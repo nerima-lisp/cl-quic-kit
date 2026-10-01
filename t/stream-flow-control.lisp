@@ -56,8 +56,10 @@
   (cl-quic-kit:stream-stop-sending-receive stream 7)
   (stream-flow-check (cl-quic-kit:stream-stopped-p stream)
                      "received STOP_SENDING changes stream state")
-  (stream-flow-check (getf (cl-quic-kit:stream-receive-data stream 0 (octets 1)) :discarded)
-                     "data after STOP_SENDING is discarded"))
+  (cl-quic-kit:stream-next-event stream)
+  (stream-flow-check (eq (getf (cl-quic-kit:stream-next-event stream) :type)
+                         :reset-stream)
+                     "peer STOP_SENDING elicits RESET_STREAM"))
 
 (let ((flow (cl-quic-kit:make-flow-control-state :max-data 2
                                                  :max-streams-bidi 1)))
@@ -81,7 +83,63 @@
       (cl-quic-kit:flow-control-limit-error () (setf rejected t)))
     (stream-flow-check rejected "MAX_DATA blocks stream writes")
     (stream-flow-check (eq (getf (cl-quic-kit:stream-next-event stream) :type)
-                           :data-blocked)
+                       :data-blocked)
                        "blocked send emits DATA_BLOCKED event")))
+
+(let* ((flow (cl-quic-kit:make-flow-control-state :max-data 10
+                                                  :max-receive-data 10))
+       (stream (cl-quic-kit:make-stream 0 :local-initiator :client
+                                        :flow-control flow)))
+  (cl-quic-kit:stream-receive-data stream 5 (octets 5 6 7 8 9))
+  (stream-flow-check (= (cl-quic-kit:flow-control-connection-received flow) 10)
+                     "sparse stream data consumes flow credit through its highest offset")
+  (let ((rejected nil))
+    (handler-case (cl-quic-kit:stream-receive-data stream 0 (octets 0 1 2 3 4 5 6 7 8 9))
+      (cl-quic-kit:flow-control-error () (setf rejected t)))
+    (stream-flow-check (not rejected) "retransmitted sparse stream data is accepted")))
+
+(let ((stream (cl-quic-kit:make-stream 0 :local-initiator :client
+                                       :max-receive-data 4)))
+  (let ((rejected nil))
+    (handler-case (cl-quic-kit:stream-reset-receive stream 9 5)
+      (cl-quic-kit:flow-control-limit-error () (setf rejected t)))
+    (stream-flow-check rejected "RESET_STREAM final size obeys stream flow control")))
+
+(let ((stream (cl-quic-kit:make-stream 0 :local-initiator :client)))
+  (cl-quic-kit:stream-receive-data stream 0 (octets 1 2))
+  (cl-quic-kit:stream-reset-receive stream 42 2)
+  (stream-flow-check (= (cl-quic-kit:stream-readable-bytes stream) 0)
+                     "RESET_STREAM discards buffered receive data")
+  (stream-flow-check (cl-quic-kit:stream-finished-p stream)
+                     "RESET_STREAM leaves the receive side terminal"))
+
+(let ((stream (cl-quic-kit:make-stream 2 :local-initiator :client)))
+  (let ((rejected nil))
+    (handler-case (cl-quic-kit:stream-reset-receive stream 1 0)
+      (cl-quic-kit:stream-id-error () (setf rejected t)))
+    (stream-flow-check rejected "RESET_STREAM is rejected for a local unidirectional stream"))
+  (let ((rejected nil))
+    (handler-case (cl-quic-kit:stream-stop-sending stream 1)
+      (cl-quic-kit:stream-id-error () (setf rejected t)))
+    (stream-flow-check rejected "STOP_SENDING is rejected for a local unidirectional stream")))
+
+(let ((flow (cl-quic-kit:make-flow-control-state :max-data 2)))
+  (let ((rejected nil))
+    (handler-case (cl-quic-kit:flow-control-update-max-data flow 3)
+      (cl-quic-kit:flow-control-error () (setf rejected t)))
+    (stream-flow-check (not rejected) "MAX_DATA increases the send limit")
+    (stream-flow-check (= (cl-quic-kit:flow-control-connection-max-data flow) 3)
+                       "MAX_DATA stores the increased limit")))
+
+(let ((rejected nil))
+  (handler-case (cl-quic-kit:make-stream 0 :max-send-data (1+ (expt 2 62)))
+    (cl-quic-kit:flow-control-error () (setf rejected t)))
+  (stream-flow-check rejected "stream flow limits reject offsets above 2^62-1"))
+
+(let ((rejected nil))
+  (handler-case
+      (cl-quic-kit:make-flow-control-state :max-streams-bidi (1+ (expt 2 60)))
+    (cl-quic-kit:flow-control-error () (setf rejected t)))
+  (stream-flow-check rejected "MAX_STREAMS rejects counts above 2^60"))
 
 (format t "~D stream/flow-control tests passed.~%" *stream-flow-tests*)

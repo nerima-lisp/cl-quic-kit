@@ -16,10 +16,12 @@
     (check (= (funcall (find-symbol "RECONSTRUCT-PACKET-NUMBER" p) #x09 1 #xabe8)
               #xac09)
            "packet number reconstruction selects the previous window")
-    (if (not (find-package "CRYPTO-KIT"))
+    (let ((crypto-package (or (find-package "CRYPTO-KIT")
+                              (find-package "CL-CRYPTO-KIT"))))
+      (if (not crypto-package)
         (format t "RFC 9001 protection vectors pending: cl-crypto-kit backend is unavailable.~%")
         (labels ((crypto (name)
-               (symbol-function (find-symbol name "CRYPTO-KIT"))))
+                   (symbol-function (find-symbol name crypto-package))))
       (funcall (find-symbol "CONFIGURE-CRYPTO-BACKEND" p)
                :hkdf-extract (crypto "HKDF-EXTRACT")
                :hkdf-expand (crypto "HKDF-EXPAND")
@@ -31,6 +33,13 @@
       (let* ((keys (funcall (find-symbol "DERIVE-INITIAL-SECRETS" p)
                             (protection-octets "8394c8f03e515708")))
              (client (getf keys :client))
+             (server (getf keys :server))
+             (server-header (protection-octets
+                             "c1000000010008f067a5502a4262b50040750001"))
+             (server-payload (protection-octets
+                              "02000000000600405a020000560303eefce7f7b37ba1d1632e96677825ddf73988cfc79825df566dc5430b9a045a1200130100002e00330024001d00209d3c940d89690b84d08a60993c144eca684d1081287c834d5311bcf32bb9da1a002b00020304"))
+             (server-ciphertext (protection-octets
+                                 "5a482cd0991cd25b0aac406a5816b6394100f37a1c69797554780bb38cc5a99f5ede4cf73c3ec2493a1839b3dbcba3f6ea46c5b7684df3548e7ddeb9c3bf9c73cc3f3bded74b562bfb19fb84022f8ef4cdd93795d77d06edbb7aaf2f58891850abbdca3d20398c276456cbc42158407dd074ee"))
              (retry-packet (protection-octets
                             "ff000000010008f067a5502a4262b5746f6b656e"))
              (retry-tag (funcall (find-symbol "RETRY-INTEGRITY-TAG" p)
@@ -44,6 +53,31 @@
         (check (equalp (funcall (find-symbol "KEY-SET-KEY" p) client)
                        (protection-octets "1f369613dd76d5467730efcbe3b1a22d"))
                "RFC 9001 Appendix A client packet key")
+        (check (equalp (funcall (find-symbol "KEY-SET-IV" p) server)
+                       (protection-octets "0ac1493ca1905853b0bba03e"))
+               "RFC 9001 Appendix A server packet IV")
+        (check (equalp (funcall (find-symbol "KEY-SET-HP" p) server)
+                       (protection-octets "c206b8d9b9f0f37644430b490eeaa314"))
+               "RFC 9001 Appendix A server header protection key")
+        (check (equalp (funcall (find-symbol "PROTECT-PAYLOAD" p)
+                                server 1 server-payload server-header)
+                       server-ciphertext)
+               "RFC 9001 Appendix A server AEAD ciphertext")
+        (check (equalp (funcall (find-symbol "UNPROTECT-PAYLOAD" p)
+                                server 1 server-ciphertext server-header)
+                       server-payload)
+               "RFC 9001 Appendix A server AEAD opens")
+        (let* ((sample (protection-octets "2cd0991cd25b0aac406a5816b6394100"))
+               (protected (funcall (find-symbol "APPLY-HEADER-PROTECTION" p)
+                                   server server-header sample 18 2 t)))
+          (check (equalp protected
+                         (protection-octets
+                          "cf000000010008f067a5502a4262b5004075c0d9"))
+                 "RFC 9001 Appendix A server header protection")
+          (check (equalp (funcall (find-symbol "REMOVE-HEADER-PROTECTION" p)
+                                  server protected sample 18 2 t)
+                         server-header)
+                 "header protection removal reverses application"))
         (check (equalp retry-tag
                        (protection-octets "04a265ba2eff4d829058fb3f0f2496ba"))
                "RFC 9001 Retry integrity tag")
@@ -51,6 +85,6 @@
                         retry-packet retry-tag
                         :original-destination-connection-id
                         (protection-octets "8394c8f03e515708"))
-               "Retry integrity tag verifies"))))))
+               "Retry integrity tag verifies")))))))
 
 (run-protection-tests)

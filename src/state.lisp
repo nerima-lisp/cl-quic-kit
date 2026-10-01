@@ -20,7 +20,7 @@
   role state now-fn idle-timeout last-activity
   local-connection-ids remote-connection-ids active-local-id
   local-cid-sequences remote-cid-sequences next-local-sequence
-  active-connection-id-limit
+  remote-retire-prior-to active-connection-id-limit
   tls-input tls-output io-read io-write on-close
   closed-error closed-reason close-kind close-frame draining-deadline)
 
@@ -69,12 +69,15 @@
                            :active-local-id (octets-copy cid)
                            :local-cid-sequences (list (cons 0 (octets-copy cid)))
                            :remote-cid-sequences nil :next-local-sequence 1
+                           :remote-retire-prior-to 0
                            :active-connection-id-limit active-connection-id-limit
                            :tls-input tls-input :tls-output tls-output
                            :io-read (or io-read read-fn) :io-write (or io-write write-fn)
                            :on-close on-close)))
 
 (defun connection-touch (connection &optional (at (funcall (quic-connection-now-fn connection))))
+  (unless (numberp at)
+    (error 'quic-error))
   (setf (quic-connection-last-activity connection) at)
   at)
 
@@ -94,7 +97,9 @@
 (defun %connection-add-sequenced-id (connection cid sequence local-p)
   (validate-connection-id cid)
   (when (zerop (length cid))
-    (error 'quic-error))
+    (connection-close connection :frame-encoding-error
+                      "NEW_CONNECTION_ID has a zero-length connection ID")
+    (return-from %connection-add-sequenced-id connection))
   (when (some (lambda (entry) (= sequence (car entry)))
               (if local-p (quic-connection-local-cid-sequences connection)
                   (quic-connection-remote-cid-sequences connection)))
@@ -117,17 +122,31 @@
                                                (stateless-reset-token
                                                 (make-array 16 :element-type '(unsigned-byte 8)
                                                             :initial-element 0)))
-  (unless (and (integerp sequence) (>= sequence 0)
-               (integerp retire-prior-to) (>= retire-prior-to 0)
+  (unless (and (varint-p sequence)
+               (varint-p retire-prior-to)
                (<= retire-prior-to sequence)
+               (connection-id-p cid)
+               (plusp (length cid))
                (typep stateless-reset-token '(simple-array (unsigned-byte 8) (*)))
                (= (length stateless-reset-token) 16))
     (connection-close connection :frame-encoding-error "invalid NEW_CONNECTION_ID")
-    (error 'quic-error))
-  (dolist (entry (copy-list (quic-connection-remote-cid-sequences connection)))
-    (when (< (car entry) retire-prior-to)
-      (connection-retire-connection-id connection (cdr entry) :local-p nil)))
-  (%connection-add-sequenced-id connection cid sequence nil))
+    (return-from connection-handle-new-connection-id connection))
+  (let ((existing (find sequence (quic-connection-remote-cid-sequences connection)
+                         :key #'car)))
+    (when existing
+      (unless (equalp (cdr existing) cid)
+        (connection-close connection :protocol-violation
+                          "NEW_CONNECTION_ID sequence was reused"))
+      (return-from connection-handle-new-connection-id connection)))
+  (when (> retire-prior-to (quic-connection-remote-retire-prior-to connection))
+    (setf (quic-connection-remote-retire-prior-to connection) retire-prior-to)
+    (dolist (entry (copy-list (quic-connection-remote-cid-sequences connection)))
+      (when (< (car entry) retire-prior-to)
+        (connection-retire-connection-id connection (cdr entry) :local-p nil))))
+  (if (< sequence (quic-connection-remote-retire-prior-to connection))
+      (connection-write connection
+                        (encode-frame (make-frame :retire-connection-id :sequence sequence)))
+      (%connection-add-sequenced-id connection cid sequence nil)))
 
 (defun connection-retire-connection-id (connection cid &key (local-p t))
   (if local-p
@@ -144,44 +163,84 @@
                        (quic-connection-remote-cid-sequences connection))))
   (when (and local-p (equalp cid (quic-connection-active-local-id connection)))
     (let ((replacement (first (quic-connection-local-connection-ids connection))))
-      (unless replacement (error 'quic-error))
+      (unless replacement
+        (let ((sequence (quic-connection-next-local-sequence connection))
+              (new-cid (make-array 8 :element-type '(unsigned-byte 8))))
+          (dotimes (index 8)
+            (setf (aref new-cid (- 7 index))
+                  (logand #xff (ash sequence (* -8 index)))))
+          (%connection-add-sequenced-id connection new-cid sequence t)
+          (incf (quic-connection-next-local-sequence connection))
+          (setf replacement new-cid)))
       (setf (quic-connection-active-local-id connection) replacement)))
   connection)
 
 (defun connection-handle-retire-connection-id (connection sequence)
+  (when (zerop sequence)
+    (connection-close connection :protocol-violation
+                      "RETIRE_CONNECTION_ID cannot retire the original connection ID")
+    (error 'quic-error))
   (let ((entry (find sequence (quic-connection-local-cid-sequences connection) :key #'car)))
     (unless entry
-      (connection-close connection :protocol-violation "unknown connection ID sequence")
-      (error 'quic-error))
-    (when (= sequence 0)
-      (connection-close connection :protocol-violation "retired original connection ID")
-      (error 'quic-error))
-    (connection-retire-connection-id connection (cdr entry))
-    (when (<= (length (quic-connection-local-cid-sequences connection)) 0)
-      (let ((cid (make-array 8 :element-type '(unsigned-byte 8) :initial-element 0)))
-        (%connection-add-sequenced-id connection cid
-                                      (quic-connection-next-local-sequence connection) t)
-        (incf (quic-connection-next-local-sequence connection))))))
+      (when (>= sequence (quic-connection-next-local-sequence connection))
+        (connection-close connection :protocol-violation
+                          "RETIRE_CONNECTION_ID has an unknown sequence"))
+      (return-from connection-handle-retire-connection-id connection))
+    (let* ((cid (cdr entry))
+           (cid-length (length cid)))
+      (connection-retire-connection-id connection cid)
+      (when (and (plusp cid-length)
+                 (< (length (quic-connection-local-cid-sequences connection))
+                    (quic-connection-active-connection-id-limit connection)))
+        (let* ((next (quic-connection-next-local-sequence connection))
+               (replacement (make-array cid-length :element-type '(unsigned-byte 8))))
+          (dotimes (index cid-length)
+            (setf (aref replacement index)
+                  (ldb (byte 8 (* 8 (mod index 8))) next)))
+          (%connection-add-sequenced-id connection replacement next t)
+          (setf (quic-connection-active-local-id connection) replacement)
+          (incf (quic-connection-next-local-sequence connection))
+          (connection-write
+           connection
+           (encode-frame
+            (make-frame :new-connection-id :sequence next :retire-prior-to 0
+                        :connection-id replacement
+                        :stateless-reset-token
+                        (make-array 16 :element-type '(unsigned-byte 8)
+                                    :initial-element 0)))))))
+    connection))
 
 (defun connection-idle-expired-p (connection &optional (at (funcall (quic-connection-now-fn connection))))
-  (and (eq (quic-connection-state connection) :established)
+  (and (numberp at)
+       (member (quic-connection-state connection) '(:handshaking :established))
        (>= (- at (quic-connection-last-activity connection))
            (quic-connection-idle-timeout connection))))
 
+(defun %connection-reason-octets (reason)
+  (cond ((null reason) #())
+        ((stringp reason)
+         (let ((out (make-array (length reason) :element-type '(unsigned-byte 8))))
+           (dotimes (index (length reason) out)
+             (let ((code (char-code (char reason index))))
+               (unless (<= code 255) (error 'quic-error))
+               (setf (aref out index) code)))))
+        (t (octets-copy reason))))
+
 (defun connection-close (connection error-code &optional reason &rest options)
-  (unless (quic-connection-close-frame connection)
+  (unless (or (eq (quic-connection-state connection) :closed)
+              (quic-connection-close-frame connection))
     (let* ((kind (or (getf options :kind)
                      (if (eq error-code :application-error) :application :transport)))
            (wire-code (or (%connection-error-code error-code) 1)))
       (setf (quic-connection-state connection) :closing
           (quic-connection-closed-error connection) wire-code
-          (quic-connection-closed-reason connection) (or reason "")
+          (quic-connection-closed-reason connection) (%connection-reason-octets reason)
           (quic-connection-close-kind connection) kind
           (quic-connection-close-frame connection)
           (make-frame (if (eq kind :application)
                           :application-close :connection-close)
                       :error-code wire-code :frame-type 0
-                      :reason (map '(vector (unsigned-byte 8)) #'char-code (or reason ""))))
+                      :reason (quic-connection-closed-reason connection)))
       (connection-write connection (encode-frame (quic-connection-close-frame connection)))
       (setf (quic-connection-draining-deadline connection)
             (+ (funcall (quic-connection-now-fn connection))
@@ -189,10 +248,11 @@
   connection)
 
 (defun connection-check-idle-timeout (connection &optional at)
-  (when (connection-idle-expired-p connection at)
-    (connection-close connection :no-error "idle timeout"))
-  (or (connection-poll connection at)
-      (not (eq (quic-connection-state connection) :established))))
+  (let ((now (or at (funcall (quic-connection-now-fn connection)))))
+    (when (connection-idle-expired-p connection now)
+      (connection-close connection :no-error "idle timeout"))
+    (or (connection-poll connection now)
+        (not (eq (quic-connection-state connection) :established)))))
 
 (defun connection-set-state (connection state)
   (unless (member state '(:handshaking :established :closing :draining :closed))
@@ -210,6 +270,8 @@
   bytes)
 
 (defun connection-receive-frame (connection frame)
+  (when (member (quic-connection-state connection) '(:draining :closed))
+    (return-from connection-receive-frame connection))
   (connection-touch connection)
   (case (frame-type frame)
     (:connection-close
@@ -249,6 +311,10 @@
         header)
     (quic-encoding-error (condition)
       (connection-close connection :frame-encoding-error (quic-error-message condition))
+      nil)
+    (quic-error (condition)
+      (declare (ignore condition))
+      (connection-close connection :frame-encoding-error "invalid QUIC packet")
       nil)))
 
 (defun connection-poll (connection &optional at)
@@ -256,7 +322,7 @@
     (when (and (eq (quic-connection-state connection) :established)
                (connection-idle-expired-p connection now))
       (connection-close connection :no-error "idle timeout"))
-    (when (and (eq (quic-connection-state connection) :draining)
+    (when (and (member (quic-connection-state connection) '(:closing :draining))
                (quic-connection-draining-deadline connection)
                (>= now (quic-connection-draining-deadline connection)))
       (connection-set-state connection :closed)

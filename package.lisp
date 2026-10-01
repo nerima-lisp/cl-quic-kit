@@ -24,7 +24,7 @@
    #:packet-header-destination-connection-id #:packet-header-source-connection-id
    #:packet-header-token #:packet-header-packet-number #:packet-header-packet-number-length
    #:packet-header-payload #:packet-header-payload-length #:packet-header-long-p
-   #:packet-header-key-phase #:packet-header-retry-integrity-tag
+   #:packet-header-key-phase #:packet-header-reserved-bits #:packet-header-retry-integrity-tag
    #:encode-packet-header
    #:decode-packet-header
    #:retry-integrity-tag

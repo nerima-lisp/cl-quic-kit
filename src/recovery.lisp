@@ -108,7 +108,7 @@
 
 (defun %rtt-update (state latest ack-delay)
   (let* ((min-rtt (recovery-state-min-rtt state))
-         (adjusted (if (and min-rtt (> latest (+ min-rtt ack-delay)))
+         (adjusted (if (and min-rtt (>= latest (+ min-rtt ack-delay)))
                        (- latest ack-delay) latest))
          (old (recovery-state-smoothed-rtt state)))
     (setf (recovery-state-latest-rtt state) latest
@@ -122,11 +122,13 @@
               (recovery-state-smoothed-rtt state)
               (+ (* 7/8 old) (* 1/8 adjusted))))))
 
-(defun %pto (state)
+(defun %pto (state &optional space-name)
   (if (recovery-state-smoothed-rtt state)
       (+ (recovery-state-smoothed-rtt state)
          (max +granularity+ (* 4 (recovery-state-rtt-variance state)))
-         (recovery-state-max-ack-delay state))
+         (if (member space-name '(:initial :handshake))
+             0
+             (recovery-state-max-ack-delay state)))
       (* 2 +initial-rtt+)))
 
 (defun %ack-eliciting-in-flight-p (packet)
@@ -140,7 +142,14 @@
                           (remove-if-not #'%ack-eliciting-in-flight-p lost)))
            (first (reduce #'min times))
            (last (reduce #'max times)))
-      (>= (- last first) (* 3 (%pto state))))))
+      (and (>= (length times) 2)
+           (>= (- last first) (* 3 (%pto state)))))))
+
+(defun %loss-delay (state)
+  (max +granularity+
+       (* +time-threshold+
+          (max (or (recovery-state-smoothed-rtt state) +initial-rtt+)
+               (or (recovery-state-latest-rtt state) +initial-rtt+)))))
 
 (defun on-ack-frame (state space-name largest-acked ack-ranges
                      &key (ack-delay 0) (received-at (%now state)))
@@ -148,9 +157,7 @@
   (let* ((space (%space state space-name)) (acked nil) (lost nil)
          (latest-sample nil)
          (ack-eliciting-acked-p nil)
-         (loss-delay (* +time-threshold+
-                        (max (or (recovery-state-smoothed-rtt state) +initial-rtt+)
-                             (or (recovery-state-latest-rtt state) +initial-rtt+)))))
+         (loss-delay (%loss-delay state)))
     (maphash (lambda (number packet)
                (cond
                  ((%acked-p number ack-ranges)
@@ -174,15 +181,16 @@
       (when (sent-packet-in-flight packet)
         (newreno-on-ack state (sent-packet-bytes packet)
                         :sent-at (sent-packet-sent-at packet))))
-    (when (%persistent-congestion-p state lost)
-      (setf (recovery-state-persistent-congestion-p state) t)
-      (setf (recovery-state-cwnd state) (* +minimum-window+ 1200)
-            (recovery-state-ssthresh state) (* +minimum-window+ 1200)))
     (dolist (packet lost)
       (when (sent-packet-in-flight packet)
         (decf (recovery-state-bytes-in-flight state) (sent-packet-bytes packet)))
       (when (sent-packet-in-flight packet)
         (newreno-on-loss state :at received-at)))
+    (when (%persistent-congestion-p state lost)
+      (setf (recovery-state-persistent-congestion-p state) t
+            (recovery-state-cwnd state) (* +minimum-window+ 1200)
+            (recovery-state-ssthresh state) (* +minimum-window+ 1200)
+            (recovery-state-recovery-start-time state) received-at))
     (when latest-sample
       (%rtt-update state latest-sample
                    (min ack-delay (recovery-state-max-ack-delay state))))
@@ -193,20 +201,27 @@
     (values (nreverse acked) (nreverse lost))))
 
 (defun pto-deadline (state space-name &key (now (%now state)))
-  (let ((space (%space state space-name)))
-    (when (loop for packet being the hash-values of (packet-number-space-sent space)
-                thereis (%ack-eliciting-in-flight-p packet))
-      (+ now (* (%pto state) (expt 2 (recovery-state-pto-count state)))))))
+  (declare (ignore now))
+  (let ((space (%space state space-name)) (last-sent nil))
+    (maphash (lambda (number packet)
+               (declare (ignore number))
+               (when (%ack-eliciting-in-flight-p packet)
+                 (when (or (null last-sent)
+                           (> (sent-packet-sent-at packet) last-sent))
+                   (setf last-sent (sent-packet-sent-at packet)))))
+             (packet-number-space-sent space))
+    (when last-sent
+      (+ last-sent (* (%pto state space-name)
+                      (expt 2 (recovery-state-pto-count state)))))))
 
 (defun loss-timeout (state space-name &key (now (%now state)))
   (let* ((space (%space state space-name))
-         (rtt (max (or (recovery-state-smoothed-rtt state) +initial-rtt+)
-                   (or (recovery-state-latest-rtt state) +initial-rtt+)))
+         (rtt (%loss-delay state))
          (deadline nil))
     (maphash (lambda (number packet)
                (declare (ignore number))
                (when (%ack-eliciting-in-flight-p packet)
-                 (let ((candidate (+ (sent-packet-sent-at packet) (* +time-threshold+ rtt))))
+                 (let ((candidate (+ (sent-packet-sent-at packet) rtt)))
                  (when (and (<= candidate now)
                             (or (null deadline) (< candidate deadline)))
                    (setf deadline candidate)))))
@@ -224,7 +239,7 @@
     (if (< (recovery-state-cwnd state) (recovery-state-ssthresh state))
         (incf (recovery-state-cwnd state) bytes)
         (incf (recovery-state-cwnd state)
-              (max 1 (floor (* 1200 1200) (recovery-state-cwnd state)))))))
+              (max 1 (floor (* bytes 1200) (recovery-state-cwnd state)))))))
 
 (defun newreno-on-loss (state &key (at (%now state)))
   (unless (and (recovery-state-recovery-start-time state)

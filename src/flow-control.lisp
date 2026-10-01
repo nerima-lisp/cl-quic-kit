@@ -30,6 +30,9 @@
 
 (in-package #:cl-quic-kit)
 
+(defparameter *quic-max-offset* (1- (expt 2 62)))
+(defparameter *quic-max-streams* (expt 2 60))
+
 (define-condition flow-control-error (error) ())
 (define-condition flow-control-limit-error (flow-control-error)
   ((limit :initarg :limit :reader flow-control-error-limit)
@@ -66,6 +69,12 @@
         (list (cons max-data :max-data)
               (cons max-streams-bidi :max-streams-bidi)
               (cons max-streams-uni :max-streams-uni)))
+  (dolist (value (list max-data max-receive-data))
+    (when (and value (> value *quic-max-offset*))
+      (error 'flow-control-error)))
+  (dolist (value (list max-streams-bidi max-streams-uni))
+    (when (> value *quic-max-streams*)
+      (error 'flow-control-error)))
   (when (and max-receive-data
              (not (and (integerp max-receive-data) (>= max-receive-data 0))))
     (error 'type-error :datum max-receive-data :expected-type '(integer 0)))
@@ -144,32 +153,34 @@
 
 (defun flow-control-update-max-data (state maximum)
   (%non-negative-integer maximum :maximum)
-  (when (< maximum (flow-control-state-connection-max-data state))
+  (when (> maximum *quic-max-offset*)
     (error 'flow-control-error))
-  (setf (flow-control-state-connection-max-data state) maximum
-        (flow-control-state-data-blocked-p state) nil)
-  maximum)
+  (if (<= maximum (flow-control-state-connection-max-data state))
+      (flow-control-state-connection-max-data state)
+      (setf (flow-control-state-connection-max-data state) maximum
+            (flow-control-state-data-blocked-p state) nil)))
 
 (defun flow-control-update-max-receive-data (state maximum)
   (%non-negative-integer maximum :maximum)
-  (when (< maximum (flow-control-state-connection-receive-limit state))
+  (when (> maximum *quic-max-offset*)
     (error 'flow-control-error))
-  (setf (flow-control-state-connection-receive-limit state) maximum)
-  maximum)
+  (if (<= maximum (flow-control-state-connection-receive-limit state))
+      (flow-control-state-connection-receive-limit state)
+      (setf (flow-control-state-connection-receive-limit state) maximum)))
 
 (defun flow-control-update-max-streams (state direction maximum)
   (%non-negative-integer maximum :maximum)
+  (when (> maximum *quic-max-streams*)
+    (error 'flow-control-error))
   (ecase direction
     (:bidirectional
-     (when (< maximum (flow-control-state-max-streams-bidi state))
-       (error 'flow-control-error))
-     (setf (flow-control-state-max-streams-bidi state) maximum
-           (flow-control-state-streams-blocked-bidi-p state) nil))
+     (when (> maximum (flow-control-state-max-streams-bidi state))
+       (setf (flow-control-state-max-streams-bidi state) maximum
+             (flow-control-state-streams-blocked-bidi-p state) nil)))
     (:unidirectional
-     (when (< maximum (flow-control-state-max-streams-uni state))
-       (error 'flow-control-error))
-     (setf (flow-control-state-max-streams-uni state) maximum
-           (flow-control-state-streams-blocked-uni-p state) nil)))
+     (when (> maximum (flow-control-state-max-streams-uni state))
+       (setf (flow-control-state-max-streams-uni state) maximum
+             (flow-control-state-streams-blocked-uni-p state) nil))))
   maximum)
 
 (defun flow-control-data-blocked-p (state)

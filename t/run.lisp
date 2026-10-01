@@ -51,6 +51,65 @@
 (let* ((frame (cl-quic-kit:make-frame :ping))
        (decoded (cl-quic-kit:decode-frame (cl-quic-kit:encode-frame frame))))
   (check (eq (cl-quic-kit:frame-type decoded) :ping) "PING frame round trip"))
+(let* ((dcid (make-array 4 :element-type '(unsigned-byte 8) :initial-contents '(1 2 3 4)))
+       (scid (make-array 3 :element-type '(unsigned-byte 8) :initial-contents '(5 6 7)))
+       (token (make-array 2 :element-type '(unsigned-byte 8) :initial-contents '(8 9)))
+       (payload (make-array 3 :element-type '(unsigned-byte 8) :initial-contents '(10 11 12)))
+       (header (cl-quic-kit:make-packet-header
+                :type :initial :version cl-quic-kit:*quic-version-1*
+                :destination-connection-id dcid :source-connection-id scid
+                :token token :packet-number #x1234 :packet-number-length 2 :payload payload))
+       (encoded (cl-quic-kit:encode-packet-header header)))
+  (multiple-value-bind (decoded end) (cl-quic-kit:decode-packet-header encoded)
+    (check (and (= end (length encoded)) (= (cl-quic-kit:packet-header-version decoded) 1)
+                (= (cl-quic-kit:packet-header-packet-number decoded) #x1234)
+                (equalp (cl-quic-kit:packet-header-payload decoded) payload))
+           "long header packet round trip")))
+(let* ((dcid (make-array 2 :element-type '(unsigned-byte 8) :initial-contents '(1 2)))
+       (payload (make-array 2 :element-type '(unsigned-byte 8) :initial-contents '(3 4)))
+       (header (cl-quic-kit:make-packet-header
+                :type :short :destination-connection-id dcid :packet-number #x7f
+                :reserved-bits 3 :key-phase t :payload payload))
+       (encoded (cl-quic-kit:encode-packet-header header)))
+  (multiple-value-bind (decoded end)
+      (cl-quic-kit:decode-packet-header encoded :short-header-dcid-length 2)
+    (check (and (= end (length encoded)) (= (cl-quic-kit:packet-header-reserved-bits decoded) 3)
+                (cl-quic-kit:packet-header-key-phase decoded)
+                (equalp (cl-quic-kit:packet-header-payload decoded) payload))
+           "short header packet round trip")))
+(let* ((tag (make-array 16 :element-type '(unsigned-byte 8) :initial-element #xaa))
+       (header (cl-quic-kit:make-packet-header
+                :type :retry :version 1 :destination-connection-id #() :source-connection-id #(1)
+                :token #(2 3) :retry-integrity-tag tag))
+       (decoded (multiple-value-list
+                 (cl-quic-kit:decode-packet-header
+                  (cl-quic-kit:encode-packet-header header)))))
+  (check (and (equalp (cl-quic-kit:packet-header-token (first decoded)) #(2 3))
+              (equalp (cl-quic-kit:packet-header-retry-integrity-tag (first decoded)) tag))
+         "Retry packet preserves token and integrity tag"))
+(let* ((encoded (cl-quic-kit:encode-version-negotiation #(1 2) #(3) '(1 #x6b3343cf)))
+       (decoded (cl-quic-kit:decode-version-negotiation encoded)))
+  (check (equal (getf decoded :versions) '(1 #x6b3343cf))
+         "Version Negotiation round trip"))
+(let* ((parameters '((1 . 30) (4 . 1200) (0 . #(1 2)) (12 . #())))
+       (decoded (cl-quic-kit:decode-transport-parameters
+                 (cl-quic-kit:encode-transport-parameters parameters))))
+  (check (equalp decoded parameters) "transport parameter integer and opaque values round trip"))
+(let* ((frame (cl-quic-kit:make-frame :ack-ecn :largest-acknowledged 10 :ack-delay 2
+                                      :ranges (list (cons 10 2) (list :gap 1 :range-length 1))
+                                      :ect0 3 :ect1 4 :ecn-ce 5))
+       (decoded (cl-quic-kit:decode-frame (cl-quic-kit:encode-frame frame))))
+  (check (and (eq (cl-quic-kit:frame-type decoded) :ack-ecn)
+              (= (cl-quic-kit:frame-field decoded :ect0) 3)
+              (= (length (cl-quic-kit:frame-field decoded :ranges)) 2))
+         "ACK ECN ranges round trip"))
+(let* ((encoded (cl-quic-kit:encode-frames
+                 (list (cl-quic-kit:make-frame :padding :count 3)
+                       (cl-quic-kit:make-frame :application-close :error-code 7 :reason #(1 2)))))
+       (decoded (cl-quic-kit:decode-frames encoded)))
+  (check (and (= (cl-quic-kit:frame-field (first decoded) :count) 3)
+              (eq (cl-quic-kit:frame-type (second decoded)) :application-close))
+         "PADDING and application close frames round trip"))
 (let* ((stream (cl-quic-kit:make-stream 0 :local-initiator :client))
        (payload (make-array 3 :element-type '(unsigned-byte 8)
                             :initial-contents '(1 2 3))))
@@ -85,6 +144,25 @@
     (check (eq (cl-quic-kit:connection-state connection) :closing)
            "active connection ID limit starts a transport close")
     (check (= (length writes) 1) "transport close is written through injected I/O")))
+(let ((writes nil)
+      (cid (make-array 8 :element-type '(unsigned-byte 8) :initial-element 1)))
+  (let ((connection (cl-quic-kit:make-quic-connection
+                    :local-connection-id cid
+                    :io-write (lambda (connection bytes)
+                                (declare (ignore connection))
+                                (push bytes writes)))))
+    (cl-quic-kit:connection-handle-new-connection-id
+     connection 1 (make-array 8 :element-type '(unsigned-byte 8) :initial-element 2)
+     :retire-prior-to 2)
+    (check (null (cl-quic-kit:connection-remote-connection-ids connection))
+           "NEW_CONNECTION_ID retires IDs below Retire Prior To before adding")
+    (check (= (length writes) 1)
+           "a NEW_CONNECTION_ID below Retire Prior To is retired on receipt")
+    (cl-quic-kit:connection-handle-new-connection-id
+     connection 1 (make-array 8 :element-type '(unsigned-byte 8) :initial-element 3)
+     :retire-prior-to 2)
+    (check (eq (cl-quic-kit:connection-state connection) :closing)
+           "reusing a connection ID sequence with a different ID closes the connection")))
 (let ((clock 0) (writes nil))
   (let ((connection (cl-quic-kit:make-quic-connection
                     :now-fn (lambda () clock) :idle-timeout 10

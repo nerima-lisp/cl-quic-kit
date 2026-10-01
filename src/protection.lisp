@@ -53,9 +53,10 @@ for ChaCha."
 
 (defun %protection-octets (value name)
   (declare (ignore name))
-  (unless (and (vectorp value)
-               (every (lambda (x) (typep x '(unsigned-byte 8))) value))
-    (error 'type-error :datum value :expected-type '(vector (unsigned-byte 8))))
+  (unless (or (typep value '(simple-array (unsigned-byte 8) (*)))
+              (and (vectorp value) (zerop (length value))))
+    (error 'type-error :datum value
+           :expected-type '(simple-array (unsigned-byte 8) (*))))
   value)
 
 (defun %concat (&rest vectors)
@@ -70,6 +71,8 @@ for ChaCha."
   (map '(vector (unsigned-byte 8)) #'char-code string))
 
 (defun %u16 (number)
+  (unless (and (integerp number) (<= 0 number #xffff))
+    (error "TLS vector length is outside the uint16 range: ~S" number))
   (vector (ldb (byte 8 8) number) (ldb (byte 8 0) number)))
 
 (defun %hkdf-label (label context length)
@@ -88,6 +91,8 @@ for ChaCha."
 (defun make-key-set (secret &key (cipher :aes-128-gcm) (hash-algorithm :sha256)
                              (key-length 16)
                              (iv-length 12) (hp-length 16))
+  (unless (member cipher '(:aes-128-gcm :aes-256-gcm :chacha20))
+    (error "Unsupported QUIC packet protection cipher: ~S" cipher))
   (let ((secret (%protection-octets secret "secret")))
     (%make-key-set (%expand-label hash-algorithm secret "quic key" #() key-length)
                    (%expand-label hash-algorithm secret "quic iv" #() iv-length)
@@ -115,7 +120,11 @@ for ChaCha."
                                 :iv-length iv-length :hp-length hp-length))))
 
 (defun %nonce (iv packet-number)
-  (let ((nonce (copy-seq iv)) (value packet-number))
+  (unless (and (integerp packet-number) (<= 0 packet-number) (< packet-number (ash 1 62)))
+    (error "QUIC packet number must be an integer in [0, 2^62): ~S" packet-number))
+  (let ((nonce (copy-seq (%protection-octets iv "iv"))) (value packet-number))
+    (unless (= (length nonce) 12)
+      (error "QUIC AEAD IV must be 12 octets, got ~D" (length nonce)))
     (loop for i from (1- (length nonce)) downto 0 while (plusp value)
           do (setf (aref nonce i)
                    (logxor (aref nonce i) (ldb (byte 8 0) value)))
@@ -135,35 +144,48 @@ for ChaCha."
            (%protection-octets ciphertext "ciphertext") (%protection-octets associated-data "associated-data")))
 
 (defun %header-mask (key-set sample)
-  (when (< (length sample) 16)
-    (error "QUIC header protection sample must be 16 octets"))
-  (subseq (ecase (key-set-cipher key-set)
-            ((:aes-128-gcm :aes-256-gcm)
-             (funcall (%require-crypto :aes-ecb *aes-ecb*)
-                      (key-set-hp key-set) (%protection-octets sample "sample")))
-            (:chacha20
-             (let ((sample (%protection-octets sample "sample")))
-               (funcall (%require-crypto :chacha20 *chacha20*)
-                        (key-set-hp key-set)
-                        (+ (aref sample 12)
-                           (ash (aref sample 13) 8)
-                           (ash (aref sample 14) 16)
-                           (ash (aref sample 15) 24))
-                        (subseq sample 0 12) 5))))
-          0 5))
-
+  (let ((sample (%protection-octets sample "sample")))
+    (when (< (length sample) 16)
+      (error "QUIC header protection sample must be 16 octets"))
+    (let ((mask (ecase (key-set-cipher key-set)
+                  ((:aes-128-gcm :aes-256-gcm)
+                   (funcall (%require-crypto :aes-ecb *aes-ecb*)
+                            (key-set-hp key-set) sample))
+                  (:chacha20
+                   (funcall (%require-crypto :chacha20 *chacha20*)
+                            (key-set-hp key-set)
+                            (+ (aref sample 12)
+                               (ash (aref sample 13) 8)
+                               (ash (aref sample 14) 16)
+                               (ash (aref sample 15) 24))
+                            (subseq sample 0 12) 5)))))
+      (unless (and (vectorp mask) (>= (length mask) 5))
+        (error "Header protection backend must return at least 5 octets"))
+      (subseq mask 0 5))))
 (defun apply-header-protection (key-set packet sample packet-number-offset
                                  packet-number-length long-header-p)
-  (let* ((result (copy-seq (%protection-octets packet "packet")))
-         (mask (%header-mask key-set sample))
-         (first-mask (if long-header-p #x0f #x1f)))
-    (setf (aref result 0) (logxor (aref result 0)
-                                  (logand first-mask (aref mask 0))))
-    (loop for i below packet-number-length
-          do (setf (aref result (+ packet-number-offset i))
-                   (logxor (aref result (+ packet-number-offset i))
-                           (aref mask (1+ i)))))
-    result))
+  (unless (member packet-number-length '(1 2 3 4))
+    (error "Packet number length must be 1, 2, 3, or 4: ~S" packet-number-length))
+  (unless (and (integerp packet-number-offset) (>= packet-number-offset 1))
+    (error "Packet number offset must be a positive integer: ~S" packet-number-offset))
+  (let* ((packet (%protection-octets packet "packet"))
+         (sample (%protection-octets sample "sample"))
+         (result (copy-seq packet)))
+    (when (< (length sample) 16)
+      (error "QUIC header protection sample must be 16 octets"))
+    (when (> (+ packet-number-offset packet-number-length) (length result))
+      (error "Packet number field is outside packet"))
+    (when (< (length result) 1)
+      (error "QUIC packet must contain a first header octet"))
+    (let* ((mask (%header-mask key-set sample))
+           (first-mask (if long-header-p #x0f #x1f)))
+      (setf (aref result 0) (logxor (aref result 0)
+                                    (logand first-mask (aref mask 0))))
+      (loop for i below packet-number-length
+            do (setf (aref result (+ packet-number-offset i))
+                     (logxor (aref result (+ packet-number-offset i))
+                             (aref mask (1+ i)))))
+      result)))
 
 (defun remove-header-protection (&rest arguments)
   "Header protection is XOR and therefore uses the same operation to remove it."
@@ -173,6 +195,15 @@ for ChaCha."
                                   largest-received-packet-number)
   "Reconstruct a full packet number as specified by RFC 9000 Appendix A."
   (check-type packet-number-length (integer 1 4))
+  (unless (and (integerp truncated-packet-number)
+               (<= 0 truncated-packet-number))
+    (error "Truncated packet number must be a non-negative integer: ~S"
+           truncated-packet-number))
+  (unless (and (integerp largest-received-packet-number)
+               (>= largest-received-packet-number -1)
+               (< largest-received-packet-number (ash 1 62)))
+    (error "Largest received packet number is outside the QUIC range: ~S"
+           largest-received-packet-number))
   (let* ((pn-bits (* 8 packet-number-length))
          (pn-window (ash 1 pn-bits))
          (pn-half-window (ash pn-window -1))
@@ -180,6 +211,8 @@ for ChaCha."
          (expected (1+ largest-received-packet-number))
          (candidate (logior (logand truncated-packet-number pn-mask)
                             (logand expected (lognot pn-mask)))))
+    (unless (< truncated-packet-number pn-window)
+      (error "Truncated packet number does not fit packet-number-length"))
     (cond ((and (<= candidate (- expected pn-half-window))
                 (< candidate (- (ash 1 62) pn-window)))
            (+ candidate pn-window))
@@ -198,24 +231,29 @@ for ChaCha."
 (defun retry-integrity-tag (retry-packet &key original-destination-connection-id)
   "Return the RFC 9001 v1 Retry Integrity Tag for RETRY-PACKET.
 RETRY-PACKET excludes its 16-octet tag; the ODCID is prepended to form AAD."
-  (let ((odcid (%protection-octets original-destination-connection-id
-                         "original-destination-connection-id")))
-    (funcall (%require-crypto :retry-integrity-aead *aead-seal*)
-             :aes-128-gcm *retry-integrity-key* *retry-integrity-nonce* #()
-             (%concat (vector (length odcid)) odcid
-                      (%protection-octets retry-packet "retry-packet")))))
+  (let* ((odcid (%protection-octets original-destination-connection-id
+                                  "original-destination-connection-id"))
+         (tag (funcall (%require-crypto :retry-integrity-aead *aead-seal*)
+                       :aes-128-gcm *retry-integrity-key* *retry-integrity-nonce* #()
+                       (%concat (vector (length odcid)) odcid
+                                (%protection-octets retry-packet "retry-packet")))))
+    (unless (and (vectorp tag) (= (length tag) 16))
+      (error "Retry integrity AEAD must return a 16-octet tag"))
+    tag))
 
 (defun verify-retry-integrity (retry-packet tag &key original-destination-connection-id)
   (let ((expected (retry-integrity-tag retry-packet
                                        :original-destination-connection-id
                                        original-destination-connection-id))
-        (actual (%protection-octets tag "tag")))
+         (actual (%protection-octets tag "tag")))
+    (unless (= (length actual) 16)
+      (return-from verify-retry-integrity nil))
     (if *constant-time-equal*
         (funcall *constant-time-equal* expected actual)
         (let ((difference (logxor (length expected) (length actual))))
-          (dotimes (i (max (length expected) (length actual))
-                   (zerop difference))
+          (dotimes (i (max (length expected) (length actual)))
             (setf difference
                   (logior difference
-                          (if (< i (length expected)) (aref expected i) 0)
-                          (if (< i (length actual)) (aref actual i) 0))))))))
+                          (logxor (if (< i (length expected)) (aref expected i) 0)
+                                  (if (< i (length actual)) (aref actual i) 0))))
+          (zerop difference))))))
