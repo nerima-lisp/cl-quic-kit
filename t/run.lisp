@@ -1,3 +1,7 @@
+(ignore-errors (require :asdf))
+(when (find-package :asdf)
+  (ignore-errors (asdf:load-system "cl-crypto-kit")))
+
 (load (merge-pathnames "../package.lisp"
                        (or *load-truename* *default-pathname-defaults*)))
 
@@ -6,6 +10,18 @@
                 "src/protection.lisp" "src/recovery.lisp"))
   (load (merge-pathnames (concatenate 'string "../" file)
                          (or *load-truename* *default-pathname-defaults*))))
+
+(when (and (find-package "CRYPTO-KIT")
+           (find-package "CL-QUIC-KIT.PROTECTION"))
+  (let ((p (find-package "CL-QUIC-KIT.PROTECTION"))
+        (crypto (lambda (name) (symbol-function (find-symbol name "CRYPTO-KIT")))))
+    (funcall (find-symbol "CONFIGURE-CRYPTO-BACKEND" p)
+             :hkdf-extract (funcall crypto "HKDF-EXTRACT")
+             :hkdf-expand (funcall crypto "HKDF-EXPAND")
+             :aead-seal (funcall crypto "AEAD-SEAL")
+             :aead-open (funcall crypto "AEAD-OPEN")
+             :aes-ecb (funcall crypto "AES-ENCRYPT-BLOCK")
+             :constant-time-equal (funcall crypto "CONSTANT-TIME-EQUAL"))))
 
 (in-package #:cl-user)
 

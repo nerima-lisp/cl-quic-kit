@@ -2,8 +2,9 @@
   description = "Common Lisp QUIC toolkit";
 
   inputs.nixpkgs.url = "github:NixOS/nixpkgs/nixpkgs-unstable";
+  inputs.cl-crypto-kit.url = "github:nerima-lisp/cl-crypto-kit/takeokunn-crypto-aes-gcm";
 
-  outputs = { self, nixpkgs }:
+  outputs = { self, nixpkgs, cl-crypto-kit }:
     let
       systems = [ "aarch64-darwin" "x86_64-linux" ];
       forEachSystem = f: nixpkgs.lib.genAttrs systems (system: f (import nixpkgs { inherit system; }));
@@ -11,6 +12,7 @@
       checks = forEachSystem (pkgs: {
         bootstrap = pkgs.runCommand "cl-quic-kit-bootstrap-tests" {
           nativeBuildInputs = [ pkgs.sbcl ];
+          CL_SOURCE_REGISTRY = "${cl-crypto-kit}/";
           src = ./.;
         } ''
           cd "$src"

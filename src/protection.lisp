@@ -20,7 +20,9 @@
                      (crypto-operation condition)))))
 
 (defparameter *initial-salt*
-  #(56 118 44 247 241 59 97 204 30 144 8 149 227 202 74 214 0 185 113 53))
+  (make-array 20 :element-type '(unsigned-byte 8)
+              :initial-contents '(56 118 44 247 245 89 52 179 77 23
+                                  154 230 164 200 12 173 204 203 127 10)))
 (defvar *hkdf-extract* nil)
 (defvar *hkdf-expand* nil)
 (defvar *aead-seal* nil)
@@ -187,9 +189,11 @@ for ChaCha."
           (t candidate))))
 
 (defparameter *retry-integrity-key*
-  #(190 12 105 11 159 102 87 90 29 118 107 84 227 104 200 78))
+  (make-array 16 :element-type '(unsigned-byte 8)
+              :initial-contents '(190 12 105 11 159 102 87 90 29 118 107 84 227 104 200 78)))
 (defparameter *retry-integrity-nonce*
-  #(70 21 153 211 93 99 43 242 35 152 37 187))
+  (make-array 12 :element-type '(unsigned-byte 8)
+              :initial-contents '(70 21 153 211 93 99 43 242 35 152 37 187)))
 
 (defun retry-integrity-tag (retry-packet &key original-destination-connection-id)
   "Return the RFC 9001 v1 Retry Integrity Tag for RETRY-PACKET.
