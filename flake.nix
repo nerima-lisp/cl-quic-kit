@@ -2,7 +2,7 @@
   description = "Common Lisp QUIC toolkit";
 
   inputs.nixpkgs.url = "github:NixOS/nixpkgs/nixpkgs-unstable";
-  inputs.cl-crypto-kit.url = "github:nerima-lisp/cl-crypto-kit/takeokunn-crypto-aes-gcm";
+  inputs.cl-crypto-kit.url = "github:nerima-lisp/cl-crypto-kit";
 
   outputs = { self, nixpkgs, cl-crypto-kit }:
     let
