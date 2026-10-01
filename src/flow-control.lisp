@@ -8,6 +8,7 @@
        #:flow-control-connection-max-data
        #:flow-control-connection-sent
        #:flow-control-connection-received
+       #:flow-control-connection-receive-limit
        #:flow-control-max-streams-bidi
        #:flow-control-max-streams-uni
        #:flow-control-open-stream
@@ -17,9 +18,12 @@
        #:flow-control-reserve-send
        #:flow-control-note-received
        #:flow-control-update-max-data
+       #:flow-control-update-max-receive-data
        #:flow-control-update-max-streams
        #:flow-control-data-blocked-p
        #:flow-control-streams-blocked-p
+       #:flow-control-mark-data-blocked
+       #:flow-control-mark-streams-blocked
        #:flow-control-error
        #:flow-control-limit-error
        #:stream-id-error))))
@@ -47,6 +51,7 @@
   (connection-max-data 0 :type integer)
   (connection-sent 0 :type integer)
   (connection-received 0 :type integer)
+  (connection-receive-limit 0 :type integer)
   (max-streams-bidi 0 :type integer)
   (max-streams-uni 0 :type integer)
   (stream-count-bidi 0 :type integer)
@@ -55,13 +60,17 @@
   (streams-blocked-bidi-p nil)
   (streams-blocked-uni-p nil))
 
-(defun make-flow-control-state (&key (max-data 0) (max-streams-bidi 0)
-                                     (max-streams-uni 0))
+(defun make-flow-control-state (&key (max-data 0) max-receive-data
+                                     (max-streams-bidi 0) (max-streams-uni 0))
   (mapc (lambda (x) (%non-negative-integer (car x) (cdr x)))
         (list (cons max-data :max-data)
               (cons max-streams-bidi :max-streams-bidi)
               (cons max-streams-uni :max-streams-uni)))
+  (when (and max-receive-data
+             (not (and (integerp max-receive-data) (>= max-receive-data 0))))
+    (error 'type-error :datum max-receive-data :expected-type '(integer 0)))
   (%make-flow-control-state :connection-max-data max-data
+                            :connection-receive-limit (or max-receive-data max-data)
                             :max-streams-bidi max-streams-bidi
                             :max-streams-uni max-streams-uni))
 
@@ -73,6 +82,9 @@
 
 (defun flow-control-connection-received (state)
   (flow-control-state-connection-received state))
+
+(defun flow-control-connection-receive-limit (state)
+  (flow-control-state-connection-receive-limit state))
 
 (defun flow-control-max-streams-bidi (state)
   (flow-control-state-max-streams-bidi state))
@@ -104,13 +116,8 @@
   t)
 
 (defun flow-control-close-stream (state direction)
-  (ecase direction
-    (:bidirectional
-     (when (plusp (flow-control-state-stream-count-bidi state))
-       (decf (flow-control-state-stream-count-bidi state))))
-    (:unidirectional
-     (when (plusp (flow-control-state-stream-count-uni state))
-       (decf (flow-control-state-stream-count-uni state)))))
+  ;; MAX_STREAMS limits the number of streams ever opened, not live streams.
+  (ecase direction (:bidirectional state) (:unidirectional state))
   t)
 
 (defun flow-control-can-send-p (state octets)
@@ -130,8 +137,8 @@
 (defun flow-control-note-received (state octets)
   (%non-negative-integer octets :octets)
   (let ((attempted (+ (flow-control-state-connection-received state) octets)))
-    (when (> attempted (flow-control-state-connection-max-data state))
-      (%raise-limit (flow-control-state-connection-max-data state) attempted))
+    (when (> attempted (flow-control-state-connection-receive-limit state))
+      (%raise-limit (flow-control-state-connection-receive-limit state) attempted))
     (setf (flow-control-state-connection-received state) attempted)
     attempted))
 
@@ -141,6 +148,13 @@
     (error 'flow-control-error))
   (setf (flow-control-state-connection-max-data state) maximum
         (flow-control-state-data-blocked-p state) nil)
+  maximum)
+
+(defun flow-control-update-max-receive-data (state maximum)
+  (%non-negative-integer maximum :maximum)
+  (when (< maximum (flow-control-state-connection-receive-limit state))
+    (error 'flow-control-error))
+  (setf (flow-control-state-connection-receive-limit state) maximum)
   maximum)
 
 (defun flow-control-update-max-streams (state direction maximum)
@@ -165,3 +179,11 @@
   (ecase direction
     (:bidirectional (flow-control-state-streams-blocked-bidi-p state))
     (:unidirectional (flow-control-state-streams-blocked-uni-p state))))
+
+(defun flow-control-mark-data-blocked (state)
+  (setf (flow-control-state-data-blocked-p state) t))
+
+(defun flow-control-mark-streams-blocked (state direction)
+  (ecase direction
+    (:bidirectional (setf (flow-control-state-streams-blocked-bidi-p state) t))
+    (:unidirectional (setf (flow-control-state-streams-blocked-uni-p state) t))))

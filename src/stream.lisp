@@ -1,19 +1,5 @@
 (in-package #:cl-quic-kit)
 
-(shadow 'stream)
-
-(export '(stream
-          make-stream
-          stream-id stream-direction stream-initiator stream-local-p
-          stream-send-offset stream-receive-offset stream-read-offset
-          stream-readable-bytes
-          stream-finished-p stream-reset-p stream-stopped-p
-          stream-write stream-finish stream-read stream-receive-data
-          stream-reset-send stream-stop-sending
-          stream-set-max-send-offset stream-set-max-receive-offset
-          stream-pending-events stream-next-event
-          stream-id-direction stream-id-initiator))
-
 (defun stream-id-direction (id)
   (unless (and (integerp id) (<= 0 id))
     (error 'stream-id-error :stream-id id))
@@ -24,7 +10,7 @@
     (error 'stream-id-error :stream-id id))
   (if (zerop (logand id 1)) :client :server))
 
-(defun %octets (data)
+(defun %stream-octets (data)
   (unless (and (arrayp data) (= (array-rank data) 1)
                (subtypep (array-element-type data) '(unsigned-byte 8)))
     (error 'type-error :datum data :expected-type '(vector (unsigned-byte 8))))
@@ -49,9 +35,14 @@
   (send-max-offset most-positive-fixnum)
   (receive-max-offset most-positive-fixnum)
   (segments nil)
+  (receive-ranges nil)
   (read-buffer (make-array 0 :element-type '(unsigned-byte 8)))
   (reset-error-code nil)
+  (send-reset-p nil)
+  (receive-reset-p nil)
   (stop-error-code nil)
+  (send-stop-p nil)
+  (receive-stop-p nil)
   (events nil)
   flow-control)
 
@@ -77,10 +68,10 @@
   (length (stream-read-buffer stream)))
 
 (defun stream-reset-p (stream)
-  (not (null (stream-reset-error-code stream))))
+  (or (stream-send-reset-p stream) (stream-receive-reset-p stream)))
 
 (defun stream-stopped-p (stream)
-  (not (null (stream-stop-error-code stream))))
+  (or (stream-send-stop-p stream) (stream-receive-stop-p stream)))
 
 (defun %queue-event (stream type &rest properties)
   (setf (stream-events stream)
@@ -110,35 +101,69 @@
   maximum)
 
 (defun stream-write (stream data)
-  (%octets data)
+  (%stream-octets data)
   (unless (stream-local-p stream) (error 'stream-id-error :stream-id (stream-id stream)))
-  (when (or (stream-send-final-size stream) (stream-reset-p stream))
+  (when (or (stream-send-final-size stream) (stream-send-reset-p stream)
+            (stream-receive-stop-p stream))
     (error 'flow-control-error))
   (let* ((size (length data))
          (end (+ (stream-send-offset stream) size)))
     (when (> end (stream-send-max-offset stream))
+      (%queue-event stream :stream-data-blocked :limit (stream-send-max-offset stream)
+                    :offset end)
       (%raise-limit (stream-send-max-offset stream) end))
     (when (stream-flow-control stream)
-      (flow-control-reserve-send (stream-flow-control stream) size))
+      (handler-case
+          (flow-control-reserve-send (stream-flow-control stream) size)
+        (flow-control-limit-error (condition)
+          (%queue-event stream :data-blocked
+                        :limit (flow-control-error-limit condition)
+                        :offset (flow-control-error-attempted condition))
+          (error condition))))
     (incf (stream-send-offset stream) size)
     (list :offset (- (stream-send-offset stream) size) :data data :fin nil)))
 
 (defun stream-finish (stream)
-  (when (or (stream-send-final-size stream) (stream-reset-p stream))
+  (when (or (stream-send-final-size stream) (stream-send-reset-p stream))
     (error 'flow-control-error))
   (setf (stream-send-final-size stream) (stream-send-offset stream))
   (%queue-event stream :fin :offset (stream-send-offset stream)))
 
 (defun stream-reset-send (stream error-code)
   (%non-negative-integer error-code :error-code)
-  (when (stream-send-final-size stream) (error 'flow-control-error))
+  (when (or (stream-send-final-size stream) (stream-send-reset-p stream))
+    (error 'flow-control-error))
   (setf (stream-reset-error-code stream) error-code)
+  (setf (stream-send-reset-p stream) t)
   (%queue-event stream :reset-stream :error-code error-code
                 :final-size (stream-send-offset stream)))
 
 (defun stream-stop-sending (stream error-code)
   (%non-negative-integer error-code :error-code)
   (setf (stream-stop-error-code stream) error-code)
+  (setf (stream-send-stop-p stream) t)
+  (%queue-event stream :stop-sending :error-code error-code))
+
+(defun stream-reset-receive (stream error-code final-size)
+  (%non-negative-integer error-code :error-code)
+  (%non-negative-integer final-size :final-size)
+  (when (and (stream-receive-final-size stream)
+             (/= final-size (stream-receive-final-size stream)))
+    (error 'flow-control-error))
+  (when (< final-size (stream-receive-offset stream))
+    (error 'flow-control-error))
+  (when (some (lambda (range) (> (cdr range) final-size))
+              (stream-receive-ranges stream))
+    (error 'flow-control-error))
+  (setf (stream-receive-final-size stream) final-size
+        (stream-reset-error-code stream) error-code
+        (stream-receive-reset-p stream) t)
+  (%queue-event stream :reset-stream :error-code error-code :final-size final-size))
+
+(defun stream-stop-sending-receive (stream error-code)
+  (%non-negative-integer error-code :error-code)
+  (setf (stream-stop-error-code stream) error-code
+        (stream-receive-stop-p stream) t)
   (%queue-event stream :stop-sending :error-code error-code))
 
 (defun %merge-segments (previous current)
@@ -170,18 +195,50 @@
                   nil)))))
 
 (defun %insert-segment (stream start data)
+  (when (zerop (length data))
+    (return-from %insert-segment stream))
   (let ((all (sort (cons (cons start data) (copy-list (stream-segments stream)))
                    #'< :key #'car))
         (result nil))
     (dolist (segment all)
       (if (null result)
           (push (cons (car segment) (copy-seq (cdr segment))) result)
-          (multiple-value-bind (merged separate)
+            (multiple-value-bind (merged separate)
               (%merge-segments (car result) segment)
             (if separate
                 (push (cons (car segment) (copy-seq (cdr segment))) result)
                 (setf (car result) merged)))))
     (setf (stream-segments stream) (nreverse result))))
+
+(defun %validate-segment (stream start data)
+  (let ((end (+ start (length data))))
+    (dolist (segment (stream-segments stream))
+      (let* ((segment-start (car segment))
+             (segment-data (cdr segment))
+             (segment-end (+ segment-start (length segment-data)))
+             (from (max start segment-start))
+             (to (min end segment-end)))
+        (loop for position from from below to
+              unless (= (aref data (- position start))
+                        (aref segment-data (- position segment-start)))
+                do (error 'flow-control-error))))))
+
+(defun %range-new-length (ranges start end)
+  (let ((covered 0))
+    (dolist (range ranges)
+      (let ((from (max start (car range)))
+            (to (min end (cdr range))))
+        (when (< from to) (incf covered (- to from)))))
+    (- (- end start) covered)))
+
+(defun %insert-range (ranges start end)
+  (let ((all (sort (cons (cons start end) (copy-list ranges)) #'< :key #'car))
+        (result nil))
+    (dolist (range all)
+      (if (and result (<= (car range) (cdr (car result))))
+          (setf (cdr (car result)) (max (cdr (car result)) (cdr range)))
+          (push (cons (car range) (cdr range)) result)))
+    (nreverse result)))
 
 (defun %drain-contiguous (stream)
   (loop while (stream-segments stream)
@@ -197,7 +254,13 @@
 
 (defun stream-receive-data (stream offset data &key fin)
   (%non-negative-integer offset :offset)
-  (%octets data)
+  (%stream-octets data)
+  (when (and (eq (stream-direction stream) :unidirectional)
+             (stream-local-p stream))
+    (error 'stream-id-error :stream-id (stream-id stream)))
+  (when (stream-receive-stop-p stream)
+    (return-from stream-receive-data
+      (list :offset offset :length (length data) :fin (not (null fin)) :discarded t)))
   (let ((end (+ offset (length data))))
     (when (> end (stream-receive-max-offset stream))
       (%raise-limit (stream-receive-max-offset stream) end))
@@ -205,14 +268,36 @@
       (when (> end (stream-receive-final-size stream))
         (error 'flow-control-error)))
     (when fin
+      (when (< end (stream-receive-offset stream))
+        (error 'flow-control-error))
+      (when (some (lambda (range) (> (cdr range) end))
+                  (stream-receive-ranges stream))
+        (error 'flow-control-error))
       (when (and (stream-receive-final-size stream)
                  (/= (stream-receive-final-size stream) end))
-        (error 'flow-control-error))
+        (error 'flow-control-error)))
+    (let ((stored-start (max offset (stream-receive-offset stream)))
+          (stored-data (cond
+                         ((<= end (stream-receive-offset stream))
+                          (make-array 0 :element-type '(unsigned-byte 8)))
+                         ((< offset (stream-receive-offset stream))
+                          (subseq data (- (stream-receive-offset stream) offset)))
+                         (t (copy-seq data)))))
+      (when (plusp (length stored-data))
+        (%validate-segment stream stored-start stored-data)))
+    (let ((new-bytes (%range-new-length (stream-receive-ranges stream) offset end)))
+      (when (and (> new-bytes 0) (stream-flow-control stream))
+        (flow-control-note-received (stream-flow-control stream) new-bytes))
+      (when (< offset end)
+        (setf (stream-receive-ranges stream)
+              (%insert-range (stream-receive-ranges stream) offset end))))
+    (when fin
       (setf (stream-receive-final-size stream) end))
-    (when (> offset (stream-receive-offset stream))
-      (%insert-segment stream offset (copy-seq data)))
-    (when (= offset (stream-receive-offset stream))
-      (%insert-segment stream offset (copy-seq data)))
+    (when (> end (stream-receive-offset stream))
+      (%insert-segment stream (max offset (stream-receive-offset stream))
+                       (if (< offset (stream-receive-offset stream))
+                           (subseq data (- (stream-receive-offset stream) offset))
+                           (copy-seq data))))
     (%drain-contiguous stream)
     (list :offset offset :length (length data) :fin (not (null fin)))))
 

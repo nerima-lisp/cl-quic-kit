@@ -1,0 +1,56 @@
+(in-package #:cl-user)
+
+(defun protection-octets (hex)
+  (let ((result (make-array (/ (length hex) 2)
+                            :element-type '(unsigned-byte 8))))
+    (dotimes (i (length result) result)
+      (setf (aref result i)
+            (parse-integer hex :start (* i 2) :end (+ (* i 2) 2)
+                           :radix 16)))))
+
+(defun run-protection-tests ()
+  (let ((p (find-package "CL-QUIC-KIT.PROTECTION")))
+    (check (= (funcall (find-symbol "RECONSTRUCT-PACKET-NUMBER" p) #x9b 1 0)
+              #x9b)
+           "packet number reconstruction keeps an expected-window candidate")
+    (check (= (funcall (find-symbol "RECONSTRUCT-PACKET-NUMBER" p) #x09 1 #xabe8)
+              #xac09)
+           "packet number reconstruction selects the previous window")
+    (if (not (find-package "CRYPTO-KIT"))
+        (format t "RFC 9001 protection vectors pending: cl-crypto-kit backend is unavailable.~%")
+        (labels ((crypto (name)
+               (symbol-function (find-symbol name "CRYPTO-KIT"))))
+      (funcall (find-symbol "CONFIGURE-CRYPTO-BACKEND" p)
+               :hkdf-extract (crypto "HKDF-EXTRACT")
+               :hkdf-expand (crypto "HKDF-EXPAND")
+               :aead-seal (crypto "AEAD-SEAL")
+               :aead-open (crypto "AEAD-OPEN")
+               :aes-ecb (crypto "AES-ENCRYPT-BLOCK")
+               :chacha20 (crypto "CHACHA20-KEYSTREAM")
+               :constant-time-equal (crypto "CONSTANT-TIME-EQUAL"))
+      (let* ((keys (funcall (find-symbol "DERIVE-INITIAL-SECRETS" p)
+                            (protection-octets "8394c8f03e515708")))
+             (client (getf keys :client))
+             (retry-packet (protection-octets
+                            "ff000000010008f067a5502a4262b5746f6b656e"))
+             (retry-tag (funcall (find-symbol "RETRY-INTEGRITY-TAG" p)
+                                 retry-packet
+                                 :original-destination-connection-id
+                                 (protection-octets "8394c8f03e515708"))))
+        (check (equalp (getf keys :initial-secret)
+                       (protection-octets
+                        "7db5df06e7a69e432496adedb00851923595221596ae2ae9fb8115c1e9ed0a44"))
+               "RFC 9001 Appendix A initial secret")
+        (check (equalp (funcall (find-symbol "KEY-SET-KEY" p) client)
+                       (protection-octets "1f369613dd76d5467730efcbe3b1a22d"))
+               "RFC 9001 Appendix A client packet key")
+        (check (equalp retry-tag
+                       (protection-octets "04a265ba2eff4d829058fb3f0f2496ba"))
+               "RFC 9001 Retry integrity tag")
+        (check (funcall (find-symbol "VERIFY-RETRY-INTEGRITY" p)
+                        retry-packet retry-tag
+                        :original-destination-connection-id
+                        (protection-octets "8394c8f03e515708"))
+               "Retry integrity tag verifies"))))))
+
+(run-protection-tests)

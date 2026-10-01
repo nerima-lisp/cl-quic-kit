@@ -20,30 +20,56 @@
    #:ensure-octets
    #:packet-header
    #:make-packet-header
+   #:packet-header-p #:packet-header-type #:packet-header-version
+   #:packet-header-destination-connection-id #:packet-header-source-connection-id
+   #:packet-header-token #:packet-header-packet-number #:packet-header-packet-number-length
+   #:packet-header-payload #:packet-header-payload-length #:packet-header-long-p
+   #:packet-header-key-phase #:packet-header-retry-integrity-tag
    #:encode-packet-header
    #:decode-packet-header
    #:retry-integrity-tag
    #:verify-retry-integrity
+   #:encode-version-negotiation #:decode-version-negotiation
+   #:encode-transport-parameters #:decode-transport-parameters
    #:frame #:make-frame #:frame-type #:frame-fields #:frame-field
    #:encode-frame #:decode-frame #:encode-frames #:decode-frames
    #:flow-control-state #:make-flow-control-state
+   #:flow-control-connection-max-data #:flow-control-connection-sent
+   #:flow-control-connection-received #:flow-control-connection-receive-limit
+   #:flow-control-max-streams-bidi #:flow-control-max-streams-uni
+   #:flow-control-stream-count
    #:flow-control-open-stream #:flow-control-close-stream
    #:flow-control-can-send-p #:flow-control-reserve-send
    #:flow-control-note-received #:flow-control-update-max-data
+   #:flow-control-update-max-receive-data
    #:flow-control-update-max-streams #:flow-control-data-blocked-p
    #:flow-control-streams-blocked-p #:flow-control-error
    #:flow-control-limit-error #:stream-id-error
+   #:flow-control-error-limit #:flow-control-error-attempted
+   #:flow-control-mark-data-blocked #:flow-control-mark-streams-blocked
    #:stream #:make-stream #:stream-id #:stream-direction #:stream-initiator
    #:stream-local-p #:stream-write #:stream-finish #:stream-read
    #:stream-receive-data #:stream-reset-send #:stream-stop-sending
+   #:stream-reset-receive #:stream-stop-sending-receive
+   #:stream-send-offset #:stream-receive-offset #:stream-read-offset
+   #:stream-readable-bytes #:stream-set-max-send-offset
+   #:stream-set-max-receive-offset
    #:stream-finished-p #:stream-reset-p #:stream-stopped-p
    #:stream-pending-events #:stream-next-event
    #:quic-connection #:make-quic-connection #:connection-touch
+   #:connection-state
    #:connection-id-known-p #:connection-add-connection-id
    #:connection-retire-connection-id #:connection-idle-expired-p
    #:connection-close #:connection-check-idle-timeout #:connection-set-state
    #:connection-tls-feed #:connection-tls-poll #:connection-closed
-   #:connection-close-error-code #:connection-close-reason))
+   #:connection-close-error-code #:connection-close-reason
+   #:connection-active-connection-id-limit
+   #:connection-local-connection-ids #:connection-remote-connection-ids
+   #:connection-active-local-id #:connection-close-frame
+   #:connection-close-kind #:connection-draining-deadline
+   #:connection-handle-new-connection-id #:connection-handle-retire-connection-id
+   #:connection-receive-frame #:connection-receive-packet
+   #:connection-read #:connection-write #:connection-poll))
 
 (in-package #:cl-quic-kit)
 

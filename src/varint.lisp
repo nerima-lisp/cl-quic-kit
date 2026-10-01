@@ -1,18 +1,3 @@
-(defpackage #:cl-quic-kit
-  (:use #:cl)
-  (:export
-   #:quic-error #:quic-encoding-error #:quic-crypto-error
-   #:encode-varint #:decode-varint #:varint-length #:varint-p
-   #:octets-copy #:ensure-octets
-   #:make-packet-header #:packet-header-p #:packet-header-type
-   #:packet-header-version #:packet-header-destination-connection-id
-   #:packet-header-source-connection-id #:packet-header-token
-   #:packet-header-packet-number #:packet-header-payload
-   #:encode-packet-header #:decode-packet-header
-   #:retry-integrity-tag #:verify-retry-integrity #:*retry-integrity-tag-function*
-   #:make-frame #:frame-p #:frame-type #:frame-fields #:frame-field
-   #:encode-frame #:decode-frame #:encode-frames #:decode-frames))
-
 (in-package #:cl-quic-kit)
 
 (define-condition quic-error (error) ())
@@ -24,8 +9,7 @@
   (:report (lambda (c s) (write-string (quic-crypto-error-message c) s))))
 
 (defun ensure-octets (value)
-  (unless (and (arrayp value) (= (array-rank value) 1)
-               (every (lambda (x) (and (integerp x) (<= 0 x 255))) value))
+  (unless (typep value '(simple-array (unsigned-byte 8) (*)))
     (error 'quic-encoding-error :message "Expected a one-dimensional octet vector"))
   value)
 
@@ -57,7 +41,7 @@
 (defun decode-varint (bytes &optional (start 0))
   (let* ((bytes (ensure-octets bytes))
          (remaining (- (length bytes) start)))
-    (when (or (< start 0) (< remaining 1))
+    (when (or (< start 0) (> start (length bytes)) (< remaining 1))
       (error 'quic-encoding-error :message "Truncated QUIC varint"))
     (let* ((first (aref bytes start))
            (size (ash 1 (ldb (byte 2 6) first))))

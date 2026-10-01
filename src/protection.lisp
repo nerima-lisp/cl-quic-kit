@@ -6,9 +6,12 @@
            #:derive-initial-secrets #:make-key-set #:key-set-key #:key-set-iv #:key-set-hp
            #:key-set-cipher
            #:protect-payload #:unprotect-payload #:apply-header-protection
-           #:remove-header-protection))
+           #:remove-header-protection #:reconstruct-packet-number
+           #:retry-integrity-tag #:verify-retry-integrity))
 
 (in-package #:cl-quic-kit.protection)
+
+(declaim (ftype function retry-integrity-tag))
 
 (define-condition crypto-not-implemented (error)
   ((operation :initarg :operation :reader crypto-operation))
@@ -24,21 +27,29 @@
 (defvar *aead-open* nil)
 (defvar *aes-ecb* nil)
 (defvar *chacha20* nil)
+(defvar *constant-time-equal* nil)
 
 (defun configure-crypto-backend (&key hkdf-extract hkdf-expand aead-seal aead-open
-                                      aes-ecb chacha20)
+                                      aes-ecb chacha20 constant-time-equal)
   "Install cl-crypto-kit adapters.
-HKDF expand receives (prk info length), AEAD receives (key nonce data aad), and
-header protection receives (key sample) for AES or (key sample counter) for ChaCha."
+HKDF receives (algorithm salt ikm) and (algorithm prk info length),
+AEAD receives (algorithm key nonce data aad),
+and header protection receives (key block16) for AES or (key counter nonce length)
+for ChaCha."
   (setf *hkdf-extract* hkdf-extract *hkdf-expand* hkdf-expand
         *aead-seal* aead-seal *aead-open* aead-open *aes-ecb* aes-ecb
-        *chacha20* chacha20)
+        *chacha20* chacha20 *constant-time-equal* constant-time-equal)
+  (setf cl-quic-kit::*retry-integrity-tag-function*
+        (lambda (retry-packet original-destination-connection-id)
+          (retry-integrity-tag retry-packet
+                               :original-destination-connection-id
+                               original-destination-connection-id)))
   t)
 
 (defun %require-crypto (operation function)
   (or function (error 'crypto-not-implemented :operation operation)))
 
-(defun %octets (value name)
+(defun %protection-octets (value name)
   (declare (ignore name))
   (unless (and (vectorp value)
                (every (lambda (x) (typep x '(unsigned-byte 8))) value))
@@ -60,40 +71,45 @@ header protection receives (key sample) for AES or (key sample counter) for ChaC
   (vector (ldb (byte 8 8) number) (ldb (byte 8 0) number)))
 
 (defun %hkdf-label (label context length)
-  (let* ((full (%concat (%ascii "quic ") (%ascii label)))
-         (ctx (%octets context "context")))
+  (let* ((full (%concat (%ascii "tls13 ") (%ascii label)))
+         (ctx (%protection-octets context "context")))
     (%concat (%u16 length) (vector (length full)) full
              (vector (length ctx)) ctx)))
 
-(defun %expand-label (secret label context length)
+(defun %expand-label (hash-algorithm secret label context length)
   (funcall (%require-crypto :hkdf-expand *hkdf-expand*)
-           secret (%hkdf-label label context length) length))
+           hash-algorithm secret (%hkdf-label label context length) length))
 
 (defstruct (key-set (:constructor %make-key-set (key iv hp cipher)))
   key iv hp cipher)
 
-(defun make-key-set (secret &key (cipher :aes-128-gcm) (key-length 16)
+(defun make-key-set (secret &key (cipher :aes-128-gcm) (hash-algorithm :sha256)
+                             (key-length 16)
                              (iv-length 12) (hp-length 16))
-  (let ((secret (%octets secret "secret")))
-    (%make-key-set (%expand-label secret "quic key" #() key-length)
-                   (%expand-label secret "quic iv" #() iv-length)
-                   (%expand-label secret "quic hp" #() hp-length)
+  (let ((secret (%protection-octets secret "secret")))
+    (%make-key-set (%expand-label hash-algorithm secret "quic key" #() key-length)
+                   (%expand-label hash-algorithm secret "quic iv" #() iv-length)
+                   (%expand-label hash-algorithm secret "quic hp" #() hp-length)
                    cipher)))
 
 (defun derive-initial-secrets (destination-connection-id
-                               &key (salt *initial-salt*) (hash-length 16)
+                               &key (salt *initial-salt*) (hash-algorithm :sha256)
+                                 (hash-length 32)
                                  (cipher :aes-128-gcm) (key-length 16)
                                  (iv-length 12) (hp-length 16))
   "Derive RFC 9001 section 5.2 client/server Initial packet keys."
-  (let* ((dcid (%octets destination-connection-id "destination-connection-id"))
-         (salt (%octets salt "salt"))
-         (initial (funcall (%require-crypto :hkdf-extract *hkdf-extract*) salt dcid))
-         (client-secret (%expand-label initial "client in" #() hash-length))
-         (server-secret (%expand-label initial "server in" #() hash-length)))
+  (let* ((dcid (%protection-octets destination-connection-id "destination-connection-id"))
+         (salt (%protection-octets salt "salt"))
+         (initial (funcall (%require-crypto :hkdf-extract *hkdf-extract*)
+                           hash-algorithm salt dcid))
+         (client-secret (%expand-label hash-algorithm initial "client in" #() hash-length))
+         (server-secret (%expand-label hash-algorithm initial "server in" #() hash-length)))
     (list :initial-secret initial :client-secret client-secret :server-secret server-secret
-          :client (make-key-set client-secret :cipher cipher :key-length key-length
+          :client (make-key-set client-secret :cipher cipher :hash-algorithm hash-algorithm
+                                :key-length key-length
                                 :iv-length iv-length :hp-length hp-length)
-          :server (make-key-set server-secret :cipher cipher :key-length key-length
+          :server (make-key-set server-secret :cipher cipher :hash-algorithm hash-algorithm
+                                :key-length key-length
                                 :iv-length iv-length :hp-length hp-length))))
 
 (defun %nonce (iv packet-number)
@@ -106,27 +122,37 @@ header protection receives (key sample) for AES or (key sample counter) for ChaC
 
 (defun protect-payload (key-set packet-number plaintext associated-data)
   (funcall (%require-crypto :aead-seal *aead-seal*)
-           (key-set-key key-set) (%nonce (key-set-iv key-set) packet-number)
-           (%octets plaintext "plaintext") (%octets associated-data "associated-data")))
+           (key-set-cipher key-set) (key-set-key key-set)
+           (%nonce (key-set-iv key-set) packet-number)
+           (%protection-octets plaintext "plaintext") (%protection-octets associated-data "associated-data")))
 
 (defun unprotect-payload (key-set packet-number ciphertext associated-data)
   (funcall (%require-crypto :aead-open *aead-open*)
-           (key-set-key key-set) (%nonce (key-set-iv key-set) packet-number)
-           (%octets ciphertext "ciphertext") (%octets associated-data "associated-data")))
+           (key-set-cipher key-set) (key-set-key key-set)
+           (%nonce (key-set-iv key-set) packet-number)
+           (%protection-octets ciphertext "ciphertext") (%protection-octets associated-data "associated-data")))
 
 (defun %header-mask (key-set sample)
+  (when (< (length sample) 16)
+    (error "QUIC header protection sample must be 16 octets"))
   (subseq (ecase (key-set-cipher key-set)
             ((:aes-128-gcm :aes-256-gcm)
              (funcall (%require-crypto :aes-ecb *aes-ecb*)
-                      (key-set-hp key-set) (%octets sample "sample")))
+                      (key-set-hp key-set) (%protection-octets sample "sample")))
             (:chacha20
-             (funcall (%require-crypto :chacha20 *chacha20*)
-                      (key-set-hp key-set) (%octets sample "sample") 0)))
+             (let ((sample (%protection-octets sample "sample")))
+               (funcall (%require-crypto :chacha20 *chacha20*)
+                        (key-set-hp key-set)
+                        (+ (aref sample 12)
+                           (ash (aref sample 13) 8)
+                           (ash (aref sample 14) 16)
+                           (ash (aref sample 15) 24))
+                        (subseq sample 0 12) 5))))
           0 5))
 
 (defun apply-header-protection (key-set packet sample packet-number-offset
                                  packet-number-length long-header-p)
-  (let* ((result (copy-seq (%octets packet "packet")))
+  (let* ((result (copy-seq (%protection-octets packet "packet")))
          (mask (%header-mask key-set sample))
          (first-mask (if long-header-p #x0f #x1f)))
     (setf (aref result 0) (logxor (aref result 0)
@@ -140,3 +166,52 @@ header protection receives (key sample) for AES or (key sample counter) for ChaC
 (defun remove-header-protection (&rest arguments)
   "Header protection is XOR and therefore uses the same operation to remove it."
   (apply #'apply-header-protection arguments))
+
+(defun reconstruct-packet-number (truncated-packet-number packet-number-length
+                                  largest-received-packet-number)
+  "Reconstruct a full packet number as specified by RFC 9000 Appendix A."
+  (check-type packet-number-length (integer 1 4))
+  (let* ((pn-bits (* 8 packet-number-length))
+         (pn-window (ash 1 pn-bits))
+         (pn-half-window (ash pn-window -1))
+         (pn-mask (1- pn-window))
+         (expected (1+ largest-received-packet-number))
+         (candidate (logior (logand truncated-packet-number pn-mask)
+                            (logand expected (lognot pn-mask)))))
+    (cond ((and (<= candidate (- expected pn-half-window))
+                (< candidate (- (ash 1 62) pn-window)))
+           (+ candidate pn-window))
+          ((and (> candidate (+ expected pn-half-window))
+                (>= candidate pn-window))
+           (- candidate pn-window))
+          (t candidate))))
+
+(defparameter *retry-integrity-key*
+  #(190 12 105 11 159 102 87 90 29 118 107 84 227 104 200 78))
+(defparameter *retry-integrity-nonce*
+  #(70 21 153 211 93 99 43 242 35 152 37 187))
+
+(defun retry-integrity-tag (retry-packet &key original-destination-connection-id)
+  "Return the RFC 9001 v1 Retry Integrity Tag for RETRY-PACKET.
+RETRY-PACKET excludes its 16-octet tag; the ODCID is prepended to form AAD."
+  (let ((odcid (%protection-octets original-destination-connection-id
+                         "original-destination-connection-id")))
+    (funcall (%require-crypto :retry-integrity-aead *aead-seal*)
+             :aes-128-gcm *retry-integrity-key* *retry-integrity-nonce* #()
+             (%concat (vector (length odcid)) odcid
+                      (%protection-octets retry-packet "retry-packet")))))
+
+(defun verify-retry-integrity (retry-packet tag &key original-destination-connection-id)
+  (let ((expected (retry-integrity-tag retry-packet
+                                       :original-destination-connection-id
+                                       original-destination-connection-id))
+        (actual (%protection-octets tag "tag")))
+    (if *constant-time-equal*
+        (funcall *constant-time-equal* expected actual)
+        (let ((difference (logxor (length expected) (length actual))))
+          (dotimes (i (max (length expected) (length actual))
+                   (zerop difference))
+            (setf difference
+                  (logior difference
+                          (if (< i (length expected)) (aref expected i) 0)
+                          (if (< i (length actual)) (aref actual i) 0))))))))
