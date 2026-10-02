@@ -300,6 +300,19 @@
 (load (merge-pathnames "client.lisp"
                        (or *load-truename* *default-pathname-defaults*)))
 
+(let* ((client (cl-quic-kit:make-quic-client))
+       (control (cl-quic-kit:client-open-stream client nil :stream-type :control)))
+  (check (= (cl-quic-kit::stream-send-offset control) 1)
+         "HTTP/3 unidirectional stream reserves its type byte"))
+
+(let ((client (cl-quic-kit:make-quic-client)))
+  (setf (cl-quic-kit::quic-client-received-packets client)
+        (list (cons :1-rtt '(6 5 3 2))))
+  (let ((frame (cl-quic-kit::%client-ack-frame client :1-rtt)))
+    (check (equal (cl-quic-kit:frame-field frame :ranges)
+                  '((6 . 1) (:gap 0 :range-length 1)))
+           "ACK encodes the gap between disjoint packet ranges")))
+
 (defun %client-test-octets (values)
   (make-array (length values) :element-type '(unsigned-byte 8)
               :initial-contents values))

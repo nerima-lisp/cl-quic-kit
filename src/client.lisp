@@ -11,7 +11,7 @@
   packet-numbers received-packets keys recovery sent-packets clock
   local-connection-id server-host server-port hostname alpn
   transport-parameters tls-key-exchange tls-provider tls-trust-anchors
-  tls-verify-signature client-hello-wire)
+  tls-verify-signature tls-signature-algorithms client-hello-wire)
 
 (declaim (ftype function client-tls-feed client-receive-datagram
                         client-flush %client-find-or-create-peer-stream
@@ -77,7 +77,7 @@
 
 (defun %client-stream-type (stream-type)
   (case stream-type
-    (:control 2) (:qpack-encoder 6) (:qpack-decoder 10) (otherwise nil)))
+    (:control 0) (:qpack-encoder 2) (:qpack-decoder 3) (otherwise nil)))
 
 (defun %client-driver-suite-cipher (driver)
   (case (%client-driver-slot driver "TLS13-CLIENT-DRIVER-SUITE")
@@ -340,12 +340,18 @@
   (let ((ranges (%client-frame-ranges
                  (%client-level-value (quic-client-received-packets client) level))))
     (when ranges
-      (make-frame :ack :largest-acknowledged (caar ranges) :ack-delay 0
-                  :ranges (cons (car ranges)
-                                (mapcar (lambda (range)
-                                          (list :gap (- (cdar ranges) (car range) 2)
-                                                :range-length (cdr range)))
-                                        (cdr ranges)))))))
+      (let ((previous-smallest (- (caar ranges) (cdar ranges))))
+        (make-frame :ack :largest-acknowledged (caar ranges) :ack-delay 0
+                    :ranges
+                    (cons (car ranges)
+                          (mapcar
+                           (lambda (range)
+                             (prog1 (list :gap (- previous-smallest
+                                                   (car range) 2)
+                                          :range-length (cdr range))
+                               (setf previous-smallest
+                                     (- (car range) (cdr range)))))
+                           (cdr ranges))))))))
 
 (defun %client-sent-packet-number (packet)
   (let ((reader (%client-function "CL-QUIC-KIT.RECOVERY" "SENT-PACKET-NUMBER")))
@@ -443,6 +449,7 @@
                               server-host server-port hostname (alpn '("h3"))
                               transport-parameters tls-key-exchange tls-provider
                               tls-trust-anchors tls-verify-signature now-fn
+                              tls-signature-algorithms
                               idle-timeout io-write on-close)
   "Create a protected QUIC client and its HTTP stream facade."
   (let* ((udp (or udp-socket
@@ -477,7 +484,8 @@
                                             (%client-transport-parameters local))
                   :tls-key-exchange tls-key-exchange :tls-provider tls-provider
                   :tls-trust-anchors tls-trust-anchors
-                  :tls-verify-signature tls-verify-signature)))
+                  :tls-verify-signature tls-verify-signature
+                  :tls-signature-algorithms tls-signature-algorithms)))
     (handler-case
         (let ((initial (cl-quic-kit.protection:derive-initial-secrets destination)))
           (%client-set-key client :initial :write (getf initial :client))
@@ -498,6 +506,7 @@
          (stream (make-stream id :local-initiator :client)))
     (setf (gethash id (quic-client-streams client)) stream)
     (when uni-type
+      (incf (stream-send-offset stream) (length (encode-varint uni-type)))
       (%client-queue-frame client
                            (make-frame :stream :stream-id id :offset 0
                                        :data (encode-varint uni-type)
@@ -598,6 +607,10 @@
             (multiple-value-bind (level number header)
                 (%client-unprotect-packet client slice layout)
               (when header
+                (when (and (member level '(:initial :handshake))
+                           (plusp (length (packet-header-source-connection-id header))))
+                  (setf (quic-client-remote-connection-id client)
+                        (packet-header-source-connection-id header)))
                 (let ((frames (decode-frames (packet-header-payload header))))
                   (%client-receive-frames client level number frames)
                   (setf last-header header)))
@@ -721,7 +734,11 @@
                                                (subseq transcript 0
                                                        (- (length transcript)
                                                           (length wire)))
-                                               sent))))))))))
+                                     sent))))))))))
+      (when (quic-client-tls-signature-algorithms client)
+        (%client-driver-set-slot
+         driver "TLS13-CLIENT-DRIVER-SIGNATURE-ALGORITHMS"
+         (quic-client-tls-signature-algorithms client)))
       (setf (quic-client-tls-driver client) driver)
       driver)))
 
