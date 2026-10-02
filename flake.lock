@@ -23,11 +23,11 @@
     "cl-crypto-kit_2": {
       "flake": false,
       "locked": {
-        "lastModified": 1790920154,
-        "narHash": "sha256-3EZACudiOvkThjXTV9WUKMRDBK1Sd7QK1JSAvHodJls=",
+        "lastModified": 1790965946,
+        "narHash": "sha256-awKWmWsoFvw0I6JbAOHyR/dNWLxlKgQ+BhuoUS49Rro=",
         "owner": "nerima-lisp",
         "repo": "cl-crypto-kit",
-        "rev": "5be434a17f8756ffd921313fc198407726ede3a8",
+        "rev": "6462b87b0e8177062d680ba8bdfb2cb58cb0445f",
         "type": "github"
       },
       "original": {
@@ -92,11 +92,11 @@
         "nixpkgs": "nixpkgs_2"
       },
       "locked": {
-        "lastModified": 1790943415,
-        "narHash": "sha256-AGx8wE3RolGEwXbhKVAlBmlgW7D9kp2SFM0z4MXcrOM=",
+        "lastModified": 1790952427,
+        "narHash": "sha256-gqehLhGTWMFycKoXt/2c/TTrijASJFdS8cXy3n5vpRw=",
         "owner": "nerima-lisp",
         "repo": "cl-tls-kit",
-        "rev": "f670518cca12b57a9cde5f61d35d055a7df3a540",
+        "rev": "148f68dd7ffbd14efa5b7dc0d465e70a6d95791b",
         "type": "github"
       },
       "original": {
