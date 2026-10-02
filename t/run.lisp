@@ -1,12 +1,14 @@
-(ignore-errors (require :asdf))
+(require :asdf)
 (when (find-package :asdf)
-  (ignore-errors (asdf:load-system "cl-crypto-kit")))
+  (asdf:load-system "cl-crypto-kit")
+  (asdf:load-system "cl-tls-kit"))
 
 (load (merge-pathnames "../package.lisp"
                        (or *load-truename* *default-pathname-defaults*)))
 
 (dolist (file '("src/varint.lisp" "src/packet.lisp" "src/frame.lisp"
                 "src/flow-control.lisp" "src/stream.lisp" "src/state.lisp"
+                "src/udp.lisp" "src/client.lisp"
                 "src/protection.lisp" "src/recovery.lisp"))
   (load (merge-pathnames (concatenate 'string "../" file)
                          (or *load-truename* *default-pathname-defaults*))))
@@ -21,6 +23,7 @@
              :aead-seal (funcall crypto "AEAD-SEAL")
              :aead-open (funcall crypto "AEAD-OPEN")
              :aes-ecb (funcall crypto "AES-ENCRYPT-BLOCK")
+             :chacha20 (funcall crypto "CHACHA20-KEYSTREAM")
              :constant-time-equal (funcall crypto "CONSTANT-TIME-EQUAL"))))
 
 (in-package #:cl-user)
@@ -214,6 +217,11 @@
     (check (= (length lost) 1) "packet threshold marks packet three numbers behind lost")))
 (let ((state (cl-quic-kit.recovery:make-recovery-state :clock (lambda () 1))))
   (cl-quic-kit.recovery:record-sent-packet state :application 1 1200 :sent-at 0)
+  (cl-quic-kit.recovery:record-sent-packet state :application 2 1200
+                                           :ack-eliciting-p nil :in-flight-p nil
+                                           :sent-at 0)
+  (cl-quic-kit.recovery:on-ack-frame state :application 2 '((2 2))
+                                     :received-at 0)
   (check (= (cl-quic-kit.recovery:loss-timeout state :application)
             (* 9/8 333/1000))
          "loss timeout exposes the earliest time-threshold deadline"))
@@ -233,9 +241,15 @@
             (+ (* 2 333/1000) (* 2 333/1000)))
          "PTO deadline doubles after an expiry"))
 (let ((state (cl-quic-kit.recovery:make-recovery-state :clock (lambda () 4))))
-  (dotimes (number 4)
+  (cl-quic-kit.recovery:record-sent-packet state :application 0 1200 :sent-at 0)
+  (cl-quic-kit.recovery:on-ack-frame state :application 0 '((0 0))
+                                     :received-at 1/10)
+  (dotimes (number 3)
     (cl-quic-kit.recovery:record-sent-packet state :application (1+ number) 1200
                                              :sent-at number))
+  (cl-quic-kit.recovery:record-sent-packet state :application 4 1200
+                                           :ack-eliciting-p nil :in-flight-p nil
+                                           :sent-at 3)
   (multiple-value-bind (acked lost)
       (cl-quic-kit.recovery:on-ack-frame state :application 4 '((4 4))
                                          :received-at 4)
@@ -261,5 +275,7 @@
   (check (= (cl-quic-kit.recovery:recovery-state-cwnd state) 6818)
          "NewReno congestion avoidance grows cwnd by MSS squared over cwnd"))
 (load (merge-pathnames "protection.lisp"
+                       (or *load-truename* *default-pathname-defaults*)))
+(load (merge-pathnames "client.lisp"
                        (or *load-truename* *default-pathname-defaults*)))
 (format t "~D tests passed.~%" *tests-run*)
