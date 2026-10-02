@@ -75,6 +75,21 @@
         ((stringp reason) (map '(vector (unsigned-byte 8)) #'char-code reason))
         (t (%client-octets reason))))
 
+(defun %client-crypto-signature-scheme (scheme)
+  (case scheme
+    (:ecdsa-secp256r1-sha256 :ecdsa-p256-sha256)
+    (:ecdsa-secp384r1-sha384 :ecdsa-p384-sha384)
+    (:ecdsa-secp521r1-sha512 :ecdsa-p521-sha512)
+    (otherwise scheme)))
+
+(defun %client-signature-verifier (client)
+  (let ((verify (or (quic-client-tls-verify-signature client)
+                    (%client-function "CRYPTO-KIT" "VERIFY-SIGNATURE"))))
+    (when verify
+      (lambda (scheme public-key message signature)
+        (funcall verify (%client-crypto-signature-scheme scheme)
+                 public-key message signature)))))
+
 (defun %client-stream-type (stream-type)
   (case stream-type
     (:control 0) (:qpack-encoder 2) (:qpack-decoder 3) (otherwise nil)))
@@ -236,8 +251,9 @@
                       truncated pn-length largest))
              (associated (subseq unmasked 0 (+ pn-offset pn-length)))
              (ciphertext (subseq unmasked (+ pn-offset pn-length)))
-             (plaintext (cl-quic-kit.protection:unprotect-payload
-                        key number ciphertext associated)))
+             (plaintext
+               (cl-quic-kit.protection:unprotect-payload
+                key number ciphertext associated)))
         (values level number
                 (make-packet-header
                  :type type :version (getf layout :version)
@@ -697,7 +713,7 @@
                      :hostname (quic-client-hostname client)
                      :alpn (quic-client-alpn client)
                      :trust-anchors (quic-client-tls-trust-anchors client)
-                     :verify-signature (quic-client-tls-verify-signature client)
+                     :verify-signature (%client-signature-verifier client)
                      :on-send
                      (lambda (driver wire)
                        (let* ((type (aref wire 0))

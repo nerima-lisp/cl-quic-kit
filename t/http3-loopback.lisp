@@ -53,14 +53,6 @@
     (cl-tls-kit.x509:parse-certificate-der
      (cl-tls-kit:pem-block-der certificate))))
 
-(defun %verify-signature (scheme public-key message signature)
-  (crypto-kit:verify-signature
-   (case scheme
-     (:ecdsa-secp256r1-sha256 :ecdsa-p256-sha256)
-     (:ecdsa-secp384r1-sha384 :ecdsa-p384-sha384)
-     (otherwise scheme))
-   public-key message signature))
-
 (defun %wait-for-handshake (client)
   (loop repeat 3000 do
     (cl-quic-kit:client-poll client)
@@ -81,7 +73,7 @@
                 :hostname "localhost"
                 :alpn (list "h3")
                 :tls-trust-anchors (list (%read-anchor))
-                :tls-verify-signature #'%verify-signature
+                :tls-verify-signature #'crypto-kit:verify-signature
                 :tls-signature-algorithms #(1027)
                 :now-fn now
                 :idle-timeout 30)))

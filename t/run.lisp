@@ -313,6 +313,11 @@
                   '((6 . 1) (:gap 0 :range-length 1)))
            "ACK encodes the gap between disjoint packet ranges")))
 
+(check (eq (cl-quic-kit::%client-crypto-signature-scheme
+            :ecdsa-secp256r1-sha256)
+           :ecdsa-p256-sha256)
+       "TLS ECDSA scheme is normalized at the client provider boundary")
+
 (defun %client-test-octets (values)
   (make-array (length values) :element-type '(unsigned-byte 8)
               :initial-contents values))
