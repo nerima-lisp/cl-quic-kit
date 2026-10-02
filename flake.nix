@@ -31,10 +31,15 @@
         '';
       });
 
-      devShells = forEachSystem (_system: pkgs: {
-        default = pkgs.mkShell {
-          packages = [ pkgs.sbcl ];
-        };
-      });
+      devShells = forEachSystem (system: pkgs:
+        let
+          crypto = cl-crypto-kit.packages.${system}.default;
+          tls = cl-tls-kit.packages.${system}.default;
+        in {
+          default = pkgs.mkShell {
+            packages = [ pkgs.sbcl ];
+            CL_SOURCE_REGISTRY = "${tls}/share/common-lisp/source//:${crypto}/share/common-lisp/source//";
+          };
+        });
     };
 }

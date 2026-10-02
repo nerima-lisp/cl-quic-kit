@@ -5,10 +5,15 @@ on:
   pull_request:
 
 jobs:
-  bootstrap:
-    runs-on: ubuntu-latest
+  nix-flake-check:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-14
+          - os: ubuntu-24.04
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
-      - uses: cachix/install-nix-action@v30
-      - run: nix flake check --all-systems --no-write-lock-file
-      - run: nix develop --command sbcl --non-interactive --load t/run.lisp
+      - uses: DeterminateSystems/nix-installer-action@v20
+      - run: nix flake check
