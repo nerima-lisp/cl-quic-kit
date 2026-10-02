@@ -69,7 +69,16 @@
    #:connection-close-kind #:connection-draining-deadline
    #:connection-handle-new-connection-id #:connection-handle-retire-connection-id
    #:connection-receive-frame #:connection-receive-packet
-   #:connection-read #:connection-write #:connection-poll))
+   #:connection-read #:connection-write #:connection-poll
+   #:udp-socket #:make-udp-socket #:udp-socket-local-port
+   #:udp-send #:udp-receive #:udp-close
+   #:quic-client #:make-quic-client #:client-open-stream
+   #:client-write-stream #:client-read-stream #:client-close-stream
+   #:client-flush #:client-receive-frame #:client-receive-datagram
+   #:make-client-tls-boundary #:client-tls-feed #:client-poll #:client-close
+   #:quic-client-connection #:quic-client-udp-socket
+   #:quic-client-tls-boundary #:quic-client-tls-secrets
+   #:quic-client-peer-transport-parameters))
 
 (in-package #:cl-quic-kit)
 
@@ -102,11 +111,17 @@ RFC 9000 permits connection IDs from zero through twenty octets."
   value)
 
 (defun crypto-available-p ()
-  "Report whether the optional crypto implementation package is loaded."
-  (not (null (find-package "CL-CRYPTO-KIT"))))
+  "Report whether the cl-crypto-kit implementation package is loaded."
+  (not (null (find-package "CRYPTO-KIT"))))
 
 (defun require-crypto (operation)
-  "Signal a clear boundary error until the crypto backend implements OPERATION."
+  "Return the requested cl-crypto-kit function or signal a boundary error."
   (unless (crypto-available-p)
     (error 'crypto-unavailable :operation operation))
-  (error 'crypto-unavailable :operation operation))
+  (let* ((name (etypecase operation
+                 (symbol (symbol-name operation))
+                 (string operation)))
+         (symbol (find-symbol name "CRYPTO-KIT")))
+    (if (and symbol (fboundp symbol))
+        (symbol-function symbol)
+        (error 'crypto-unavailable :operation operation))))
