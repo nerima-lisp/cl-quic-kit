@@ -457,7 +457,8 @@
       ((:connection-close :application-close)
        (connection-receive-frame (quic-client-connection client) frame))
       (:handshake-done
-       (connection-set-state (quic-client-connection client) :established))
+       (unless (quic-client-closed-p client)
+         (connection-set-state (quic-client-connection client) :established)))
       (otherwise nil))))
 
 (defun make-quic-client (&key connection udp-socket tls-boundary tls-driver
@@ -610,6 +611,8 @@
 
 (defun client-receive-datagram (client bytes &key (short-header-dcid-length 8))
   "Decrypt and dispatch all packets in one UDP datagram."
+  (when (quic-client-closed-p client)
+    (return-from client-receive-datagram nil))
   (handler-case
       (let ((bytes (ensure-octets bytes)) (at 0) (last-header nil))
         (loop while (< at (length bytes)) do

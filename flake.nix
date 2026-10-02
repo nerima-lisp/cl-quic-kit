@@ -86,7 +86,7 @@
             exit 1
           fi
           proxy_pid=
-          "$TMPDIR/udp-proxy" 18444 18443 1 > "$TMPDIR/proxy.log" 2>&1 &
+          "$TMPDIR/udp-proxy" 18444 18443 1 20 0 > "$TMPDIR/proxy.log" 2>&1 &
           proxy_pid=$!
           attempts=0
           while ! grep -q 'udp-proxy listening' "$TMPDIR/proxy.log"; do
@@ -109,9 +109,38 @@
             exit 1
           fi
           grep -q 'udp-proxy dropped server packet' "$TMPDIR/proxy.log"
-          # Caddy's Caddyfile does not expose QUIC Retry forcing.  The
-          # Retry integrity and client restart path remains covered by t/run.lisp.
-          echo 'Caddy Retry forcing is unavailable in its Caddyfile; synthetic Retry coverage passed.'
+          grep -q 'loss=20% mutate-1rtt=0' "$TMPDIR/proxy.log"
+          kill "$proxy_pid" 2>/dev/null || true
+          wait "$proxy_pid" 2>/dev/null || true
+          proxy_pid=
+          "$TMPDIR/udp-proxy" 18445 18443 0 0 1 > "$TMPDIR/malformed-proxy.log" 2>&1 &
+          proxy_pid=$!
+          attempts=0
+          while ! grep -q 'udp-proxy listening' "$TMPDIR/malformed-proxy.log"; do
+            attempts=$((attempts + 1))
+            if [ "$attempts" -ge 200 ]; then
+              cat "$TMPDIR/malformed-proxy.log"
+              exit 1
+            fi
+            if ! kill -0 "$proxy_pid" 2>/dev/null; then
+              cat "$TMPDIR/malformed-proxy.log"
+              exit 1
+            fi
+            sleep 0.05
+          done
+          if ! HOME="$TMPDIR" XDG_CACHE_HOME="$XDG_CACHE_HOME" \
+            CADDY_ROOT="$TMPDIR/self.crt" QUIC_PORT=18445 \
+            EXPECT_CONNECTION_CLOSE=1 \
+            sbcl --non-interactive --load t/http3-loopback.lisp; then
+            cat "$TMPDIR/caddy.log"
+            cat "$TMPDIR/malformed-proxy.log"
+            exit 1
+          fi
+          grep -q 'udp-proxy mutated server 1-rtt packet' "$TMPDIR/malformed-proxy.log"
+          # Caddy's Caddyfile does not expose QUIC Retry forcing. The
+          # deterministic RFC 9001 Appendix A.4 Retry vector and client restart
+          # path are executed by t/protection.lisp loaded from t/run.lisp.
+          echo 'Caddy Retry forcing is unavailable in its Caddyfile; RFC 9001 Appendix A.4 vector passed.'
           touch "$out"
         '';
       });

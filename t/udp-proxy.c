@@ -34,6 +34,11 @@ static int parse_nonnegative(const char *text) {
   return (int)value;
 }
 
+static int parse_percentage(const char *text) {
+  int value = parse_nonnegative(text);
+  return value >= 0 && value <= 100 ? value : -1;
+}
+
 static bool same_address(const struct sockaddr_in *left,
                          const struct sockaddr_in *right) {
   return left->sin_family == right->sin_family &&
@@ -42,15 +47,20 @@ static bool same_address(const struct sockaddr_in *left,
 }
 
 int main(int argc, char **argv) {
-  if (argc != 4) {
-    fprintf(stderr, "usage: %s LISTEN_PORT UPSTREAM_PORT DROP_SERVER_PACKETS\n",
+  if (argc < 4 || argc > 6) {
+    fprintf(stderr,
+            "usage: %s LISTEN_PORT UPSTREAM_PORT DROP_SERVER_PACKETS "
+            "DROP_SERVER_PERCENT MUTATE_1RTT\n",
             argv[0]);
     return 2;
   }
   int listen_port = parse_port(argv[1]);
   int upstream_port = parse_port(argv[2]);
   int drops_remaining = parse_nonnegative(argv[3]);
-  if (listen_port < 0 || upstream_port < 0 || drops_remaining < 0) {
+  int drop_percent = argc >= 5 ? parse_percentage(argv[4]) : 0;
+  int mutate_1rtt = argc >= 6 ? parse_nonnegative(argv[5]) : 0;
+  if (listen_port < 0 || upstream_port < 0 || drops_remaining < 0 ||
+      drop_percent < 0 || mutate_1rtt < 0 || mutate_1rtt > 1) {
     fputs("invalid UDP proxy argument\n", stderr);
     return 2;
   }
@@ -87,8 +97,12 @@ int main(int argc, char **argv) {
   signal(SIGINT, stop_proxy);
   signal(SIGTERM, stop_proxy);
   unsigned char buffer[65536];
-  fprintf(stderr, "udp-proxy listening on 127.0.0.1:%d -> 127.0.0.1:%d\n",
-          listen_port, upstream_port);
+  unsigned long server_packets = 0;
+  bool mutated_1rtt = false;
+  fprintf(stderr,
+          "udp-proxy listening on 127.0.0.1:%d -> 127.0.0.1:%d "
+          "loss=%d%% mutate-1rtt=%d\n",
+          listen_port, upstream_port, drop_percent, mutate_1rtt);
   while (!stop_requested) {
     fd_set read_set;
     FD_ZERO(&read_set);
@@ -118,11 +132,25 @@ int main(int argc, char **argv) {
     if (same_address(&source_address, &upstream_address)) {
       if (!have_client)
         continue;
-      if (drops_remaining > 0) {
-        --drops_remaining;
-        fprintf(stderr, "udp-proxy dropped server packet (%zd bytes), %d left\n",
-                received, drops_remaining);
+      ++server_packets;
+      bool percentage_drop = drop_percent > 0 &&
+                             ((server_packets * 37u) % 100u) <
+                                 (unsigned int)drop_percent;
+      if (drops_remaining > 0 || percentage_drop) {
+        if (drops_remaining > 0)
+          --drops_remaining;
+        fprintf(stderr,
+                "udp-proxy dropped server packet (%zd bytes), %d left "
+                "(%d%% schedule)\n",
+                received, drops_remaining, drop_percent);
         continue;
+      }
+      if (mutate_1rtt && !mutated_1rtt && received > 20 &&
+          (buffer[0] & 0x80u) == 0) {
+        buffer[received - 1] ^= 1;
+        mutated_1rtt = true;
+        fprintf(stderr, "udp-proxy mutated server 1-rtt packet (%zd bytes)\n",
+                received);
       }
       if (sendto(socket_fd, buffer, (size_t)received, 0,
                  (struct sockaddr *)&client_address,

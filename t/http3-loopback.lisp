@@ -65,6 +65,19 @@
     (sleep 0.005))
   (error "QUIC handshake timed out"))
 
+(defun %wait-for-connection-close (client)
+  (loop repeat 3000 do
+    (cl-quic-kit:client-poll client)
+    (when (cl-quic-kit::quic-client-closed-p client)
+      (let ((state (cl-quic-kit:connection-state
+                    (cl-quic-kit:quic-client-connection client))))
+        (unless (eq state :closing)
+          (error "Expected CONNECTION_CLOSE, got state ~S" state))
+        (format t "CONNECTION_CLOSE observed after malformed 1-RTT packet~%")
+        (return-from %wait-for-connection-close t)))
+    (sleep 0.005))
+  (error "Malformed 1-RTT packet did not produce CONNECTION_CLOSE"))
+
 (let* ((now (lambda () (/ (get-internal-real-time)
                           internal-time-units-per-second)))
        (client (cl-quic-kit:make-quic-client
@@ -80,9 +93,12 @@
   (unwind-protect
        (progn
          (cl-quic-kit:client-start client)
-         (%wait-for-handshake client)
-         (let ((control (cl-quic-kit:client-open-stream
-                         client nil :stream-type :control)))
+         (if (string= (%env "EXPECT_CONNECTION_CLOSE" "0") "1")
+             (%wait-for-connection-close client)
+             (progn
+               (%wait-for-handshake client)
+               (let ((control (cl-quic-kit:client-open-stream
+                               client nil :stream-type :control)))
            (cl-quic-kit:client-write-stream
             client control
             ;; SETTINGS and MAX_PUSH_ID as emitted by a conventional H3
@@ -100,43 +116,43 @@
                  (cl-quic-kit:client-read-stream client peer-control)
                  (return)))
              (sleep 0.005))
-           (let ((qpack-encoder (cl-quic-kit:client-open-stream
-                                 client nil :stream-type :qpack-encoder))
-                 (qpack-decoder (cl-quic-kit:client-open-stream
-                                 client nil :stream-type :qpack-decoder))
-                 (request (cl-quic-kit:client-open-stream client nil)))
-             (declare (ignore qpack-encoder qpack-decoder))
-             (cl-quic-kit:client-write-stream
-              client request
-              (%h3-frame
-               1
-               (%append-octets
-                ;; QPACK static entries 17, 23, 0, and 1 encode
-                ;; :method GET, :scheme https, :authority, and :path /.
-                (%bytes 0 0 #xd1 #xd7 #x50 #x8a #xa0 #xe4 #x1d #x13
-                        #x9d #x09 #xb8 #xf3 #x4d #x33 #xc1)))
-              :fin-p t)
-             (cl-quic-kit:client-flush client)
-             (let ((response (make-array 0 :element-type '(unsigned-byte 8)))
-                   (succeeded nil))
-               (loop repeat 5000 do
-                 (cl-quic-kit:client-poll client)
-                 (let ((stream (gethash 0
-                                        (cl-quic-kit::quic-client-streams client))))
-                   (when stream
-                     (multiple-value-bind (data fin)
-                         (cl-quic-kit:client-read-stream client stream)
-                       (when (plusp (length data))
-                         (setf response (%append-octets response data)))
-                       (when (and fin
-                                  (%contains-octets-p response (%octets "ok")))
-                         (setf succeeded t)
-                         (return)))))
-                 (when (cl-quic-kit::quic-client-closed-p client)
-                   (error "QUIC connection closed before HTTP/3 response"))
-                 (sleep 0.005))
-               (if succeeded
-                   (format t "HTTP/3 GET succeeded: ~D response octets~%"
-                           (length response))
-                   (error "HTTP/3 response timed out")))))
+                 (let ((qpack-encoder (cl-quic-kit:client-open-stream
+                                       client nil :stream-type :qpack-encoder))
+                       (qpack-decoder (cl-quic-kit:client-open-stream
+                                       client nil :stream-type :qpack-decoder))
+                       (request (cl-quic-kit:client-open-stream client nil)))
+                   (declare (ignore qpack-encoder qpack-decoder))
+                   (cl-quic-kit:client-write-stream
+                    client request
+                    (%h3-frame
+                     1
+                     (%append-octets
+                      ;; QPACK static entries 17, 23, 0, and 1 encode
+                      ;; :method GET, :scheme https, :authority, and :path /.
+                      (%bytes 0 0 #xd1 #xd7 #x50 #x8a #xa0 #xe4 #x1d #x13
+                              #x9d #x09 #xb8 #xf3 #x4d #x33 #xc1)))
+                    :fin-p t)
+                   (cl-quic-kit:client-flush client)
+                   (let ((response (make-array 0 :element-type '(unsigned-byte 8)))
+                         (succeeded nil))
+                     (loop repeat 5000 do
+                       (cl-quic-kit:client-poll client)
+                       (let ((stream (gethash 0
+                                              (cl-quic-kit::quic-client-streams client))))
+                         (when stream
+                           (multiple-value-bind (data fin)
+                               (cl-quic-kit:client-read-stream client stream)
+                             (when (plusp (length data))
+                               (setf response (%append-octets response data)))
+                             (when (and fin
+                                        (%contains-octets-p response (%octets "ok")))
+                               (setf succeeded t)
+                               (return)))))
+                       (when (cl-quic-kit::quic-client-closed-p client)
+                         (error "QUIC connection closed before HTTP/3 response"))
+                       (sleep 0.005))
+                     (if succeeded
+                         (format t "HTTP/3 GET succeeded: ~D response octets~%"
+                                 (length response))
+                         (error "HTTP/3 response timed out")))))))
     (ignore-errors (cl-quic-kit:client-close client)))))

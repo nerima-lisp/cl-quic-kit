@@ -35,6 +35,11 @@
   (unless condition
     (error "Test failed: ~A" description)))
 
+;; Keep the RFC 9001 packet-protection vectors in the flake check, including
+;; the deterministic Retry integrity vector from Appendix A.
+(load (merge-pathnames "protection.lisp"
+                       (or *load-truename* *default-pathname-defaults*)))
+
 (check (= cl-quic-kit:*quic-version-1* #x00000001)
        "QUIC v1 has the RFC 9000 version number")
 (check (cl-quic-kit:connection-id-p (make-array 0 :element-type '(unsigned-byte 8)))
@@ -428,7 +433,11 @@
     (check (null (cl-quic-kit:client-receive-datagram sender vn))
            "client accepts Version Negotiation advertising QUIC v1")
     (cl-quic-kit:client-receive-datagram receiver bad)
-    (check (and (cl-quic-kit::quic-client-closed-p receiver) ack-wire)
+    (check (and (cl-quic-kit::quic-client-closed-p receiver)
+                (eq (cl-quic-kit:connection-state
+                     (cl-quic-kit::quic-client-connection receiver))
+                    :closing)
+                ack-wire)
            "malformed packet transitions the client to protocol close"))
 
   (let* ((retry-token (%client-test-octets '(6 7)))
