@@ -14,9 +14,9 @@
                              (:file "stream")
                              (:file "state")
                              (:file "udp")
-                             (:file "client")
                              (:file "protection")
-                             (:file "recovery"))))
+                             (:file "recovery")
+                             (:file "client"))))
   :in-order-to ((test-op (test-op "cl-quic-kit/tests"))))
 
 (asdf:defsystem "cl-quic-kit/tests"

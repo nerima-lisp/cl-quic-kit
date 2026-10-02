@@ -3,7 +3,8 @@
 (defpackage #:cl-quic-kit.recovery
   (:use #:cl)
   (:export #:make-recovery-state #:recovery-space #:record-sent-packet
-           #:on-packet-received #:ack-needed-p #:on-ack-frame #:loss-timeout
+           #:reset-packet-number-space #:on-packet-received #:ack-needed-p #:on-ack-sent
+           #:on-ack-frame #:loss-timeout #:on-loss-timeout
            #:pto-deadline #:on-pto-expired #:newreno-on-ack #:newreno-on-loss
            #:recovery-state-smoothed-rtt #:recovery-state-rtt-variance
            #:recovery-state-latest-rtt #:recovery-state-min-rtt
@@ -61,6 +62,24 @@
   (check-type name (member :initial :handshake :application))
   (%space state name))
 
+(defun reset-packet-number-space (state space-name)
+  "Discard packets and ACK state for SPACE-NAME after a QUIC retry restart."
+  (let ((space (%space state space-name)))
+    (maphash (lambda (number packet)
+               (declare (ignore number))
+               (when (sent-packet-in-flight packet)
+                 (decf (recovery-state-bytes-in-flight state)
+                       (sent-packet-bytes packet))))
+             (packet-number-space-sent space))
+    (clrhash (packet-number-space-sent space))
+    (setf (packet-number-space-largest-received space) -1
+          (packet-number-space-largest-acked space) -1
+          (packet-number-space-ack-eliciting-count space) 0
+          (packet-number-space-ack-pending space) nil
+          (packet-number-space-ack-deadline space) nil
+          (packet-number-space-loss-time space) nil)
+    space))
+
 (defun record-sent-packet (state space-name packet-number bytes
                             &key (ack-eliciting-p t) (in-flight-p ack-eliciting-p)
                               (sent-at (%now state)))
@@ -91,16 +110,25 @@
              (and (packet-number-space-ack-deadline space)
                   (>= now (packet-number-space-ack-deadline space)))))))
 
+(defun on-ack-sent (state space-name)
+  "Clear the ACK timer after an ACK covering SPACE has been sent."
+  (let ((space (%space state space-name)))
+    (setf (packet-number-space-ack-pending space) nil
+          (packet-number-space-ack-eliciting-count space) 0
+          (packet-number-space-ack-deadline space) nil)
+    space))
+
 (defun %ack-ranges (ranges)
   (cond ((null ranges) nil)
-        ((and (consp (first ranges))
-              (or (and (listp (first ranges)) (= 2 (length (first ranges))))
-                  (and (consp (first ranges)) (numberp (car (first ranges)))
-                       (numberp (cdr (first ranges))))))
+        ((consp (first ranges))
          (mapcar (lambda (range)
-                   (if (and (listp range) (= 2 (length range)))
-                       range
-                       (list (car range) (cdr range))))
+                   (cond ((and (consp range) (consp (cdr range))
+                               (null (cddr range)))
+                          range)
+                         ((and (consp range) (numberp (car range))
+                               (numberp (cdr range)))
+                          (list (car range) (cdr range)))
+                         (t (error "Invalid ACK range: ~S" range))))
                  ranges))
         (t (mapcar (lambda (number) (list number number)) ranges))))
 
@@ -265,6 +293,35 @@
 (defun loss-timeout (state space-name &key (now (%now state)))
   (declare (ignore now))
   (%loss-deadline state (%space state space-name)))
+
+(defun on-loss-timeout (state space-name &key (now (%now state)))
+  "Mark time-threshold losses due at NOW and return the lost packets."
+  (let* ((space (%space state space-name))
+         (deadline (%loss-deadline state space))
+         (lost nil))
+    (when (and deadline (>= now deadline))
+      (let ((loss-delay (%loss-delay state))
+            (largest-acked (packet-number-space-largest-acked space)))
+        (maphash (lambda (number packet)
+                   (when (and (%ack-eliciting-in-flight-p packet)
+                              (< number largest-acked)
+                              (>= (- now (sent-packet-sent-at packet)) loss-delay))
+                     (push packet lost)))
+                 (packet-number-space-sent space)))
+      (dolist (packet lost)
+        (remhash (sent-packet-number packet) (packet-number-space-sent space))
+        (when (sent-packet-in-flight packet)
+          (decf (recovery-state-bytes-in-flight state)
+                (sent-packet-bytes packet)))
+        (push (sent-packet-sent-at packet)
+              (recovery-state-lost-sent-times state)))
+      (when lost
+        (%newreno-on-loss state now (reduce #'max lost :key #'sent-packet-sent-at)))
+      (when (%persistent-congestion-p state)
+        (setf (recovery-state-persistent-congestion-p state) t
+              (recovery-state-cwnd state) (* +minimum-window+ 1200)
+              (recovery-state-recovery-start-time state) nil)))
+    (values (nreverse lost) deadline)))
 
 (defun on-pto-expired (state)
   (incf (recovery-state-pto-count state))

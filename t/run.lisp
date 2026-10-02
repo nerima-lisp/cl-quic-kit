@@ -8,8 +8,8 @@
 
 (dolist (file '("src/varint.lisp" "src/packet.lisp" "src/frame.lisp"
                 "src/flow-control.lisp" "src/stream.lisp" "src/state.lisp"
-                "src/udp.lisp" "src/client.lisp"
-                "src/protection.lisp" "src/recovery.lisp"))
+                "src/udp.lisp" "src/protection.lisp" "src/recovery.lisp"
+                "src/client.lisp"))
   (load (merge-pathnames (concatenate 'string "../" file)
                          (or *load-truename* *default-pathname-defaults*))))
 
@@ -274,8 +274,173 @@
   (cl-quic-kit.recovery:newreno-on-ack state 1200 :sent-at 2)
   (check (= (cl-quic-kit.recovery:recovery-state-cwnd state) 6818)
          "NewReno congestion avoidance grows cwnd by MSS squared over cwnd"))
+(let ((state (cl-quic-kit.recovery:make-recovery-state :clock (lambda () 0))))
+  (cl-quic-kit.recovery:record-sent-packet state :application 0 1200 :sent-at 0)
+  (cl-quic-kit.recovery:record-sent-packet state :application 1 1200 :sent-at 0)
+  (cl-quic-kit.recovery:record-sent-packet state :application 2 1200 :sent-at 0)
+  (multiple-value-bind (acked lost)
+      (cl-quic-kit.recovery:on-ack-frame state :application 2 '((2 2))
+                                         :received-at 1/10)
+    (check (and (= (length acked) 1) (null lost))
+           "ACK leaves below-threshold packets for time loss detection"))
+  (multiple-value-bind (lost deadline)
+      (cl-quic-kit.recovery:on-loss-timeout state :application :now 1)
+    (check (and deadline (= (length lost) 2))
+           "time-threshold loss removes and returns expired packets")))
 (load (merge-pathnames "protection.lisp"
                        (or *load-truename* *default-pathname-defaults*)))
 (load (merge-pathnames "client.lisp"
                        (or *load-truename* *default-pathname-defaults*)))
+
+(defun %client-test-octets (values)
+  (make-array (length values) :element-type '(unsigned-byte 8)
+              :initial-contents values))
+
+(let* ((destination (%client-test-octets '(16 17 18 19 20 21 22 23)))
+       (sender-id (%client-test-octets '(32 33 34 35 36 37 38 39)))
+       (receiver-id (%client-test-octets '(48 49 50 51 52 53 54 55)))
+       (wire nil)
+       (ack-wire nil)
+       (sender (cl-quic-kit:make-quic-client
+                :local-connection-id sender-id
+                :destination-connection-id destination
+                :hostname "localhost"
+                :io-write (lambda (connection bytes)
+                            (declare (ignore connection))
+                            (setf wire bytes))
+                :now-fn (lambda () 0)))
+       (receiver (cl-quic-kit:make-quic-client
+                  :local-connection-id receiver-id
+                  :destination-connection-id destination
+                  :io-write (lambda (connection bytes)
+                              (declare (ignore connection))
+                              (setf ack-wire bytes))
+                  :now-fn (lambda () 0))))
+  (cl-quic-kit:client-start sender)
+  (check (and wire (>= (length wire) 1200))
+         "client-start emits a protected Initial packet of at least 1200 octets")
+  (cl-quic-kit::%client-set-key
+   receiver :initial :read (cl-quic-kit::%client-key sender :initial :write))
+  (cl-quic-kit::%client-set-key
+   receiver :initial :write (cl-quic-kit::%client-key sender :initial :read))
+  (check (cl-quic-kit:client-receive-datagram receiver wire)
+         "peer decrypts the protected Initial packet")
+  (setf wire nil ack-wire nil)
+  (cl-quic-kit:client-poll receiver 0)
+  (check ack-wire "peer emits an ACK packet after receiving an ack-eliciting Initial")
+  (check (cl-quic-kit:client-receive-datagram sender ack-wire)
+         "client decrypts the Initial ACK")
+  (setf ack-wire nil)
+  (cl-quic-kit:client-poll receiver 0)
+  (check (null ack-wire) "an ACK is not retransmitted after being sent")
+
+  (let ((handshake-secret
+          (%client-test-octets
+           '(96 97 98 99 100 101 102 103 104 105 106 107 108 109 110 111
+             112 113 114 115 116 117 118 119 120 121 122 123 124 125 126 127)))
+        (application-secret
+          (%client-test-octets
+           '(64 65 66 67 68 69 70 71 72 73 74 75 76 77 78 79
+             80 81 82 83 84 85 86 87 88 89 90 91 92 93 94 95))))
+    (cl-quic-kit::%client-set-key
+     sender :handshake :write
+     (cl-quic-kit.protection:make-key-set handshake-secret))
+    (cl-quic-kit::%client-set-key
+     receiver :handshake :read
+     (cl-quic-kit::%client-key sender :handshake :write))
+    (setf wire nil)
+    (cl-quic-kit::%client-queue-frame sender (cl-quic-kit:make-frame :ping)
+                                      :handshake)
+    (cl-quic-kit:client-flush sender)
+    (check wire "client encrypts a Handshake packet")
+    (check (cl-quic-kit:client-receive-datagram receiver wire)
+           "peer decrypts the Handshake packet")
+
+    (cl-quic-kit::%client-set-key
+     sender :1-rtt :write
+     (cl-quic-kit.protection:make-key-set application-secret))
+    (cl-quic-kit::%client-set-key
+     receiver :1-rtt :read
+     (cl-quic-kit::%client-key sender :1-rtt :write))
+    (let* ((stream (cl-quic-kit:client-open-stream sender nil))
+           (request (%client-test-octets
+                     '(71 69 84 32 47 32 72 84 84 80 47 51 10))))
+      (cl-quic-kit:client-write-stream sender stream request :fin-p t)
+      (setf wire nil)
+      (cl-quic-kit:client-flush sender)
+      (check wire "client encrypts a 1-RTT STREAM packet")
+      (check (cl-quic-kit:client-receive-datagram receiver wire)
+             "peer decrypts the 1-RTT STREAM packet")
+      (let ((peer-stream (gethash 0 (cl-quic-kit::quic-client-streams receiver))))
+        (multiple-value-bind (data fin)
+            (cl-quic-kit:client-read-stream receiver peer-stream)
+          (check (and (equalp data request) fin)
+                 "peer exposes received 1-RTT stream data")))
+      (setf wire nil)
+      (cl-quic-kit:client-poll sender (* 2 333/1000))
+      (check wire "PTO sends a protected 1-RTT probe after the stream packet is dropped")
+      (check (cl-quic-kit:client-receive-datagram receiver wire)
+             "peer decrypts the 1-RTT PTO probe")))
+
+  (let ((idle-wire nil))
+    (let ((idle-client
+            (cl-quic-kit:make-quic-client
+             :local-connection-id sender-id
+             :destination-connection-id destination
+             :idle-timeout 5
+             :io-write (lambda (connection bytes)
+                         (declare (ignore connection))
+                         (setf idle-wire bytes))
+             :now-fn (lambda () 0))))
+      (cl-quic-kit:client-poll idle-client 5)
+      (check (and (cl-quic-kit::quic-client-closed-p idle-client) idle-wire)
+             "idle timeout emits a protected CONNECTION_CLOSE")))
+
+  (let* ((vn (cl-quic-kit:encode-version-negotiation
+              sender-id receiver-id (list cl-quic-kit:*quic-version-1* #x6b3343cf)))
+         (bad (make-array 1 :element-type '(unsigned-byte 8) :initial-element #xff)))
+    (check (null (cl-quic-kit:client-receive-datagram sender vn))
+           "client accepts Version Negotiation advertising QUIC v1")
+    (cl-quic-kit:client-receive-datagram receiver bad)
+    (check (and (cl-quic-kit::quic-client-closed-p receiver) ack-wire)
+           "malformed packet transitions the client to protocol close"))
+
+  (let* ((retry-token (%client-test-octets '(6 7)))
+         (retry-scid (%client-test-octets '(80 81 82 83 84 85 86 87)))
+         (zero-tag (make-array 16 :element-type '(unsigned-byte 8)
+                               :initial-element 0))
+         (without-tag
+           (cl-quic-kit:encode-packet-header
+            (cl-quic-kit:make-packet-header
+             :type :retry :version cl-quic-kit:*quic-version-1*
+             :destination-connection-id sender-id
+             :source-connection-id retry-scid :token retry-token
+             :retry-integrity-tag zero-tag)))
+         (pseudo (subseq without-tag 0 (- (length without-tag) 16)))
+         (tag (cl-quic-kit:retry-integrity-tag
+               pseudo :original-destination-connection-id destination))
+         (retry
+           (cl-quic-kit:encode-packet-header
+            (cl-quic-kit:make-packet-header
+             :type :retry :version cl-quic-kit:*quic-version-1*
+             :destination-connection-id sender-id
+             :source-connection-id retry-scid :token retry-token
+             :retry-integrity-tag tag))))
+    (setf (cl-quic-kit::quic-client-closed-p sender) nil)
+    (check (null (cl-quic-kit:client-receive-datagram sender retry))
+           "client processes a valid Retry packet")
+    (check (and (equalp (cl-quic-kit::quic-client-retry-token sender) retry-token)
+                (equalp (cl-quic-kit::quic-client-remote-connection-id sender)
+                        retry-scid))
+           "Retry replaces the token and remote connection ID")
+    (check (zerop (or (cl-quic-kit::%client-level-value
+                       (cl-quic-kit::quic-client-packet-numbers sender) :initial)
+                      0))
+           "Retry resets the Initial packet number space")
+    (setf wire nil)
+    (cl-quic-kit:client-flush sender)
+    (check (and wire
+                (equalp (getf (cl-quic-kit::%client-layout wire) :token)
+                        retry-token))
+           "Retry retransmits ClientHello with the Retry token")))
 (format t "~D tests passed.~%" *tests-run*)

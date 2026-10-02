@@ -75,7 +75,8 @@
    #:quic-client #:make-quic-client #:client-open-stream
    #:client-write-stream #:client-read-stream #:client-close-stream
    #:client-flush #:client-receive-frame #:client-receive-datagram
-   #:make-client-tls-boundary #:client-tls-feed #:client-poll #:client-close
+   #:make-client-tls-boundary #:make-client-tls-driver #:client-tls-feed
+   #:client-start #:client-poll #:client-close
    #:quic-client-connection #:quic-client-udp-socket
    #:quic-client-tls-boundary #:quic-client-tls-secrets
    #:quic-client-peer-transport-parameters))
