@@ -142,4 +142,100 @@
     (cl-quic-kit:flow-control-error () (setf rejected t)))
   (stream-flow-check rejected "MAX_STREAMS rejects counts above 2^60"))
 
+(let ((stream (cl-quic-kit:make-stream 0 :local-initiator :client)))
+  (cl-quic-kit:stream-receive-data stream 0 (octets 1 2))
+  (multiple-value-bind (data fin) (cl-quic-kit:stream-read stream)
+    (declare (ignore data fin)))
+  (let ((rejected nil))
+    (handler-case (cl-quic-kit:stream-receive-data stream 0 (octets 9 2))
+      (cl-quic-kit:flow-control-error () (setf rejected t)))
+    (stream-flow-check rejected
+                       "conflicting retransmission is rejected after data is read")))
+
+(let ((stream (cl-quic-kit:make-stream 0 :local-initiator :client)))
+  (cl-quic-kit:stream-receive-data stream 3 (octets 4 5))
+  (cl-quic-kit:stream-reset-receive stream 42 5)
+  (multiple-value-bind (data fin) (cl-quic-kit:stream-read stream)
+    (stream-flow-check (and (zerop (length data)) fin)
+                       "RESET_STREAM is terminal even with an undelivered gap"))
+  (stream-flow-check (cl-quic-kit:stream-finished-p stream)
+                     "RESET_STREAM finalizes a sparse receive side"))
+
+(let ((stream (cl-quic-kit:make-stream 2 :local-initiator :client)))
+  (cl-quic-kit:stream-stop-sending-receive stream 7)
+  (stream-flow-check (eq (getf (cl-quic-kit:stream-next-event stream) :type)
+                         :stop-sending)
+                     "STOP_SENDING is accepted on a local unidirectional sender")
+  (stream-flow-check (eq (getf (cl-quic-kit:stream-next-event stream) :type)
+                         :reset-stream)
+                     "STOP_SENDING resets the local sending part"))
+
+(let ((stream (cl-quic-kit:make-stream 3 :local-initiator :client))
+      (rejected nil))
+  (handler-case (cl-quic-kit:stream-stop-sending-receive stream 7)
+    (cl-quic-kit:stream-id-error () (setf rejected t)))
+  (stream-flow-check rejected
+                     "STOP_SENDING is rejected on a peer unidirectional receiver"))
+
+(let ((stream (cl-quic-kit:make-stream 0 :local-initiator :client
+                                       :max-send-data 2)))
+  (let ((rejected nil))
+    (handler-case (cl-quic-kit:stream-write stream (octets 1 2 3))
+      (cl-quic-kit:flow-control-limit-error () (setf rejected t)))
+    (stream-flow-check rejected "stream flow control blocks an oversized write")
+    (stream-flow-check
+     (eq (getf (cl-quic-kit:stream-next-event stream) :type)
+         :stream-data-blocked)
+     "stream flow control emits STREAM_DATA_BLOCKED"))
+  (cl-quic-kit:stream-set-max-send-offset stream 3)
+  (stream-flow-check (= (getf (cl-quic-kit:stream-write stream (octets 8)) :offset) 0)
+                     "MAX_STREAM_DATA permits a later write"))
+
+(let ((flow (cl-quic-kit:make-flow-control-state :max-data 2
+                                                 :max-streams-bidi 1)))
+  (cl-quic-kit:flow-control-open-stream flow :bidirectional)
+  (let ((rejected nil))
+    (handler-case (cl-quic-kit:flow-control-open-stream flow :bidirectional)
+      (cl-quic-kit:flow-control-limit-error () (setf rejected t)))
+    (stream-flow-check rejected "MAX_STREAMS records a blocked opener")
+    (stream-flow-check (cl-quic-kit:flow-control-streams-blocked-p
+                        flow :bidirectional)
+                       "MAX_STREAMS exposes blocked signaling"))
+  (stream-flow-check (= (cl-quic-kit:flow-control-update-max-streams
+                         flow :bidirectional 0) 1)
+                       "a smaller MAX_STREAMS value is ignored")
+  (stream-flow-check (cl-quic-kit:flow-control-streams-blocked-p
+                      flow :bidirectional)
+                     "a smaller MAX_STREAMS does not clear blocked signaling")
+  (cl-quic-kit:flow-control-update-max-streams flow :bidirectional 2)
+  (stream-flow-check (not (cl-quic-kit:flow-control-streams-blocked-p
+                           flow :bidirectional))
+                     "an increased MAX_STREAMS clears blocked signaling"))
+
+(let ((flow (cl-quic-kit:make-flow-control-state :max-data 1))
+      (stream nil))
+  (setf stream (cl-quic-kit:make-stream 0 :local-initiator :client
+                                         :flow-control flow))
+  (let ((rejected nil))
+    (handler-case (cl-quic-kit:stream-write stream (octets 1 2))
+      (cl-quic-kit:flow-control-limit-error () (setf rejected t)))
+    (stream-flow-check rejected "connection flow control blocks a write")
+    (stream-flow-check (cl-quic-kit:flow-control-data-blocked-p flow)
+                       "connection flow control exposes DATA_BLOCKED"))
+  (cl-quic-kit:flow-control-update-max-data flow 2)
+  (stream-flow-check (not (cl-quic-kit:flow-control-data-blocked-p flow))
+                     "MAX_DATA clears DATA_BLOCKED signaling"))
+
+(let ((rejected nil))
+  (handler-case (cl-quic-kit:make-stream 0 :max-send-data 1.5)
+    (type-error () (setf rejected t)))
+  (stream-flow-check rejected "stream flow limits require integer offsets"))
+
+(let ((stream (cl-quic-kit:make-stream 0 :max-send-data 4
+                                       :max-receive-data 4)))
+  (stream-flow-check (= (cl-quic-kit:stream-set-max-send-offset stream 2) 4)
+                     "a smaller MAX_STREAM_DATA does not reduce send credit")
+  (stream-flow-check (= (cl-quic-kit:stream-set-max-receive-offset stream 2) 4)
+                     "a smaller receive limit does not reduce stream credit"))
+
 (format t "~D stream/flow-control tests passed.~%" *stream-flow-tests*)

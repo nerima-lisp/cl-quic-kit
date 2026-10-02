@@ -65,19 +65,17 @@
 
 (defun make-flow-control-state (&key (max-data 0) max-receive-data
                                      (max-streams-bidi 0) (max-streams-uni 0))
-  (mapc (lambda (x) (%non-negative-integer (car x) (cdr x)))
-        (list (cons max-data :max-data)
-              (cons max-streams-bidi :max-streams-bidi)
-              (cons max-streams-uni :max-streams-uni)))
+  (%non-negative-integer max-data :max-data)
+  (%non-negative-integer max-streams-bidi :max-streams-bidi)
+  (%non-negative-integer max-streams-uni :max-streams-uni)
+  (when max-receive-data
+    (%non-negative-integer max-receive-data :max-receive-data))
   (dolist (value (list max-data max-receive-data))
     (when (and value (> value *quic-max-offset*))
       (error 'flow-control-error)))
   (dolist (value (list max-streams-bidi max-streams-uni))
     (when (> value *quic-max-streams*)
       (error 'flow-control-error)))
-  (when (and max-receive-data
-             (not (and (integerp max-receive-data) (>= max-receive-data 0))))
-    (error 'type-error :datum max-receive-data :expected-type '(integer 0)))
   (%make-flow-control-state :connection-max-data max-data
                             :connection-receive-limit (or max-receive-data max-data)
                             :max-streams-bidi max-streams-bidi
@@ -181,7 +179,9 @@
      (when (> maximum (flow-control-state-max-streams-uni state))
        (setf (flow-control-state-max-streams-uni state) maximum
              (flow-control-state-streams-blocked-uni-p state) nil))))
-  maximum)
+  (ecase direction
+    (:bidirectional (flow-control-state-max-streams-bidi state))
+    (:unidirectional (flow-control-state-max-streams-uni state))))
 
 (defun flow-control-data-blocked-p (state)
   (flow-control-state-data-blocked-p state))
