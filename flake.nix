@@ -19,8 +19,8 @@
         in {
         bootstrap = pkgs.runCommand "cl-quic-kit-bootstrap-tests" {
           nativeBuildInputs = [ pkgs.sbcl pkgs.caddy pkgs.openssl pkgs.stdenv.cc ];
-          __darwinAllowLocalNetworking = true;
-          __noChroot = true;
+          __darwinAllowLocalNetworking = pkgs.stdenv.isDarwin;
+          __noChroot = pkgs.stdenv.isDarwin;
           CL_SOURCE_REGISTRY = "${tls}/share/common-lisp/source//:${crypto}/share/common-lisp/source//";
           src = ./.;
         } ''
