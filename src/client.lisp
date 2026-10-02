@@ -110,11 +110,12 @@
               (%client-install-secret client level direction
                                        (funcall secret-reader state)))))))))
 
-(defun %client-transport-parameters ()
-  (let ((limit (encode-varint 1048576)))
-    (encode-transport-parameters
-     `((0 . ,limit) (1 . 1048576) (3 . 65527)
-       (4 . 3) (5 . 3) (6 . 3) (7 . 25) (14 . 2)))))
+(defun %client-transport-parameters (local-connection-id)
+  (encode-transport-parameters
+   `((1 . 30) (3 . 65527) (4 . 1048576)
+     (5 . 65536) (6 . 65536) (7 . 65536)
+     (8 . 25) (9 . 25) (10 . 3) (11 . 25)
+     (14 . 2) (15 . ,local-connection-id))))
 
 (defun %client-packet-number (client level)
   (let ((number (or (%client-level-value (quic-client-packet-numbers client) level) 0)))
@@ -473,7 +474,7 @@
                   :server-host server-host :server-port server-port
                   :hostname hostname :alpn alpn
                   :transport-parameters (or transport-parameters
-                                            (%client-transport-parameters))
+                                            (%client-transport-parameters local))
                   :tls-key-exchange tls-key-exchange :tls-provider tls-provider
                   :tls-trust-anchors tls-trust-anchors
                   :tls-verify-signature tls-verify-signature)))

@@ -289,6 +289,14 @@
            "time-threshold loss removes and returns expired packets")))
 (load (merge-pathnames "protection.lisp"
                        (or *load-truename* *default-pathname-defaults*)))
+(let ((socket (cl-quic-kit:make-udp-socket :local-host "127.0.0.1"
+                                            :local-port 0)))
+  (unwind-protect
+       (multiple-value-bind (data length address)
+           (cl-quic-kit:udp-receive socket)
+         (check (and (null data) (null length) (null address))
+                "non-blocking UDP receive reports no datagram cleanly"))
+    (cl-quic-kit:udp-close socket)))
 (load (merge-pathnames "client.lisp"
                        (or *load-truename* *default-pathname-defaults*)))
 
