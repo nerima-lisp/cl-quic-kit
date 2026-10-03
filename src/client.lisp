@@ -401,14 +401,13 @@
                    (cl-quic-kit.protection:reconstruct-packet-number
                     unmasked-truncated pn-length received-largest))
                  (associated (subseq unmasked 0 (+ pn-offset pn-length)))
-                 (ciphertext (subseq unmasked (+ pn-offset pn-length)))
-                 (plaintext
-                   (cl-quic-kit.protection:unprotect-payload
-                    key reconstructed-number ciphertext associated)))
+                 (ciphertext (subseq unmasked (+ pn-offset pn-length))))
             (setf truncated unmasked-truncated
                   largest received-largest
                   number reconstructed-number)
-            (let ((key-phase key-phase))
+            (let ((plaintext
+                    (cl-quic-kit.protection:unprotect-payload
+                     key reconstructed-number ciphertext associated)))
               (when (and (eq level :1-rtt) key-phase)
                 (setf (quic-client-application-read-key-phase client) 1))
               (values level number
