@@ -376,8 +376,7 @@
                :disable-hostname-verification-p t)))
   (cl-quic-kit::%client-protocol-close client 7 "private implementation detail")
   (check (null (cl-quic-kit:frame-field
-                (cl-quic-kit:connection-close-frame
-                 (cl-quic-kit:quic-client-connection client))
+                (cdr (first (cl-quic-kit::quic-client-pending-frames client)))
                 :reason))
          "protocol close does not disclose internal error text"))
 
