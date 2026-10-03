@@ -2,6 +2,7 @@
 #include <errno.h>
 #include <netinet/in.h>
 #include <stdio.h>
+#include <stdbool.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
@@ -15,6 +16,30 @@ static int read_all(int fd, unsigned char *buffer, size_t length) {
     offset += (size_t)count;
   }
   return 0;
+}
+
+static int next_body_byte(int fd, const unsigned char *buffer, size_t available,
+                          size_t *offset, unsigned char *value) {
+  if (*offset < available) {
+    *value = buffer[(*offset)++];
+    return 0;
+  }
+  return read(fd, value, 1) == 1 ? 0 : -1;
+}
+
+static int read_body_line(int fd, const unsigned char *buffer, size_t available,
+                          size_t *offset, char *line, size_t capacity) {
+  size_t used = 0;
+  unsigned char value;
+  while (used + 1 < capacity) {
+    if (next_body_byte(fd, buffer, available, offset, &value) < 0) return -1;
+    line[used++] = (char)value;
+    if (used >= 2 && line[used - 2] == '\r' && line[used - 1] == '\n') {
+      line[used - 2] = 0;
+      return 0;
+    }
+  }
+  return -1;
 }
 
 int main(int argc, char **argv) {
@@ -50,18 +75,70 @@ int main(int argc, char **argv) {
   }
   char *length_header = strstr((char *)headers, "\r\nContent-Length:");
   if (!length_header) length_header = strstr((char *)headers, "\nContent-Length:");
-  if (!length_header) {
+  char *transfer_header = strstr((char *)headers, "\r\nTransfer-Encoding:");
+  if (!transfer_header) transfer_header = strstr((char *)headers, "\nTransfer-Encoding:");
+  bool chunked = transfer_header &&
+                 strstr(transfer_header, "chunked") != NULL;
+  if (!length_header && !chunked) {
     fprintf(stderr, "missing Content-Length\n");
     return 1;
   }
-  long length = strtol(strchr(length_header, ':') + 1, NULL, 10);
-  if (length != expected || length < 0) {
+  long length = length_header ? strtol(strchr(length_header, ':') + 1, NULL, 10)
+                              : -1;
+  if (length_header && (length != expected || length < 0)) {
     fprintf(stderr, "unexpected Content-Length=%ld\n", length);
     return 1;
   }
   char *body = strstr((char *)headers, "\r\n\r\n");
   size_t header_size = (size_t)(body + 4 - (char *)headers);
   long buffered = (long)used - (long)header_size;
+  const unsigned char *body_buffer = headers + header_size;
+  size_t body_available = (size_t)buffered;
+  size_t body_offset = 0;
+  if (chunked) {
+    long total = 0;
+    char line[128];
+    for (;;) {
+      char *end = NULL;
+      if (read_body_line(client, body_buffer, body_available, &body_offset,
+                         line, sizeof(line)) < 0)
+        return 1;
+      long chunk = strtol(line, &end, 16);
+      if (end == line || chunk < 0) return 1;
+      if (chunk == 0) {
+        do {
+          if (read_body_line(client, body_buffer, body_available, &body_offset,
+                             line, sizeof(line)) < 0)
+            return 1;
+        } while (line[0] != 0);
+        break;
+      }
+      while (chunk > 0) {
+        unsigned char value;
+        if (next_body_byte(client, body_buffer, body_available, &body_offset,
+                           &value) < 0)
+          return 1;
+        if (value != 0x5a || total >= expected) return 1;
+        ++total;
+        --chunk;
+      }
+      unsigned char carriage, newline;
+      if (next_body_byte(client, body_buffer, body_available, &body_offset,
+                         &carriage) < 0 ||
+          next_body_byte(client, body_buffer, body_available, &body_offset,
+                         &newline) < 0 || carriage != '\r' || newline != '\n')
+        return 1;
+    }
+    if (total != expected) return 1;
+    static const char response[] =
+        "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok";
+    if (write(client, response, sizeof(response) - 1) !=
+        (ssize_t)(sizeof(response) - 1)) return 1;
+    fprintf(stderr, "POST length=%ld octets=ok\n", total);
+    close(client);
+    close(server);
+    return 0;
+  }
   if (buffered > length) {
     fprintf(stderr, "body exceeds Content-Length\n");
     return 1;
