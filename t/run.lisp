@@ -380,8 +380,8 @@
                            (push bytes writes)))))
   (setf (cl-quic-kit::quic-client-keys client) nil)
   (cl-quic-kit::%client-protocol-close client 7 "private implementation detail")
-  (check (null (cl-quic-kit:frame-field
-                (cl-quic-kit:decode-frame (first writes)) :reason))
+  (check (zerop (length (cl-quic-kit:frame-field
+                         (cl-quic-kit:decode-frame (first writes)) :reason)))
          "protocol close does not disclose internal error text"))
 
 (let* ((destination (%client-test-octets '(16 17 18 19 20 21 22 23)))
