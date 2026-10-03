@@ -107,6 +107,42 @@
                                  (protection-octets "8394c8f03e515708")))
                    "Retry integrity rejects a tampered tag"))
           (check (= constant-time-calls 2)
-                 "Retry integrity verification uses constant-time comparison"))))))
+                 "Retry integrity verification uses constant-time comparison")
+          (let* ((old-secret (protection-octets
+                              "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f"))
+                 (next-secret
+                   (funcall (protection-function p "%EXPAND-LABEL")
+                            :sha256 old-secret "traffic upd"
+                            (make-array 0 :element-type '(unsigned-byte 8)) 32))
+                 (old-key (funcall (protection-function p "MAKE-KEY-SET") old-secret))
+                 (next-key (funcall (protection-function p "MAKE-KEY-SET") next-secret))
+                 (header (protection-octets "4007"))
+                 (plaintext (protection-octets "0102030405060708"))
+                 (ciphertext (funcall (protection-function p "PROTECT-PAYLOAD")
+                                     next-key 7 plaintext header))
+                 (packet (concatenate '(vector (unsigned-byte 8)) header ciphertext))
+                 (sample (subseq packet 5 21))
+                 (protected (funcall (protection-function p "APPLY-HEADER-PROTECTION")
+                                     old-key packet sample 1 1 nil))
+                 (unmasked (funcall (protection-function p "REMOVE-HEADER-PROTECTION")
+                                    old-key protected sample 1 1 nil))
+                 (old-rejected nil))
+            ;; QUIC key update changes packet protection but retains HP.
+            (setf (cl-quic-kit.protection:key-set-hp next-key)
+                  (cl-quic-kit.protection:key-set-hp old-key))
+            (check (equalp (funcall (protection-function p "KEY-SET-HP") next-key)
+                           (funcall (protection-function p "KEY-SET-HP") old-key))
+                   "application key update retains the header protection key")
+            (check (equalp (funcall (protection-function p "UNPROTECT-PAYLOAD")
+                                    next-key 7 (subseq unmasked 2)
+                                    (subseq unmasked 0 2))
+                           plaintext)
+                   "next application packet key opens with the unchanged header")
+            (handler-case
+                (funcall (protection-function p "UNPROTECT-PAYLOAD")
+                         old-key 7 (subseq unmasked 2) (subseq unmasked 0 2))
+              (error () (setf old-rejected t)))
+            (check old-rejected
+                   "old application packet key rejects the next key phase")))))))
 
 (run-protection-tests)
