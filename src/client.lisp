@@ -11,8 +11,9 @@
   initial-destination-connection-id remote-connection-id retry-token
   packet-numbers received-packets keys recovery sent-packets clock
   (application-read-key-phase 0)
-  application-read-old-key application-read-secret
-  application-read-key-update-packet-number
+  application-read-old-key application-read-next-key application-read-next-secret
+  application-read-secret application-read-key-update-packet-number
+  application-read-old-key-retire-at
   (application-write-key-phase 0) application-write-secret
   application-write-key-phase-first-packet-number
   (application-write-key-phase-acked-p t)
@@ -23,7 +24,9 @@
 
 (declaim (ftype function client-tls-feed client-receive-datagram
                         client-flush %client-find-or-create-peer-stream
-                        %client-protocol-close))
+                        %client-protocol-close
+                        %client-prepare-next-application-read-key
+                        %client-ack-includes-packet-p))
 
 (defun %client-level-value (alist key)
   (cdr (assoc key alist)))
@@ -298,7 +301,9 @@
         (%client-set-key client wire-level direction new-key))
       (when (eq wire-level :1-rtt)
         (if (eq direction :read)
-            (setf (quic-client-application-read-secret client) secret)
+            (progn
+              (setf (quic-client-application-read-secret client) secret)
+              (%client-prepare-next-application-read-key client))
             (setf (quic-client-application-write-secret client) secret)))
       (let ((boundary (quic-client-tls-boundary client))
             (emit (%client-function "CL-TLS-KIT" "QUIC-TLS-BOUNDARY-EMIT-SECRET")))
@@ -351,19 +356,34 @@
                          (%client-key client :1-rtt direction)))
                   next-key))))))
 
+(defun %client-prepare-next-application-read-key (client)
+  (multiple-value-bind (secret key)
+      (%client-next-application-key client :read)
+    (setf (quic-client-application-read-next-secret client) secret
+          (quic-client-application-read-next-key client) key)))
+
 (defun %client-application-write-key-update-allowed-p (client)
   (quic-client-application-write-key-phase-acked-p client))
 
-(defun %client-commit-application-read-key-update (client secret number)
+(defun %client-commit-application-read-key-update (client secret key number)
   (setf (quic-client-application-read-old-key client)
-        (%client-key client :1-rtt :read))
-  (%client-install-secret client :1-rtt :read secret :replace-p t
-                          :preserve-hp t)
+        (%client-key client :1-rtt :read)
+        (quic-client-application-read-old-key-retire-at client)
+        ;; RFC 9001 section 6.5 allows reordered old packets for three PTOs.
+        (+ (funcall (quic-client-clock client))
+           (* 3 (cl-quic-kit.recovery:pto-duration
+                 (quic-client-recovery client) :application)))
+        (quic-client-application-read-secret client) secret
+        (quic-client-application-read-next-secret client) nil
+        (quic-client-application-read-next-key client) nil)
+  (%client-set-key client :1-rtt :read key)
   (setf (quic-client-application-read-key-phase client)
         (logxor 1 (quic-client-application-read-key-phase client))
-        (quic-client-application-read-key-update-packet-number client) number))
+        (quic-client-application-read-key-update-packet-number client) number)
+  ;; Keep the next key ready before processing another packet to avoid a timing signal.
+  (%client-prepare-next-application-read-key client))
 
-(defun %client-rotate-application-write-key (client &key force-p (update-read-p t))
+(defun %client-rotate-application-write-key (client &key force-p (update-read-p nil))
   (let* ((driver (quic-client-tls-driver client))
          (secret (quic-client-application-write-secret client))
          (hash (%client-driver-suite-hash driver))
@@ -386,6 +406,24 @@
             nil
             (quic-client-application-write-key-phase-acked-p client) nil)
       t)))
+
+(defun %client-discard-expired-read-key (client &optional (now (funcall (quic-client-clock client))))
+  (when (and (quic-client-application-read-old-key-retire-at client)
+             (>= now (quic-client-application-read-old-key-retire-at client)))
+    (setf (quic-client-application-read-old-key client) nil
+          (quic-client-application-read-old-key-retire-at client) nil
+          (quic-client-application-read-key-update-packet-number client) nil)))
+
+(defun %client-largest-received-packet-number (client level)
+  (reduce #'max (%client-level-value (quic-client-received-packets client) level)
+          :initial-value -1))
+
+(defun %client-packet-number-length (number largest-acked)
+  (let* ((range (if largest-acked
+                    (max 1 (- number largest-acked))
+                    (max 1 number)))
+         (bits (integer-length range)))
+    (min 4 (max 1 (ceiling bits 8)))))
 
 (defun %client-sync-tls-secrets (client)
   (let ((driver (quic-client-tls-driver client))
@@ -521,17 +559,17 @@
       (let* ((unmasked (cl-quic-kit.protection:remove-header-protection
                         key packet sample pn-offset pn-length (getf layout :long-p)))
              (truncated (%client-truncated-number unmasked pn-offset pn-length))
-             (largest (or (first (%client-level-value
-                                  (quic-client-received-packets client) level))
-                          -1))
+             (largest (%client-largest-received-packet-number client level))
              (number (cl-quic-kit.protection:reconstruct-packet-number
                       truncated pn-length largest))
              (associated (subseq unmasked 0 (+ pn-offset pn-length)))
              (ciphertext (subseq unmasked (+ pn-offset pn-length)))
              (key-phase (and (eq type :short) (logbitp 2 first)))
              (selected-key key)
-             (next-read-secret nil))
+             (next-read-secret nil)
+             (next-read-key nil))
         (when (eq level :1-rtt)
+          (%client-discard-expired-read-key client)
           (let ((current-phase (quic-client-application-read-key-phase client)))
             (unless (eq key-phase (= current-phase 1))
               (if (and (quic-client-application-read-old-key client)
@@ -542,19 +580,20 @@
                   (setf selected-key
                         (quic-client-application-read-old-key client))
                   (progn
-                    (multiple-value-bind (secret next-key)
-                        (%client-next-application-key client :read)
+                    (let ((secret (quic-client-application-read-next-secret client))
+                          (next-key (quic-client-application-read-next-key client)))
                       (unless (and secret next-key)
                         (error 'quic-crypto-error
                                :message "application key phase update unavailable"))
                       (setf selected-key next-key)
-                      (setf next-read-secret secret)))))))
+                      (setf next-read-secret secret
+                            next-read-key next-key)))))))
         (let ((plaintext
                 (cl-quic-kit.protection:unprotect-payload
                  selected-key number ciphertext associated)))
           (when next-read-secret
             (%client-commit-application-read-key-update
-             client next-read-secret number)
+             client next-read-secret next-read-key number)
             (%client-rotate-application-write-key
              client :force-p t :update-read-p nil))
           (values level number
@@ -591,7 +630,12 @@
          (type (if (eq wire-level :1-rtt) :short wire-level))
          (key (%client-key client wire-level :write))
          (number (%client-packet-number client wire-level))
-         (pn-length 2)
+         (largest-acked
+           (and (eq wire-level :1-rtt)
+                (cl-quic-kit.recovery:packet-number-space-largest-acked
+                 (cl-quic-kit.recovery:recovery-space
+                  (quic-client-recovery client) :application))))
+         (pn-length (%client-packet-number-length number largest-acked))
          (plaintext (encode-frames frames))
          (dcid (or (quic-client-remote-connection-id client) #()))
          (scid (if (eq type :short) #() (quic-client-local-connection-id client)))
@@ -763,13 +807,21 @@
     (let ((space (%client-level-space level)))
       (when (and (eq space :application)
                  (quic-client-application-write-key-phase-first-packet-number client)
-                 (<= (quic-client-application-write-key-phase-first-packet-number
-                      client)
-                     (frame-field frame :largest-acknowledged)))
+                 (%client-ack-includes-packet-p
+                  frame
+                  (quic-client-application-write-key-phase-first-packet-number
+                   client)))
         (setf (quic-client-application-write-key-phase-acked-p client) t
               (quic-client-application-handshake-confirmed-p client) t))
       (%client-drop-records client space acked nil)
       (%client-drop-records client space lost t))))
+
+(defun %client-ack-includes-packet-p (frame packet-number)
+  (some (lambda (interval)
+          (let ((largest (car interval))
+                (smallest (- (car interval) (cdr interval))))
+            (<= smallest packet-number largest)))
+        (%client-ack-intervals frame)))
 
 (defun %client-receive-frames (client level number frames)
   (let ((space (%client-level-space level)))
@@ -876,8 +928,11 @@
                   :pending-stream-writes nil
                   :application-read-key-phase 0
                   :application-read-old-key nil
+                  :application-read-next-key nil
+                  :application-read-next-secret nil
                   :application-read-secret nil
                   :application-read-key-update-packet-number nil
+                  :application-read-old-key-retire-at nil
                   :application-write-key-phase 0
                   :application-write-secret nil
                   :application-write-key-phase-first-packet-number nil
@@ -1332,6 +1387,7 @@
          (length (quic-client-local-connection-id client)))))))
 
 (defun %client-poll-recovery (client at)
+  (%client-discard-expired-read-key client at)
   (dolist (space '(:initial :handshake :application))
     (multiple-value-bind (lost loss)
         (cl-quic-kit.recovery:on-loss-timeout

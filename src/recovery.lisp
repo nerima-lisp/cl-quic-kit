@@ -5,13 +5,14 @@
   (:export #:make-recovery-state #:recovery-space #:record-sent-packet
            #:reset-packet-number-space #:on-packet-received #:ack-needed-p #:on-ack-sent
            #:on-ack-frame #:loss-timeout #:on-loss-timeout
-           #:pto-deadline #:on-pto-expired #:newreno-on-ack #:newreno-on-loss
+           #:pto-deadline #:pto-duration #:on-pto-expired #:newreno-on-ack #:newreno-on-loss
            #:recovery-state-smoothed-rtt #:recovery-state-rtt-variance
            #:recovery-state-latest-rtt #:recovery-state-min-rtt
            #:recovery-state-ssthresh #:recovery-state-recovery-start-time
            #:recovery-state-persistent-congestion-p
            #:recovery-state-cwnd #:recovery-state-bytes-in-flight
-           #:recovery-state-pto-count #:packet-number-space-name))
+           #:recovery-state-pto-count #:packet-number-space-name
+           #:packet-number-space-largest-acked))
 
 (in-package #:cl-quic-kit.recovery)
 
@@ -312,6 +313,9 @@
     (when last-sent
       (+ last-sent (* (%pto state space-name)
                       (expt 2 (recovery-state-pto-count state)))))))
+
+(defun pto-duration (state &optional space-name)
+  (%pto state space-name))
 
 (defun loss-timeout (state space-name &key (now (%now state)))
   (declare (ignore now))
