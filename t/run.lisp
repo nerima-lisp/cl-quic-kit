@@ -652,6 +652,12 @@
     (cl-quic-kit::%client-set-key
      receiver :handshake :read
      (cl-quic-kit::%client-key sender :handshake :write))
+    (cl-quic-kit::%client-set-key
+     receiver :handshake :write
+     (cl-quic-kit::%client-key sender :handshake :write))
+    (cl-quic-kit::%client-set-key
+     sender :handshake :read
+     (cl-quic-kit::%client-key receiver :handshake :write))
     (setf wire nil)
     (cl-quic-kit::%client-queue-frame sender (cl-quic-kit:make-frame :ping)
                                       :handshake)
@@ -659,6 +665,11 @@
     (check wire "client encrypts a Handshake packet")
     (check (cl-quic-kit:client-receive-datagram receiver wire)
            "peer decrypts the Handshake packet")
+    (setf ack-wire nil)
+    (cl-quic-kit:client-poll receiver 0)
+    (check ack-wire "peer emits an ACK packet after receiving a Handshake packet")
+    (check (cl-quic-kit:client-receive-datagram sender ack-wire)
+           "client decrypts the Handshake ACK")
 
     (cl-quic-kit::%client-set-key
      sender :1-rtt :write
