@@ -99,7 +99,13 @@
         (let ((part-size (length (encode-frame part))))
           (when (> part-size *client-packet-payload-limit*)
             (error 'quic-encoding-error
-                   :message "Frame exceeds the QUIC packet payload limit"))
+                   :message (format nil
+                                    "Frame exceeds the QUIC packet payload limit: type=~S offset=~S data=~D encoded=~D limit=~D"
+                                    (frame-type part)
+                                    (frame-field part :offset nil)
+                                    (length (%client-frame-data part))
+                                    part-size
+                                    *client-packet-payload-limit*)))
           (if (and current
                    (> (+ size part-size) *client-packet-payload-limit*))
               (progn
