@@ -3,15 +3,22 @@
   (asdf:load-system "cl-crypto-kit")
   (asdf:load-system "cl-tls-kit"))
 
-(load (merge-pathnames "../package.lisp"
-                       (or *load-truename* *default-pathname-defaults*)))
+(defun test-path (path)
+  (merge-pathnames path
+                   (if (and (find-package :asdf)
+                            (asdf:find-system "cl-quic-kit/tests" nil))
+                       (asdf:system-source-directory "cl-quic-kit/tests")
+                       (merge-pathnames "../"
+                                        (or *load-truename*
+                                            *default-pathname-defaults*)))))
+
+(load (test-path "package.lisp"))
 
 (dolist (file '("src/varint.lisp" "src/packet.lisp" "src/frame.lisp"
                 "src/flow-control.lisp" "src/stream.lisp" "src/state.lisp"
                 "src/udp.lisp" "src/protection.lisp" "src/recovery.lisp"
                 "src/client.lisp"))
-  (load (merge-pathnames (concatenate 'string "../" file)
-                         (or *load-truename* *default-pathname-defaults*))))
+  (load (test-path file)))
 
 (when (and (find-package "CRYPTO-KIT")
            (find-package "CL-QUIC-KIT.PROTECTION"))
@@ -35,10 +42,48 @@
   (unless condition
     (error "Test failed: ~A" description)))
 
+(defun strict-utf8-p (octets)
+  (labels ((continuation-p (byte) (<= #x80 byte #xbf)))
+    (loop with index = 0
+          while (< index (length octets))
+          do (let* ((lead (aref octets index))
+                    (remaining (- (length octets) index))
+                    (width (cond
+                             ((<= lead #x7f) 1)
+                             ((and (<= #xc2 lead #xdf) (>= remaining 2)
+                                   (continuation-p (aref octets (1+ index))))
+                              2)
+                             ((and (or (= lead #xe0) (<= #xe1 lead #xec)
+                                       (= lead #xed) (<= #xee lead #xef))
+                                   (>= remaining 3)
+                                   (or (and (= lead #xe0)
+                                            (<= #xa0 (aref octets (1+ index)) #xbf))
+                                       (and (or (<= #xe1 lead #xec)
+                                                (<= #xee lead #xef))
+                                            (continuation-p (aref octets (1+ index))))
+                                       (and (= lead #xed)
+                                            (<= #x80 (aref octets (1+ index)) #x9f)))
+                                   (continuation-p (aref octets (+ index 2))))
+                              3)
+                             ((and (or (= lead #xf0) (<= #xf1 lead #xf3)
+                                       (= lead #xf4))
+                                   (>= remaining 4)
+                                   (or (and (= lead #xf0)
+                                            (<= #x90 (aref octets (1+ index)) #xbf))
+                                       (and (<= #xf1 lead #xf3)
+                                            (continuation-p (aref octets (1+ index))))
+                                       (and (= lead #xf4)
+                                            (<= #x80 (aref octets (1+ index)) #x8f)))
+                                   (continuation-p (aref octets (+ index 2)))
+                                   (continuation-p (aref octets (+ index 3))))
+                              4))))
+               (unless width (return nil))
+               (incf index width))
+          finally (return t))))
+
 ;; Keep the RFC 9001 packet-protection vectors in the flake check, including
 ;; the deterministic Retry integrity vector from Appendix A.
-(load (merge-pathnames "protection.lisp"
-                       (or *load-truename* *default-pathname-defaults*)))
+(load (test-path "t/protection.lisp"))
 
 (check (= cl-quic-kit:*quic-version-1* #x00000001)
        "QUIC v1 has the RFC 9000 version number")
@@ -120,21 +165,66 @@
   (check (= (length (cl-quic-kit::quic-connection-closed-reason connection))
             (1- cl-quic-kit::+max-quic-close-reason-size+))
          "connection close reason does not split UTF-8 characters"))
-(dolist (case '((2 #(195 169) 1)
-                (3 #(226 130 172) 2)
-                (4 #(240 144 144 128) 3)))
-  (destructuring-bind (width character expected-trim) case
-    (let ((connection (cl-quic-kit:make-quic-connection :now-fn (lambda () 0)))
-          (reason (concatenate '(vector (unsigned-byte 8))
-                               (make-array (- cl-quic-kit::+max-quic-close-reason-size+
-                                             (1- width))
-                                           :element-type '(unsigned-byte 8)
-                                           :initial-element #x61)
-                               character)))
-      (cl-quic-kit:connection-close connection :no-error reason)
-      (check (= (length (cl-quic-kit::quic-connection-closed-reason connection))
-                (- cl-quic-kit::+max-quic-close-reason-size+ expected-trim))
-             "raw close reason truncates at a UTF-8 character boundary"))))
+(dolist (case '((2 #(195 169) #\é)
+                (3 #(226 130 172) #\€)
+                (4 #(240 144 144 128) #\𐀀)))
+  (destructuring-bind (width character string-character) case
+    (loop for cut from 1 below width
+          for prefix-length = (- cl-quic-kit::+max-quic-close-reason-size+ cut)
+          for reason = (concatenate '(vector (unsigned-byte 8))
+                                    (make-array prefix-length
+                                                :element-type '(unsigned-byte 8)
+                                                :initial-element #x61)
+                                    (subseq character 0 cut))
+          for output = (cl-quic-kit::%connection-reason-octets reason)
+          do (check (= (length output) prefix-length)
+                    "raw close reason drops every incomplete UTF-8 suffix")
+             (check (strict-utf8-p output)
+                    "raw close reason has a strict UTF-8 prefix"))
+    (let* ((prefix-length (- cl-quic-kit::+max-quic-close-reason-size+ width))
+           (reason (concatenate '(vector (unsigned-byte 8))
+                                (make-array prefix-length
+                                            :element-type '(unsigned-byte 8)
+                                            :initial-element #x61)
+                                character))
+           (output (cl-quic-kit::%connection-reason-octets reason)))
+      (check (= (length output) cl-quic-kit::+max-quic-close-reason-size+)
+             "raw close reason keeps a character complete at the limit")
+      (check (strict-utf8-p output)
+             "raw close reason boundary output is strict UTF-8"))
+    (loop for cut from 1 below width
+          for prefix-length = (- cl-quic-kit::+max-quic-close-reason-size+ cut)
+          for reason = (concatenate 'string
+                                    (make-string prefix-length :initial-element #\a)
+                                    (string string-character))
+          for output = (cl-quic-kit::%connection-reason-octets reason)
+          do (check (= (length output) prefix-length)
+                    "string close reason drops every oversized UTF-8 character")
+             (check (strict-utf8-p output)
+                    "string close reason has a strict UTF-8 prefix"))
+    (let* ((prefix-length (- cl-quic-kit::+max-quic-close-reason-size+ width))
+           (reason (concatenate 'string
+                                (make-string prefix-length :initial-element #\a)
+                                (string string-character)))
+           (output (cl-quic-kit::%connection-reason-octets reason)))
+      (check (= (length output) cl-quic-kit::+max-quic-close-reason-size+)
+             "string close reason keeps a character complete at the limit")
+      (check (strict-utf8-p output)
+             "string close reason boundary output is strict UTF-8"))))
+(dolist (invalid '((#x80 #xbf #x80)
+                   (#xc0 #x80)
+                   (#xe0 #x80 #x80)
+                   (#xed #xa0 #x80)
+                   (#xf0 #x80 #x80 #x80)
+                   (#xf4 #x90 #x80 #x80)
+                   (#xe2 #x28 #xa1)))
+  (let* ((prefix (make-array 9 :element-type '(unsigned-byte 8) :initial-element #x61))
+         (reason (concatenate '(vector (unsigned-byte 8)) prefix invalid))
+         (output (cl-quic-kit::%connection-reason-octets reason)))
+    (check (= (length output) (length prefix))
+           "raw close reason stops before invalid UTF-8")
+    (check (strict-utf8-p output)
+           "invalid raw close reason still returns strict UTF-8")))
 (let ((rejected nil))
   (handler-case
       (cl-quic-kit:decode-frame
@@ -393,8 +483,7 @@
       (cl-quic-kit.recovery:on-loss-timeout state :application :now 1)
     (check (and deadline (= (length lost) 2))
            "time-threshold loss removes and returns expired packets")))
-(load (merge-pathnames "protection.lisp"
-                       (or *load-truename* *default-pathname-defaults*)))
+(load (test-path "t/protection.lisp"))
 (let ((socket (cl-quic-kit:make-udp-socket :local-host "127.0.0.1"
                                             :local-port 0)))
   (unwind-protect
@@ -403,8 +492,7 @@
          (check (and (null data) (null length) (null address))
                 "non-blocking UDP receive reports no datagram cleanly"))
     (cl-quic-kit:udp-close socket)))
-(load (merge-pathnames "client.lisp"
-                       (or *load-truename* *default-pathname-defaults*)))
+(load (test-path "t/client.lisp"))
 
 (let* ((client (cl-quic-kit:make-quic-client
                :disable-hostname-verification-p t))
@@ -689,12 +777,8 @@
          :retry-integrity-tag tag)))
       (check (cl-quic-kit:quic-client-closed-p mismatched)
              "Retry for another connection is rejected"))))
-(load (merge-pathnames "codec.lisp"
-                       (or *load-truename* *default-pathname-defaults*)))
-(load (merge-pathnames "state.lisp"
-                       (or *load-truename* *default-pathname-defaults*)))
-(load (merge-pathnames "recovery.lisp"
-                       (or *load-truename* *default-pathname-defaults*)))
-(load (merge-pathnames "stream-flow-control.lisp"
-                       (or *load-truename* *default-pathname-defaults*)))
+(load (test-path "t/codec.lisp"))
+(load (test-path "t/state.lisp"))
+(load (test-path "t/recovery.lisp"))
+(load (test-path "t/stream-flow-control.lisp"))
 (format t "~D tests passed.~%" *tests-run*)

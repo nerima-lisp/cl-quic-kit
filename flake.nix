@@ -60,7 +60,10 @@
             fi
           }
           trap cleanup EXIT HUP INT TERM
-          sbcl --non-interactive --load t/run.lisp
+          sbcl --non-interactive \
+            --eval '(require :asdf)' \
+            --load cl-quic-kit.asd \
+            --eval '(asdf:test-system "cl-quic-kit")'
           ${pkgs.caddy}/bin/caddy run --config "$TMPDIR/Caddyfile" \
             --adapter caddyfile > "$TMPDIR/caddy.log" 2>&1 &
           caddy_pid=$!
