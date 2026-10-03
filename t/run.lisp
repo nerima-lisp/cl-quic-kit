@@ -56,6 +56,46 @@
 (let ((encoded (cl-quic-kit:encode-varint 494)))
   (multiple-value-bind (value size) (cl-quic-kit:decode-varint encoded)
     (check (and (= value 494) (= size 2)) "varint round trip")))
+(let ((encoded (cl-quic-kit:encode-varint (1- (ash 1 62)))))
+  (multiple-value-bind (value size) (cl-quic-kit:decode-varint encoded)
+    (check (and (= value (1- (ash 1 62))) (= size 8))
+           "maximum QUIC varint round trip")))
+(let ((rejected nil))
+  (handler-case (cl-quic-kit:encode-varint (ash 1 62))
+    (cl-quic-kit:quic-encoding-error () (setf rejected t)))
+  (check rejected "varints above the maximum are rejected"))
+(let ((bytes (make-array 65527 :element-type '(unsigned-byte 8))))
+  (setf (aref bytes 0) #x40)
+  (multiple-value-bind (header end) (cl-quic-kit:decode-packet-header bytes)
+    (check (and (eq (cl-quic-kit:packet-header-type header) :short)
+                (= end 65527))
+           "maximum UDP payload packet is accepted")))
+(let ((rejected nil))
+  (handler-case
+      (cl-quic-kit:decode-packet-header
+       (make-array 65528 :element-type '(unsigned-byte 8)
+                   :initial-element #x40))
+    (cl-quic-kit:quic-encoding-error () (setf rejected t)))
+  (check rejected "packet above the maximum UDP payload is rejected"))
+(let ((rejected nil))
+  (handler-case
+      (cl-quic-kit:decode-frame
+       (concatenate '(vector (unsigned-byte 8))
+                    (cl-quic-kit:encode-varint #x06)
+                    (cl-quic-kit:encode-varint 0)
+                    (cl-quic-kit:encode-varint 0)))
+    (cl-quic-kit:quic-encoding-error () (setf rejected t)))
+  (check (not rejected) "zero-length CRYPTO frame is accepted"))
+(let ((rejected nil))
+  (handler-case
+      (cl-quic-kit:decode-frame
+       (concatenate '(vector (unsigned-byte 8))
+                    (cl-quic-kit:encode-varint #x06)
+                    (cl-quic-kit:encode-varint 0)
+                    (cl-quic-kit:encode-varint (1- (ash 1 62)))
+                    #(1)))
+    (cl-quic-kit:quic-encoding-error () (setf rejected t)))
+  (check rejected "frame length beyond remaining bytes is rejected"))
 (let* ((frame (cl-quic-kit:make-frame :ping))
        (decoded (cl-quic-kit:decode-frame (cl-quic-kit:encode-frame frame))))
   (check (eq (cl-quic-kit:frame-type decoded) :ping) "PING frame round trip"))
@@ -178,9 +218,12 @@
                                 (declare (ignore connection))
                                 (push bytes writes)))))
     (cl-quic-kit:connection-set-state connection :established)
-    (cl-quic-kit:connection-close connection 42 "transport failure")
+    (cl-quic-kit:connection-close connection 42 "終了")
     (check (eq (cl-quic-kit:connection-state connection) :closing)
            "CONNECTION_CLOSE enters closing")
+    (check (equalp (cl-quic-kit::quic-connection-closed-reason connection)
+                   #(231 181 130 228 186 134))
+           "connection close stores a non-ASCII UTF-8 reason")
     (check (= (length writes) 1) "CONNECTION_CLOSE uses injected output")
     (cl-quic-kit:connection-receive-frame
      connection (cl-quic-kit:make-frame :application-close :error-code 7 :reason #()))
@@ -387,9 +430,28 @@
     (test-wire-captured (condition)
       (setf wire (test-wire-captured-bytes condition))))
   (check (and wire
-              (zerop (length (cl-quic-kit:frame-field
-                              (cl-quic-kit:decode-frame wire) :reason))))
-         "protocol close does not disclose internal error text"))
+              (equalp (cl-quic-kit:frame-field
+                       (cl-quic-kit:decode-frame wire) :reason)
+                      #(112 114 105 118 97 116 101 32 105 109 112 108 101 109 101 110 116 97 116 105 111 110 32 100 101 116 97 105 108)))
+         "protocol close carries its UTF-8 reason"))
+
+(let ((wire nil)
+      (client (cl-quic-kit:make-quic-client
+               :local-connection-id (%client-test-octets '(17 18 19 20 21 22 23 24))
+               :destination-connection-id (%client-test-octets '(25 26 27 28 29 30 31 32))
+               :disable-hostname-verification-p t
+               :io-write (lambda (connection bytes)
+                           (declare (ignore connection))
+                           (error 'test-wire-captured :bytes bytes)))))
+  (setf (cl-quic-kit::quic-client-keys client) nil)
+  (handler-case
+      (cl-quic-kit:client-close client :error-code 7 :reason "終了")
+    (test-wire-captured (condition)
+      (setf wire (test-wire-captured-bytes condition))))
+  (let ((reason (cl-quic-kit:frame-field
+                 (cl-quic-kit:decode-frame wire) :reason)))
+    (check (equalp reason #(231 181 130 228 186 134))
+           "client close sends a non-ASCII UTF-8 reason")))
 
 (let* ((destination (%client-test-octets '(16 17 18 19 20 21 22 23)))
        (sender-id (%client-test-octets '(32 33 34 35 36 37 38 39)))

@@ -2,6 +2,7 @@
 
 (defconstant +quic-v1+ #x00000001)
 (defconstant +quic-v2+ #x6b3343cf)
+(defconstant +max-quic-packet-size+ 65527)
 
 (defun %packet-error (message)
   (error 'quic-encoding-error :message message))
@@ -184,6 +185,8 @@
 (defun decode-packet-header (bytes &key (start 0) (short-header-dcid-length 0))
   (let* ((b (%octet-vector bytes))
          (at start))
+    (when (> (length b) +max-quic-packet-size+)
+      (%packet-error "QUIC packet exceeds the maximum UDP payload size"))
     (when (or (< at 0) (>= at (length b)))
       (%packet-error "Truncated packet header"))
     (let* ((first (aref b at))
@@ -239,6 +242,8 @@
                             (multiple-value-bind (length-value length-size)
                                 (decode-varint b at)
                               (incf at length-size)
+                              (when (> length-value +max-quic-packet-size+)
+                                (%packet-error "QUIC packet length exceeds the maximum UDP payload size"))
                               (let ((pn-length (1+ (logand first 3))))
                                 (when (< length-value pn-length)
                                   (%packet-error "Invalid long-header packet length"))
@@ -336,6 +341,8 @@
   "Decode a Version Negotiation packet into a property list."
   (let* ((b (%octet-vector bytes))
          (at start))
+    (when (> (length b) +max-quic-packet-size+)
+      (%packet-error "Version Negotiation packet exceeds the maximum UDP payload size"))
     (when (or (< at 0) (> (+ at 7) (length b)))
       (%packet-error "Truncated Version Negotiation packet"))
     (let ((first (aref b at)))
