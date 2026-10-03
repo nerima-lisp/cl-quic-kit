@@ -10,6 +10,7 @@
   flow-control
   initial-destination-connection-id remote-connection-id retry-token
   packet-numbers received-packets keys recovery sent-packets clock
+  (application-read-key-phase 0)
   local-connection-id server-host server-port hostname alpn
   transport-parameters tls-key-exchange tls-provider tls-trust-anchors
   tls-verify-signature tls-signature-algorithms client-hello-wire)
@@ -222,9 +223,9 @@
     (#x1303 :chacha20-poly1305)
     (otherwise :aes-128-gcm)))
 
-(defun %client-install-secret (client level direction secret)
+(defun %client-install-secret (client level direction secret &key replace-p)
   (let ((wire-level (%client-space-level level)))
-    (unless (%client-key client wire-level direction)
+    (when (or replace-p (not (%client-key client wire-level direction)))
       (%client-set-key
        client wire-level direction
        (cl-quic-kit.protection:make-key-set
@@ -235,6 +236,19 @@
           (%client-tls-level-call
            (%client-level-space level) (lambda (tls-level)
                    (funcall emit boundary tls-level direction secret))))))))
+
+(defun %client-rotate-application-read-key (client)
+  (let* ((driver (quic-client-tls-driver client))
+         (state (%client-driver-slot driver
+                                     "TLS13-CLIENT-DRIVER-APPLICATION-READ-STATE"))
+         (update (%client-function "CL-TLS-KIT" "TLS13-UPDATE-TRAFFIC-SECRET"))
+         (secret-reader (%client-function "CL-TLS-KIT"
+                                          "TLS13-TRAFFIC-STATE-SECRET")))
+    (when (and driver state update secret-reader)
+      (funcall update state)
+      (%client-install-secret client :1-rtt :read (funcall secret-reader state)
+                              :replace-p t)
+      t)))
 
 (defun %client-sync-tls-secrets (client)
   (let ((driver (quic-client-tls-driver client))
@@ -350,7 +364,7 @@
     (dotimes (index length number)
       (setf number (+ (ash number 8) (aref bytes (+ at index)))))))
 
-(defun %client-unprotect-packet (client bytes layout)
+(defun %client-unprotect-packet (client bytes layout &optional retried-p)
   (let* ((type (getf layout :type))
          (level (case type (:initial :initial) (:handshake :handshake)
                  (:0-rtt :0-rtt) (:short :1-rtt)))
@@ -360,35 +374,44 @@
     (unless key (return-from %client-unprotect-packet nil))
     (when (< (length packet) (+ pn-offset 20))
       (error 'quic-encoding-error :message "packet is too short for header protection"))
-    (let* ((sample (subseq packet (+ pn-offset 4) (+ pn-offset 20)))
-           (unmasked4 (cl-quic-kit.protection:remove-header-protection
-                       key packet sample pn-offset 4 (getf layout :long-p)))
-           (first (aref unmasked4 0))
-           (pn-length (1+ (logand first 3))))
-      (when (> (+ pn-offset pn-length) (length packet))
-        (error 'quic-encoding-error :message "truncated packet number"))
-      (let* ((unmasked (cl-quic-kit.protection:remove-header-protection
-                        key packet sample pn-offset pn-length (getf layout :long-p)))
-             (truncated (%client-truncated-number unmasked pn-offset pn-length))
-             (largest (or (first (%client-level-value
-                                  (quic-client-received-packets client) level))
-                          -1))
-             (number (cl-quic-kit.protection:reconstruct-packet-number
-                      truncated pn-length largest))
-             (associated (subseq unmasked 0 (+ pn-offset pn-length)))
-             (ciphertext (subseq unmasked (+ pn-offset pn-length)))
-             (plaintext
-               (cl-quic-kit.protection:unprotect-payload
-                key number ciphertext associated)))
-        (values level number
-                (make-packet-header
-                 :type type :version (getf layout :version)
-                 :destination-connection-id (getf layout :dcid)
-                 :source-connection-id (getf layout :scid)
-                 :packet-number number :packet-number-length pn-length
-                 :reserved-bits (ldb (byte 2 2) first)
-                 :key-phase (and (eq type :short) (logbitp 2 first))
-                 :payload plaintext))))))
+    (handler-case
+        (let* ((sample (subseq packet (+ pn-offset 4) (+ pn-offset 20)))
+               (unmasked4 (cl-quic-kit.protection:remove-header-protection
+                           key packet sample pn-offset 4 (getf layout :long-p)))
+               (first (aref unmasked4 0))
+               (pn-length (1+ (logand first 3))))
+          (when (> (+ pn-offset pn-length) (length packet))
+            (error 'quic-encoding-error :message "truncated packet number"))
+          (let* ((unmasked (cl-quic-kit.protection:remove-header-protection
+                            key packet sample pn-offset pn-length (getf layout :long-p)))
+                 (truncated (%client-truncated-number unmasked pn-offset pn-length))
+                 (largest (or (first (%client-level-value
+                                      (quic-client-received-packets client) level))
+                              -1))
+                 (number (cl-quic-kit.protection:reconstruct-packet-number
+                          truncated pn-length largest))
+                 (associated (subseq unmasked 0 (+ pn-offset pn-length)))
+                 (ciphertext (subseq unmasked (+ pn-offset pn-length)))
+                 (plaintext
+                   (cl-quic-kit.protection:unprotect-payload
+                    key number ciphertext associated)))
+            (let ((key-phase (and (eq type :short) (logbitp 2 first))))
+              (when (and (eq level :1-rtt) key-phase)
+                (setf (quic-client-application-read-key-phase client) 1))
+              (values level number
+                      (make-packet-header
+                       :type type :version (getf layout :version)
+                       :destination-connection-id (getf layout :dcid)
+                       :source-connection-id (getf layout :scid)
+                       :packet-number number :packet-number-length pn-length
+                       :reserved-bits (ldb (byte 2 2) first)
+                       :key-phase key-phase
+                       :payload plaintext)))))
+      (error (caught)
+        (if (and (eq level :1-rtt) (not retried-p)
+                 (%client-rotate-application-read-key client))
+            (%client-unprotect-packet client bytes layout t)
+            (error caught))))))
 
 (defun %client-packet-header-prefix (header cipher-length)
   (let* ((header (make-packet-header
@@ -675,6 +698,7 @@
                   :tls-driver tls-driver :streams (make-hash-table :test #'eql)
                   :next-bidi-stream 0 :next-uni-stream 2 :pending-frames nil
                   :pending-stream-writes nil
+                  :application-read-key-phase 0
                   :crypto-send-offsets nil
                   :peer-transport-parameters nil :closed-p nil :started-p nil
                   :flow-control

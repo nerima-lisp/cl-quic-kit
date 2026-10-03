@@ -170,7 +170,7 @@
                          (error "QUIC connection closed before HTTP/3 response"))
                        (sleep 0.005))
                      (if succeeded
-                         (format t "HTTP/3 GET succeeded: ~D response octets~%"
+                         (format t "HTTP/3 request succeeded: ~D response octets~%"
                                  (length response))
                          (error "HTTP/3 response timed out")))))))
     (ignore-errors (cl-quic-kit:client-close client)))))

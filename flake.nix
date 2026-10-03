@@ -45,10 +45,12 @@
             'localhost:18443 {' \
             '  bind 127.0.0.1' \
             "  tls $TMPDIR/self.crt $TMPDIR/self.key" \
-            '  respond "ok"' \
+            '  reverse_proxy 127.0.0.1:18080' \
             '}' > "$TMPDIR/Caddyfile"
           ${pkgs.stdenv.cc}/bin/cc -std=c11 -Wall -Wextra -O2 \
             t/udp-proxy.c -o "$TMPDIR/udp-proxy"
+          ${pkgs.stdenv.cc}/bin/cc -std=c11 -Wall -Wextra -O2 \
+            t/http-receiver.c -o "$TMPDIR/http-receiver"
           cleanup() {
             if [ -n "''${proxy_pid:-}" ]; then
               kill "$proxy_pid" 2>/dev/null || true
@@ -57,6 +59,10 @@
             if [ -n "''${caddy_pid:-}" ]; then
               kill "$caddy_pid" 2>/dev/null || true
               wait "$caddy_pid" 2>/dev/null || true
+            fi
+            if [ -n "''${receiver_pid:-}" ]; then
+              kill "$receiver_pid" 2>/dev/null || true
+              wait "$receiver_pid" 2>/dev/null || true
             fi
           }
           trap cleanup EXIT HUP INT TERM
@@ -80,12 +86,31 @@
             fi
             sleep 0.05
           done
-          if ! HOME="$TMPDIR" XDG_CACHE_HOME="$XDG_CACHE_HOME" \
-            CADDY_ROOT="$TMPDIR/self.crt" QUIC_PORT=18443 QUIC_BODY_SIZE=1048576 \
-            sbcl --non-interactive --load t/http3-loopback.lisp; then
-            cat "$TMPDIR/caddy.log"
-            exit 1
-          fi
+          run_post_case() {
+            expected="$1"
+            port="$2"
+            log="$TMPDIR/receiver-$expected-$port.log"
+            "$TMPDIR/http-receiver" "$expected" 18080 > "$log" 2>&1 &
+            receiver_pid=$!
+            attempts=0
+            while ! grep -q 'http-receiver listening' "$log"; do
+              attempts=$((attempts + 1))
+              if [ "$attempts" -ge 200 ]; then cat "$log"; return 1; fi
+              if ! kill -0 "$receiver_pid" 2>/dev/null; then cat "$log"; return 1; fi
+              sleep 0.05
+            done
+            if ! HOME="$TMPDIR" XDG_CACHE_HOME="$XDG_CACHE_HOME" \
+              CADDY_ROOT="$TMPDIR/self.crt" QUIC_PORT="$port" \
+              QUIC_BODY_SIZE="$expected" \
+              sbcl --non-interactive --load t/http3-loopback.lisp; then
+              cat "$log" "$TMPDIR/caddy.log"
+              return 1
+            fi
+            wait "$receiver_pid" || return 1
+            receiver_pid=
+            grep -q "POST length=$expected octets=ok" "$log"
+          }
+          run_post_case 1048576 18443
           proxy_pid=
           "$TMPDIR/udp-proxy" 18444 18443 1 20 0 > "$TMPDIR/proxy.log" 2>&1 &
           proxy_pid=$!
@@ -102,26 +127,9 @@
             fi
             sleep 0.05
           done
-          if ! HOME="$TMPDIR" XDG_CACHE_HOME="$XDG_CACHE_HOME" \
-            CADDY_ROOT="$TMPDIR/self.crt" QUIC_PORT=18444 QUIC_BODY_SIZE=1048576 \
-            sbcl --non-interactive --load t/http3-loopback.lisp; then
-            cat "$TMPDIR/caddy.log"
-            cat "$TMPDIR/proxy.log"
-            exit 1
-          fi
-          if ! HOME="$TMPDIR" XDG_CACHE_HOME="$XDG_CACHE_HOME" \
-            CADDY_ROOT="$TMPDIR/self.crt" QUIC_PORT=18443 QUIC_BODY_SIZE=8388608 \
-            sbcl --non-interactive --load t/http3-loopback.lisp; then
-            cat "$TMPDIR/caddy.log"
-            exit 1
-          fi
-          if ! HOME="$TMPDIR" XDG_CACHE_HOME="$XDG_CACHE_HOME" \
-            CADDY_ROOT="$TMPDIR/self.crt" QUIC_PORT=18444 QUIC_BODY_SIZE=8388608 \
-            sbcl --non-interactive --load t/http3-loopback.lisp; then
-            cat "$TMPDIR/caddy.log"
-            cat "$TMPDIR/proxy.log"
-            exit 1
-          fi
+          run_post_case 1048576 18444
+          run_post_case 8388608 18443
+          run_post_case 8388608 18444
           grep -q 'udp-proxy dropped server packet' "$TMPDIR/proxy.log"
           grep -q 'loss=20% mutate-1rtt=0' "$TMPDIR/proxy.log"
           kill "$proxy_pid" 2>/dev/null || true
