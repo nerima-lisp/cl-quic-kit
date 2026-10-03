@@ -8,7 +8,7 @@
 
   outputs = { self, nixpkgs, cl-crypto-kit, cl-tls-kit }:
     let
-      systems = [ "aarch64-darwin" "x86_64-linux" ];
+      systems = [ "x86_64-linux" ];
       forEachSystem = f: nixpkgs.lib.genAttrs systems
         (system: f system (import nixpkgs { inherit system; }));
     in {
@@ -19,8 +19,6 @@
         in {
         bootstrap = pkgs.runCommand "cl-quic-kit-bootstrap-tests" {
           nativeBuildInputs = [ pkgs.sbcl pkgs.caddy pkgs.openssl pkgs.stdenv.cc ];
-          __darwinAllowLocalNetworking = pkgs.stdenv.isDarwin;
-          __noChroot = pkgs.stdenv.isDarwin;
           CL_SOURCE_REGISTRY = "${tls}/share/common-lisp/source//:${crypto}/share/common-lisp/source//";
           src = ./.;
         } ''

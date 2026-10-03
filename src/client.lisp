@@ -7,6 +7,7 @@
   streams next-bidi-stream next-uni-stream
   pending-frames crypto-send-offsets tls-secrets
   peer-transport-parameters closed-p started-p
+  flow-control
   initial-destination-connection-id remote-connection-id retry-token
   packet-numbers received-packets keys recovery sent-packets clock
   local-connection-id server-host server-port hostname alpn
@@ -53,6 +54,19 @@
          (symbol (and package (find-symbol symbol-name package))))
     (and symbol (fboundp symbol) (symbol-function symbol))))
 
+(defun %client-tls-boundary-error-p (condition)
+  (let ((type (find-symbol "QUIC-TLS-BOUNDARY-ERROR" "CL-TLS-KIT")))
+    (and type (typep condition type))))
+
+(defun %client-tls-level-call (level function)
+  (handler-case
+      (funcall function level)
+    (error (condition)
+      (if (and (eq level :application)
+               (%client-tls-boundary-error-p condition))
+          (funcall function :1-rtt)
+          (error condition)))))
+
 (defun %client-driver-slot (driver name)
   (let ((reader (%client-function "CL-TLS-KIT" name)))
     (and reader (funcall reader driver))))
@@ -94,6 +108,46 @@
   (case stream-type
     (:control 0) (:qpack-encoder 2) (:qpack-decoder 3) (otherwise nil)))
 
+(defun %client-transport-parameter (parameters id default)
+  (let ((value (cdr (assoc id parameters))))
+    (if (integerp value) value default)))
+
+(defun %client-stream-send-limit (client id)
+  (let ((parameters (quic-client-peer-transport-parameters client)))
+    (if (eq (stream-id-direction id) :bidirectional)
+        (%client-transport-parameter parameters 6 *quic-max-offset*)
+        (%client-transport-parameter parameters 7 *quic-max-offset*))))
+
+(defun %client-stream-receive-limit (client id)
+  (declare (ignore client))
+  (if (eq (stream-id-direction id) :bidirectional) 65536 65536))
+
+(defun %client-check-deadline (client timeout deadline)
+  (let ((now (funcall (quic-client-clock client))))
+    (when (and timeout (not (and (numberp timeout) (>= timeout 0))))
+      (error 'quic-error))
+    (when (and deadline (not (numberp deadline)))
+      (error 'quic-error))
+    (when (and (or deadline timeout)
+               (<= (or deadline (+ now timeout)) now))
+      (error 'quic-error))))
+
+(defun %client-apply-max-data (client maximum)
+  (let ((flow (quic-client-flow-control client)))
+    (if (and (null (quic-client-peer-transport-parameters client))
+             (zerop (flow-control-connection-sent flow)))
+        (setf (flow-control-state-connection-max-data flow) maximum)
+        (flow-control-update-max-data flow maximum))))
+
+(defun %client-apply-max-streams (client direction maximum)
+  (let ((flow (quic-client-flow-control client)))
+    (if (and (null (quic-client-peer-transport-parameters client))
+             (zerop (flow-control-stream-count flow direction)))
+        (ecase direction
+          (:bidirectional (setf (flow-control-state-max-streams-bidi flow) maximum))
+          (:unidirectional (setf (flow-control-state-max-streams-uni flow) maximum)))
+        (flow-control-update-max-streams flow direction maximum))))
+
 (defun %client-driver-suite-cipher (driver)
   (case (%client-driver-slot driver "TLS13-CLIENT-DRIVER-SUITE")
     (#x1302 :aes-256-gcm)
@@ -101,14 +155,18 @@
     (otherwise :aes-128-gcm)))
 
 (defun %client-install-secret (client level direction secret)
-  (unless (%client-key client level direction)
-    (%client-set-key
-     client level direction
-     (cl-quic-kit.protection:make-key-set
-      secret :cipher (%client-driver-suite-cipher (quic-client-tls-driver client))))
-    (let ((boundary (quic-client-tls-boundary client))
-          (emit (%client-function "CL-TLS-KIT" "QUIC-TLS-BOUNDARY-EMIT-SECRET")))
-      (when (and boundary emit) (funcall emit boundary level direction secret)))))
+  (let ((wire-level (%client-space-level level)))
+    (unless (%client-key client wire-level direction)
+      (%client-set-key
+       client wire-level direction
+       (cl-quic-kit.protection:make-key-set
+        secret :cipher (%client-driver-suite-cipher (quic-client-tls-driver client))))
+      (let ((boundary (quic-client-tls-boundary client))
+            (emit (%client-function "CL-TLS-KIT" "QUIC-TLS-BOUNDARY-EMIT-SECRET")))
+        (when (and boundary emit)
+          (%client-tls-level-call
+           (%client-level-space level) (lambda (tls-level)
+                   (funcall emit boundary tls-level direction secret))))))))
 
 (defun %client-sync-tls-secrets (client)
   (let ((driver (quic-client-tls-driver client))
@@ -446,6 +504,48 @@
   (dolist (frame frames)
     (case (frame-type frame)
       ((:ack :ack-ecn) (%client-handle-ack client level frame))
+      (:max-data
+       (%client-apply-max-data client (frame-field frame :maximum 0)))
+      (:max-streams-bidi
+       (%client-apply-max-streams client :bidirectional
+                                  (frame-field frame :maximum 0)))
+      (:max-streams-uni
+       (%client-apply-max-streams client :unidirectional
+                                  (frame-field frame :maximum 0)))
+      (:max-stream-data
+       (let ((stream (gethash (frame-field frame :stream-id)
+                              (quic-client-streams client))))
+         (unless stream
+           (error 'quic-encoding-error :message "MAX_STREAM_DATA for unknown stream"))
+         (if (and (null (quic-client-peer-transport-parameters client))
+                  (zerop (stream-send-offset stream)))
+             (setf (stream-send-max-offset stream) (frame-field frame :maximum 0))
+             (stream-set-max-send-offset stream (frame-field frame :maximum 0)))))
+      (:reset-stream
+       (let ((stream (gethash (frame-field frame :stream-id)
+                              (quic-client-streams client))))
+         (unless stream
+           (error 'quic-encoding-error :message "RESET_STREAM for unknown stream"))
+         (stream-reset-receive
+          stream (frame-field frame :application-protocol-error-code 0)
+          (frame-field frame :final-size 0))))
+      (:stop-sending
+       (let ((stream (gethash (frame-field frame :stream-id)
+                              (quic-client-streams client))))
+         (unless stream
+           (error 'quic-encoding-error :message "STOP_SENDING for unknown stream"))
+         (stream-stop-sending-receive
+          stream (frame-field frame :application-protocol-error-code 0))
+         (loop for event = (stream-next-event stream)
+               while event
+               when (eq (getf event :type) :reset-stream)
+                 do (%client-queue-frame
+                     client (make-frame :reset-stream
+                                        :stream-id (stream-id stream)
+                                        :application-protocol-error-code
+                                        (getf event :error-code 0)
+                                        :final-size (getf event :final-size 0))
+                     :1-rtt))))
       (:stream
        (let ((stream (%client-find-or-create-peer-stream
                       client (frame-field frame :stream-id))))
@@ -475,7 +575,7 @@
                                         :remote-port server-port))))
          (local (or local-connection-id (%client-random-octets 8)))
          (destination (or destination-connection-id (%client-random-octets 8)))
-         (clock (or now-fn #'get-internal-real-time))
+         (clock (or now-fn #'%quic-real-time))
          (write (or io-write
                     (and udp (lambda (ignored bytes)
                                (declare (ignore ignored)) (udp-send udp bytes)))))
@@ -490,6 +590,12 @@
                   :next-bidi-stream 0 :next-uni-stream 2 :pending-frames nil
                   :crypto-send-offsets nil :tls-secrets nil
                   :peer-transport-parameters nil :closed-p nil :started-p nil
+                  :flow-control
+                  (make-flow-control-state
+                   :max-data *quic-max-offset*
+                   :max-receive-data 1048576
+                   :max-streams-bidi *quic-max-streams*
+                   :max-streams-uni *quic-max-streams*)
                   :initial-destination-connection-id destination
                   :remote-connection-id destination :retry-token #()
                   :packet-numbers nil :received-packets nil :keys nil
@@ -511,16 +617,31 @@
     client))
 
 (defun client-open-stream (client request &key stream-type timeout deadline)
-  (declare (ignore request timeout deadline))
+  (declare (ignore request))
+  (%client-check-deadline client timeout deadline)
   (when (quic-client-closed-p client)
     (error 'connection-closed :error-code 0 :reason #()))
+  (let* ((uni-type (%client-stream-type stream-type))
+         (direction (if uni-type :unidirectional :bidirectional)))
+    (handler-case
+        (flow-control-open-stream (quic-client-flow-control client) direction)
+      (flow-control-limit-error (condition)
+        (%client-queue-frame
+         client (make-frame (if uni-type :streams-blocked-uni
+                                :streams-blocked-bidi)
+                            :maximum (flow-control-error-limit condition))
+         :1-rtt)
+        (error condition)))
   (let* ((uni-type (%client-stream-type stream-type))
          (id (if uni-type
                  (prog1 (quic-client-next-uni-stream client)
                    (incf (quic-client-next-uni-stream client) 4))
                  (prog1 (quic-client-next-bidi-stream client)
                    (incf (quic-client-next-bidi-stream client) 4))))
-         (stream (make-stream id :local-initiator :client)))
+         (stream (make-stream id :local-initiator :client
+                              :flow-control (quic-client-flow-control client)
+                              :max-send-data (%client-stream-send-limit client id)
+                              :max-receive-data (%client-stream-receive-limit client id))))
     (setf (gethash id (quic-client-streams client)) stream)
     (when uni-type
       (incf (stream-send-offset stream) (length (encode-varint uni-type)))
@@ -529,13 +650,20 @@
                                        :data (encode-varint uni-type)
                                        :fin nil :len-present t)
                            :1-rtt))
-    stream))
+    stream)))
 
 (defun client-write-stream (client stream octets &key (fin-p nil) timeout deadline)
-  (declare (ignore timeout deadline))
+  (%client-check-deadline client timeout deadline)
   (unless (eq (gethash (stream-id stream) (quic-client-streams client)) stream)
     (error 'quic-error))
-  (let* ((result (stream-write stream octets))
+  (let* ((result (handler-case
+                     (stream-write stream octets)
+                   (flow-control-limit-error (condition)
+                     (%client-queue-frame
+                      client (make-frame :data-blocked
+                                         :maximum (flow-control-error-limit condition))
+                      :1-rtt)
+                     (error condition))))
          (frame (make-frame :stream :stream-id (stream-id stream)
                             :offset (getf result :offset) :data (getf result :data)
                             :fin fin-p :len-present t)))
@@ -544,7 +672,18 @@
     frame))
 
 (defun client-read-stream (client stream &key timeout deadline)
-  (declare (ignore client timeout deadline)) (stream-read stream))
+  (%client-check-deadline client timeout deadline)
+  (multiple-value-bind (data fin) (stream-read stream)
+    (let ((maximum (+ (stream-read-offset stream) 65536)))
+      (stream-set-max-receive-offset stream maximum)
+      (%client-queue-frame
+       client (make-frame :max-stream-data :stream-id (stream-id stream)
+                          :maximum maximum) :1-rtt)
+      (flow-control-update-max-receive-data
+       (quic-client-flow-control client)
+       (max maximum (flow-control-connection-receive-limit
+                     (quic-client-flow-control client)))))
+    (values data fin)))
 
 (defun client-close-stream (client stream &key condition)
   (declare (ignore condition))
@@ -572,7 +711,10 @@
 (defun %client-find-or-create-peer-stream (client id)
   (or (gethash id (quic-client-streams client))
       (setf (gethash id (quic-client-streams client))
-            (make-stream id :local-initiator :client))))
+            (make-stream id :local-initiator :client
+                         :flow-control (quic-client-flow-control client)
+                         :max-receive-data (%client-stream-receive-limit client id)
+                         :max-send-data (%client-stream-send-limit client id)))))
 
 (defun client-receive-frame (client frame)
   (%client-receive-frames client :initial 0 (list frame))
@@ -586,6 +728,9 @@
   (let* ((header (%client-retry-header bytes))
          (tag (packet-header-retry-integrity-tag header))
          (pseudo (subseq bytes 0 (- (length bytes) 16))))
+    (unless (and (equalp (packet-header-destination-connection-id header)
+                         (quic-client-local-connection-id client)))
+      (error 'quic-encoding-error :message "Retry connection ID mismatch"))
     (unless (verify-retry-integrity
              pseudo tag :original-destination-connection-id
              (quic-client-initial-destination-connection-id client))
@@ -604,8 +749,12 @@
                           :data (quic-client-client-hello-wire client)) :initial))))
 
 (defun %client-handle-version-negotiation (client bytes)
-  (declare (ignore client))
   (let ((decoded (decode-version-negotiation bytes)))
+    (unless (and (equalp (getf decoded :destination-connection-id)
+                         (quic-client-local-connection-id client))
+                 (equalp (getf decoded :source-connection-id)
+                         (quic-client-initial-destination-connection-id client)))
+      (error 'quic-encoding-error :message "Version Negotiation connection ID mismatch"))
     (unless (member *quic-version-1* (getf decoded :versions))
       (error 'quic-encoding-error :message "peer does not support QUIC v1"))))
 
@@ -674,8 +823,25 @@
                    :on-transport-parameters
                    (lambda (boundary parameters)
                      (declare (ignore boundary))
-                     (setf (quic-client-peer-transport-parameters client) parameters))))
-    (quic-client-tls-boundary client)))
+                     (setf (quic-client-peer-transport-parameters client) parameters)
+                     (let ((flow (quic-client-flow-control client)))
+                       (when (zerop (flow-control-connection-sent flow))
+                         (setf (flow-control-state-connection-max-data flow)
+                               (%client-transport-parameter parameters 4 0)))
+                       (when (zerop (flow-control-stream-count flow :bidirectional))
+                         (setf (flow-control-state-max-streams-bidi flow)
+                               (%client-transport-parameter parameters 8 0)))
+                       (when (zerop (flow-control-stream-count flow :unidirectional))
+                         (setf (flow-control-state-max-streams-uni flow)
+                               (%client-transport-parameter parameters 9 0))))
+                     (maphash
+                      (lambda (id stream)
+                        (stream-set-max-send-offset
+                         stream (%client-stream-send-limit client id))
+                        (stream-set-max-receive-offset
+                         stream (%client-stream-receive-limit client id)))
+                      (quic-client-streams client))))))
+    (quic-client-tls-boundary client))
 
 (defun %client-driver-key-exchange (client)
   (or (quic-client-tls-key-exchange client)
@@ -721,21 +887,25 @@
                      (lambda (driver wire)
                        (let* ((type (aref wire 0))
                               (level (if (= type 1) :initial
-                                         (if (= type 20) :handshake :1-rtt)))
+                                         (if (= type 20) :handshake :application)))
                               (boundary (quic-client-tls-boundary client))
                               (before (length (quic-client-pending-frames client))))
                          (unless boundary (error 'quic-error))
-                         (if (and (= type 1)
-                                  (%client-function "CL-TLS-KIT"
-                                                    "QUIC-TLS-BOUNDARY-SEND-WITH-TRANSPORT-PARAMETERS"))
-                             (funcall (%client-function
-                                       "CL-TLS-KIT"
-                                       "QUIC-TLS-BOUNDARY-SEND-WITH-TRANSPORT-PARAMETERS")
-                                      boundary level type (subseq wire 4)
-                                      (quic-client-transport-parameters client))
-                             (funcall (%client-function "CL-TLS-KIT"
-                                                        "QUIC-TLS-BOUNDARY-SEND")
-                                      boundary level type (subseq wire 4)))
+                         (%client-tls-level-call
+                          level
+                          (lambda (tls-level)
+                            (if (and (= type 1)
+                                     (%client-function
+                                      "CL-TLS-KIT"
+                                      "QUIC-TLS-BOUNDARY-SEND-WITH-TRANSPORT-PARAMETERS"))
+                                (funcall (%client-function
+                                          "CL-TLS-KIT"
+                                          "QUIC-TLS-BOUNDARY-SEND-WITH-TRANSPORT-PARAMETERS")
+                                         boundary tls-level type (subseq wire 4)
+                                         (quic-client-transport-parameters client))
+                                (funcall (%client-function "CL-TLS-KIT"
+                                                           "QUIC-TLS-BOUNDARY-SEND")
+                                         boundary tls-level type (subseq wire 4)))))
                          (when (and (= type 1)
                                     (> (length (quic-client-pending-frames client)) before))
                            (setf (quic-client-client-hello-wire client)
@@ -767,8 +937,12 @@
         (step (%client-function "CL-TLS-KIT" "TLS13-CLIENT-DRIVER-STEP")))
     (when (and feed step (quic-client-tls-boundary client)
                (quic-client-tls-driver client))
-      (dolist (message (funcall feed (quic-client-tls-boundary client)
-                                level offset bytes))
+      (dolist (message
+                (%client-tls-level-call
+                 (%client-level-space level)
+                 (lambda (tls-level)
+                   (funcall feed (quic-client-tls-boundary client)
+                            tls-level offset bytes))))
         (funcall step (quic-client-tls-driver client) (getf message :wire))
         (%client-sync-tls-secrets client)))))
 

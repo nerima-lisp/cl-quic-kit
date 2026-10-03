@@ -78,6 +78,7 @@
    #:make-client-tls-boundary #:make-client-tls-driver #:client-tls-feed
    #:client-start #:client-poll #:client-close
    #:quic-client-connection #:quic-client-udp-socket
+   #:quic-client-closed-p
    #:quic-client-tls-boundary #:quic-client-tls-secrets
    #:quic-client-peer-transport-parameters))
 

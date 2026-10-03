@@ -428,7 +428,7 @@
              "idle timeout emits a protected CONNECTION_CLOSE")))
 
   (let* ((vn (cl-quic-kit:encode-version-negotiation
-              sender-id receiver-id (list cl-quic-kit:*quic-version-1* #x6b3343cf)))
+              sender-id destination (list cl-quic-kit:*quic-version-1* #x6b3343cf)))
          (bad (make-array 1 :element-type '(unsigned-byte 8) :initial-element #xff)))
     (check (null (cl-quic-kit:client-receive-datagram sender vn))
            "client accepts Version Negotiation advertising QUIC v1")
@@ -439,6 +439,16 @@
                     :closing)
                 ack-wire)
            "malformed packet transitions the client to protocol close"))
+
+  (let ((mismatched (cl-quic-kit:make-quic-client
+                     :local-connection-id sender-id
+                     :destination-connection-id destination)))
+    (cl-quic-kit:client-receive-datagram
+     mismatched
+     (cl-quic-kit:encode-version-negotiation
+      receiver-id destination (list cl-quic-kit:*quic-version-1*)))
+    (check (cl-quic-kit:quic-client-closed-p mismatched)
+           "Version Negotiation for another connection is rejected"))
 
   (let* ((retry-token (%client-test-octets '(6 7)))
          (retry-scid (%client-test-octets '(80 81 82 83 84 85 86 87)))
@@ -477,5 +487,18 @@
     (check (and wire
                 (equalp (getf (cl-quic-kit::%client-layout wire) :token)
                         retry-token))
-           "Retry retransmits ClientHello with the Retry token")))
+           "Retry retransmits ClientHello with the Retry token")
+    (let ((mismatched (cl-quic-kit:make-quic-client
+                       :local-connection-id sender-id
+                       :destination-connection-id destination)))
+      (cl-quic-kit:client-receive-datagram
+       mismatched
+       (cl-quic-kit:encode-packet-header
+        (cl-quic-kit:make-packet-header
+         :type :retry :version cl-quic-kit:*quic-version-1*
+         :destination-connection-id receiver-id
+         :source-connection-id retry-scid :token retry-token
+         :retry-integrity-tag tag)))
+      (check (cl-quic-kit:quic-client-closed-p mismatched)
+             "Retry for another connection is rejected"))))
 (format t "~D tests passed.~%" *tests-run*)

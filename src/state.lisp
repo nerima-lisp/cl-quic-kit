@@ -3,7 +3,7 @@
 (declaim (ftype function connection-close connection-retire-connection-id
                         connection-write connection-poll))
 
-(defparameter *quic-idle-timeout-default* 30000)
+(defparameter *quic-idle-timeout-default* 30)
 (defparameter *quic-active-connection-id-limit-default* 2)
 
 (defun %connection-error-code (code)
@@ -48,7 +48,10 @@
 (defun connection-draining-deadline (connection)
   (quic-connection-draining-deadline connection))
 
-(defun make-quic-connection (&key (role :client) (now-fn #'get-internal-real-time)
+(defun %quic-real-time ()
+  (/ (get-internal-real-time) internal-time-units-per-second))
+
+(defun make-quic-connection (&key (role :client) (now-fn #'%quic-real-time)
                                   (idle-timeout *quic-idle-timeout-default*)
                                   local-connection-id tls-input tls-output
                                   io-read io-write read-fn write-fn on-close

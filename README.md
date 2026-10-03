@@ -13,7 +13,7 @@ NewReno state, connection lifecycle management, and an explicit `cl-crypto-kit` 
 
 ## Development
 
-Run the dependency-free bootstrap tests with:
+Run the bootstrap tests with:
 
 ```sh
 sbcl --non-interactive --load t/run.lisp
