@@ -329,6 +329,9 @@
   (make-array (length values) :element-type '(unsigned-byte 8)
               :initial-contents values))
 
+(define-condition test-wire-captured (error)
+  ((bytes :initarg :bytes :reader test-wire-captured-bytes)))
+
 (let ((caught nil))
   (handler-case
       (cl-quic-kit:make-quic-client
@@ -370,18 +373,22 @@
   (check (not (eq status :external))
          "TLS traffic secrets are not exposed as a public accessor"))
 
-(let ((writes nil)
+(let ((wire nil)
       (client (cl-quic-kit:make-quic-client
                :local-connection-id (%client-test-octets '(17 18 19 20 21 22 23 24))
                :destination-connection-id (%client-test-octets '(25 26 27 28 29 30 31 32))
                :disable-hostname-verification-p t
                :io-write (lambda (connection bytes)
                            (declare (ignore connection))
-                           (push bytes writes)))))
+                           (error 'test-wire-captured :bytes bytes)))))
   (setf (cl-quic-kit::quic-client-keys client) nil)
-  (cl-quic-kit::%client-protocol-close client 7 "private implementation detail")
-  (check (zerop (length (cl-quic-kit:frame-field
-                         (cl-quic-kit:decode-frame (first writes)) :reason)))
+  (handler-case
+      (cl-quic-kit::%client-protocol-close client 7 "private implementation detail")
+    (test-wire-captured (condition)
+      (setf wire (test-wire-captured-bytes condition))))
+  (check (and wire
+              (zerop (length (cl-quic-kit:frame-field
+                              (cl-quic-kit:decode-frame wire) :reason))))
          "protocol close does not disclose internal error text"))
 
 (let* ((destination (%client-test-octets '(16 17 18 19 20 21 22 23)))
