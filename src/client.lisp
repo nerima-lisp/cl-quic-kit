@@ -370,9 +370,7 @@
                  (:0-rtt :0-rtt) (:short :1-rtt)))
          (key (%client-key client level :read))
          (pn-offset (getf layout :pn-offset))
-         (packet (subseq bytes 0 (getf layout :end)))
-         (first-octet nil) (pn-length nil) (truncated nil) (largest nil)
-         (number nil) (key-phase nil))
+         (packet (subseq bytes 0 (getf layout :end))))
     (unless key (return-from %client-unprotect-packet nil))
     (when (< (length packet) (+ pn-offset 20))
       (error 'quic-encoding-error :message "packet is too short for header protection"))
@@ -380,34 +378,24 @@
         (let* ((sample (subseq packet (+ pn-offset 4) (+ pn-offset 20)))
                (unmasked4 (cl-quic-kit.protection:remove-header-protection
                            key packet sample pn-offset 4 (getf layout :long-p)))
-               (unmasked-first (aref unmasked4 0))
-               (unmasked-pn-length (1+ (logand unmasked-first 3)))
-               (unmasked-key-phase (and (eq type :short)
-                                        (logbitp 2 unmasked-first))))
-          (setf first-octet unmasked-first
-                pn-length unmasked-pn-length
-                key-phase unmasked-key-phase)
+               (first (aref unmasked4 0))
+               (pn-length (1+ (logand first 3))))
           (when (> (+ pn-offset pn-length) (length packet))
             (error 'quic-encoding-error :message "truncated packet number"))
           (let* ((unmasked (cl-quic-kit.protection:remove-header-protection
                             key packet sample pn-offset pn-length (getf layout :long-p)))
-                 (unmasked-truncated
-                   (%client-truncated-number unmasked pn-offset pn-length))
-                 (received-largest (or (cl:first (%client-level-value
-                                               (quic-client-received-packets client)
-                                               level))
-                                       -1))
-                 (reconstructed-number
-                   (cl-quic-kit.protection:reconstruct-packet-number
-                    unmasked-truncated pn-length received-largest))
+                 (truncated (%client-truncated-number unmasked pn-offset pn-length))
+                 (largest (or (first (%client-level-value
+                                      (quic-client-received-packets client) level))
+                              -1))
+                 (number (cl-quic-kit.protection:reconstruct-packet-number
+                          truncated pn-length largest))
                  (associated (subseq unmasked 0 (+ pn-offset pn-length)))
-                 (ciphertext (subseq unmasked (+ pn-offset pn-length))))
-            (setf truncated unmasked-truncated
-                  largest received-largest
-                  number reconstructed-number)
-            (let ((plaintext
-                    (cl-quic-kit.protection:unprotect-payload
-                     key reconstructed-number ciphertext associated)))
+                 (ciphertext (subseq unmasked (+ pn-offset pn-length)))
+                 (plaintext
+                   (cl-quic-kit.protection:unprotect-payload
+                    key number ciphertext associated)))
+            (let ((key-phase (and (eq type :short) (logbitp 2 first))))
               (when (and (eq level :1-rtt) key-phase)
                 (setf (quic-client-application-read-key-phase client) 1))
               (values level number
@@ -416,21 +404,10 @@
                        :destination-connection-id (getf layout :dcid)
                        :source-connection-id (getf layout :scid)
                        :packet-number number :packet-number-length pn-length
-                       :reserved-bits (ldb (byte 2 2) first-octet)
+                       :reserved-bits (ldb (byte 2 2) first)
                        :key-phase key-phase
                        :payload plaintext)))))
       (error (caught)
-        (format *error-output*
-                "QUIC receive decrypt failure level=~S type=~S retried=~S packet-length=~D end=~D pn-offset=~D pn-length=~S truncated=~S largest=~S reconstructed=~S key-phase=~S recent=~S~%"
-                level type retried-p (length packet) (getf layout :end)
-                pn-offset pn-length truncated largest number key-phase
-                (subseq (or (%client-level-value
-                             (quic-client-received-packets client) level)
-                            nil)
-                        0 (min 8 (length (or (%client-level-value
-                                              (quic-client-received-packets client)
-                                              level)
-                                              nil)))))
         (if (and (eq level :1-rtt) (not retried-p)
                  (%client-rotate-application-read-key client))
             (%client-unprotect-packet client bytes layout t)
