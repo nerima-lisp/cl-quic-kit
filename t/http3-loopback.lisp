@@ -124,13 +124,18 @@
                    (declare (ignore qpack-encoder qpack-decoder))
                    (cl-quic-kit:client-write-stream
                     client request
-                    (%h3-frame
-                     1
-                     (%append-octets
-                      ;; QPACK static entries 17, 23, 0, and 1 encode
-                      ;; :method GET, :scheme https, :authority, and :path /.
-                      (%bytes 0 0 #xd1 #xd7 #x50 #x8a #xa0 #xe4 #x1d #x13
-                              #x9d #x09 #xb8 #xf3 #x4d #x33 #xc1)))
+                    (%append-octets
+                     (%h3-frame
+                      1
+                      (%append-octets
+                       ;; QPACK static entries 17, 23, 0, and 1 encode
+                       ;; :method GET, :scheme https, :authority, and :path /.
+                       (%bytes 0 0 #xd1 #xd7 #x50 #x8a #xa0 #xe4 #x1d #x13
+                               #x9d #x09 #xb8 #xf3 #x4d #x33 #xc1)))
+                     (%h3-frame 0
+                                (make-array (* 1024 1024)
+                                            :element-type '(unsigned-byte 8)
+                                            :initial-element #x5a)))
                     :fin-p t)
                    (cl-quic-kit:client-flush client)
                    (let ((response (make-array 0 :element-type '(unsigned-byte 8)))

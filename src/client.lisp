@@ -5,7 +5,7 @@
 (defstruct (quic-client (:constructor %make-quic-client))
   connection udp-socket tls-boundary tls-driver
   streams next-bidi-stream next-uni-stream
-  pending-frames crypto-send-offsets
+  pending-frames pending-stream-writes crypto-send-offsets
   peer-transport-parameters closed-p started-p
   flow-control
   initial-destination-connection-id remote-connection-id retry-token
@@ -45,6 +45,68 @@
   (setf (quic-client-pending-frames client)
         (nconc (quic-client-pending-frames client) (list (cons level frame))))
   frame)
+
+(defparameter *client-packet-payload-limit* 1100)
+
+(defun %client-frame-data (frame)
+  (frame-field frame :data #()))
+
+(defun %client-split-frame (frame)
+  (if (not (member (frame-type frame) '(:stream :crypto)))
+      (list frame)
+      (let* ((data (%client-frame-data frame))
+             (length (length data))
+             (chunks nil)
+             (at 0))
+        (if (zerop length)
+            (list frame)
+            (progn
+              (loop while (< at length) do
+              (let* ((remaining (- length at)) (low 1) (high remaining) (best 0))
+                (loop while (<= low high) do
+                  (let* ((middle (floor (+ low high) 2))
+                         (fields (copy-list (frame-fields frame))))
+                    (setf (getf fields :data) (subseq data at (+ at middle))
+                          (getf fields :offset)
+                          (+ (or (getf fields :offset) 0) at)
+                          (getf fields :fin)
+                          (and (getf fields :fin) (= (+ at middle) length)))
+                    (if (<= (length (encode-frame
+                                     (apply #'make-frame (frame-type frame) fields)))
+                            *client-packet-payload-limit*)
+                        (setf best middle low (1+ middle))
+                        (setf high (1- middle)))))
+                (when (zerop best)
+                  (error 'quic-encoding-error
+                         :message "Frame cannot fit in a QUIC packet"))
+                (let ((fields (copy-list (frame-fields frame))))
+                  (setf (getf fields :data) (subseq data at (+ at best))
+                        (getf fields :offset)
+                        (+ (or (getf fields :offset) 0) at)
+                        (getf fields :fin)
+                        (and (getf fields :fin) (= (+ at best) length)))
+                  (push (apply #'make-frame (frame-type frame) fields) chunks))
+                (incf at best)))
+              (nreverse chunks))))))
+
+(defun %client-frame-packet-groups (frames)
+  (let ((groups nil) (current nil) (size 0))
+    (dolist (frame frames)
+      (dolist (part (%client-split-frame frame))
+        (let ((part-size (length (encode-frame part))))
+          (when (> part-size *client-packet-payload-limit*)
+            (error 'quic-encoding-error
+                   :message "Frame exceeds the QUIC packet payload limit"))
+          (if (and current
+                   (> (+ size part-size) *client-packet-payload-limit*))
+              (progn
+                (push (nreverse current) groups)
+                (setf current (list part) size part-size))
+              (progn
+                (push part current)
+                (incf size part-size))))))
+    (when current (push (nreverse current) groups))
+    (nreverse groups)))
 
 (defun %client-octets (value)
   (ensure-octets (or value #())))
@@ -597,6 +659,7 @@
                   :connection connection :udp-socket udp :tls-boundary tls-boundary
                   :tls-driver tls-driver :streams (make-hash-table :test #'eql)
                   :next-bidi-stream 0 :next-uni-stream 2 :pending-frames nil
+                  :pending-stream-writes nil
                   :crypto-send-offsets nil
                   :peer-transport-parameters nil :closed-p nil :started-p nil
                   :flow-control
@@ -659,24 +722,73 @@
                            :1-rtt))
     stream)))
 
+(defun %client-stream-send-credit (client stream)
+  (min (- (stream-send-max-offset stream) (stream-send-offset stream))
+       (- (flow-control-connection-max-data (quic-client-flow-control client))
+          (flow-control-connection-sent (quic-client-flow-control client)))))
+
+(defun %client-queue-pending-stream-write (client stream octets fin-p)
+  (setf (quic-client-pending-stream-writes client)
+        (nconc (quic-client-pending-stream-writes client)
+               (list (list stream octets fin-p)))))
+
+(defun %client-write-stream-available (client stream octets fin-p)
+  (let* ((credit (max 0 (%client-stream-send-credit client stream)))
+         (count (min credit (length octets)))
+         (data (subseq octets 0 count)))
+    (when (and (zerop count) (plusp (length octets)))
+      (%client-queue-frame
+       client (make-frame :data-blocked
+                          :maximum (flow-control-connection-max-data
+                                    (quic-client-flow-control client)))
+       :1-rtt)
+      (%client-queue-pending-stream-write client stream octets fin-p)
+      (return-from %client-write-stream-available nil))
+    (let* ((result (handler-case
+                       (stream-write stream data)
+                     (flow-control-limit-error (condition)
+                       (%client-queue-frame
+                        client (make-frame :data-blocked
+                                           :maximum (flow-control-error-limit condition))
+                        :1-rtt)
+                       (error condition))))
+           (remaining (subseq octets count))
+           (complete (zerop (length remaining)))
+           (frame (make-frame :stream :stream-id (stream-id stream)
+                              :offset (getf result :offset) :data (getf result :data)
+                              :fin (and fin-p complete) :len-present t)))
+      (%client-queue-frame client frame :1-rtt)
+      (if complete
+          (when fin-p (stream-finish stream))
+          (%client-queue-pending-stream-write client stream remaining fin-p))
+      frame)))
+
+(defun %client-drain-pending-stream-writes (client)
+  (loop while (quic-client-pending-stream-writes client) do
+    (let* ((entry (pop (quic-client-pending-stream-writes client)))
+           (stream (first entry))
+           (octets (second entry))
+           (fin-p (third entry)))
+      (if (plusp (%client-stream-send-credit client stream))
+          (%client-write-stream-available client stream octets fin-p)
+          (progn
+            (%client-queue-frame
+             client (make-frame :data-blocked
+                                :maximum (flow-control-connection-max-data
+                                          (quic-client-flow-control client)))
+             :1-rtt)
+            (push entry (quic-client-pending-stream-writes client))
+            (return)))))
+  client)
+
 (defun client-write-stream (client stream octets &key (fin-p nil) timeout deadline)
   (%client-check-deadline client timeout deadline)
   (unless (eq (gethash (stream-id stream) (quic-client-streams client)) stream)
     (error 'quic-error))
-  (let* ((result (handler-case
-                     (stream-write stream octets)
-                   (flow-control-limit-error (condition)
-                     (%client-queue-frame
-                      client (make-frame :data-blocked
-                                         :maximum (flow-control-error-limit condition))
-                      :1-rtt)
-                     (error condition))))
-         (frame (make-frame :stream :stream-id (stream-id stream)
-                            :offset (getf result :offset) :data (getf result :data)
-                            :fin fin-p :len-present t)))
-    (%client-queue-frame client frame :1-rtt)
-    (when fin-p (stream-finish stream))
-    frame))
+  (unless (and (arrayp octets) (= (array-rank octets) 1)
+               (subtypep (array-element-type octets) '(unsigned-byte 8)))
+    (error 'type-error :datum octets :expected-type '(vector (unsigned-byte 8))))
+  (%client-write-stream-available client stream octets fin-p))
 
 (defun client-read-stream (client stream &key timeout deadline)
   (%client-check-deadline client timeout deadline)
@@ -701,6 +813,7 @@
 
 (defun client-flush (client)
   "Packetize all queued frames, preserving their QUIC encryption level."
+  (%client-drain-pending-stream-writes client)
   (let ((pending (prog1 (quic-client-pending-frames client)
                   (setf (quic-client-pending-frames client) nil)))
         (groups nil))
@@ -710,9 +823,11 @@
             (push (cons (car entry) (list (cdr entry))) groups))))
     (dolist (group groups)
       (let ((frames (reverse (cdr group))))
-        (unless (%client-send-frames client (car group) frames)
-          (dolist (frame frames)
-            (connection-write (quic-client-connection client) (encode-frame frame)))))))
+        (dolist (packet-frames (%client-frame-packet-groups frames))
+          (unless (%client-send-frames client (car group) packet-frames)
+            (dolist (frame packet-frames)
+              (connection-write (quic-client-connection client)
+                                (encode-frame frame))))))))
   t)
 
 (defun %client-find-or-create-peer-stream (client id)

@@ -5,7 +5,7 @@
                        (or *load-truename* *default-pathname-defaults*)))
 (load (merge-pathnames "../src/packet.lisp"
                        (or *load-truename* *default-pathname-defaults*)))
-(load (merge-pathnames "../src/frame.fasl"
+(load (merge-pathnames "../src/frame.lisp"
                        (or *load-truename* *default-pathname-defaults*)))
 (load (merge-pathnames "../src/state.lisp"
                        (or *load-truename* *default-pathname-defaults*)))

@@ -120,6 +120,21 @@
   (check (= (length (cl-quic-kit::quic-connection-closed-reason connection))
             (1- cl-quic-kit::+max-quic-close-reason-size+))
          "connection close reason does not split UTF-8 characters"))
+(dolist (case '((2 #(195 169) 1)
+                (3 #(226 130 172) 2)
+                (4 #(240 144 144 128) 3)))
+  (destructuring-bind (width character expected-trim) case
+    (let ((connection (cl-quic-kit:make-quic-connection :now-fn (lambda () 0)))
+          (reason (concatenate '(vector (unsigned-byte 8))
+                               (make-array (- cl-quic-kit::+max-quic-close-reason-size+
+                                             (1- width))
+                                           :element-type '(unsigned-byte 8)
+                                           :initial-element #x61)
+                               character)))
+      (cl-quic-kit:connection-close connection :no-error reason)
+      (check (= (length (cl-quic-kit::quic-connection-closed-reason connection))
+                (- cl-quic-kit::+max-quic-close-reason-size+ expected-trim))
+             "raw close reason truncates at a UTF-8 character boundary"))))
 (let ((rejected nil))
   (handler-case
       (cl-quic-kit:decode-frame
@@ -674,4 +689,12 @@
          :retry-integrity-tag tag)))
       (check (cl-quic-kit:quic-client-closed-p mismatched)
              "Retry for another connection is rejected"))))
+(load (merge-pathnames "codec.lisp"
+                       (or *load-truename* *default-pathname-defaults*)))
+(load (merge-pathnames "state.lisp"
+                       (or *load-truename* *default-pathname-defaults*)))
+(load (merge-pathnames "recovery.lisp"
+                       (or *load-truename* *default-pathname-defaults*)))
+(load (merge-pathnames "stream-flow-control.lisp"
+                       (or *load-truename* *default-pathname-defaults*)))
 (format t "~D tests passed.~%" *tests-run*)
