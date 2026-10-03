@@ -21,7 +21,7 @@
                   (equalp (cl-quic-kit:frame-field frame :data) payload))
              "client stream writes are encoded through the injected connection I/O"))))
 
-(dolist (size '(65526 65527 65528 1048576))
+(dolist (size '(65526 65527 65528 1048576 8388608))
   (let* ((writes nil)
          (connection (cl-quic-kit:make-quic-connection
                      :io-write (lambda (ignored bytes)
