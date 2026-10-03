@@ -54,8 +54,61 @@
 (defun %client-frame-data (frame)
   (frame-field frame :data #()))
 
+(defun %client-ack-intervals (frame)
+  (let* ((ranges (frame-field frame :ranges))
+         (first-range (first ranges))
+         (largest (car first-range))
+         (intervals (list first-range))
+         (previous-smallest (- largest (cdr first-range))))
+    (dolist (range (rest ranges) (nreverse intervals))
+      (let* ((gap (getf range :gap))
+             (range-length (getf range :range-length))
+             (next-largest (- previous-smallest gap 2)))
+        (push (cons next-largest range-length) intervals)
+        (setf previous-smallest (- next-largest range-length))))))
+
+(defun %client-ack-ranges (intervals)
+  (let* ((first-range (first intervals))
+         (ranges (list first-range))
+         (previous-smallest (- (car first-range) (cdr first-range))))
+    (dolist (interval (rest intervals) (nreverse ranges))
+      (let ((largest (car interval))
+            (range-length (cdr interval)))
+        (push (list :gap (- previous-smallest largest 2)
+                    :range-length range-length)
+              ranges)
+        (setf previous-smallest (- largest range-length))))))
+
+(defun %client-split-ack-frame (frame)
+  (let ((parts nil) (current nil))
+    (dolist (interval (%client-ack-intervals frame))
+      (let* ((candidate (append current (list interval)))
+             (fields (copy-list (frame-fields frame))))
+        (setf (getf fields :ranges) (%client-ack-ranges candidate))
+        (if (and current
+                 (> (length (encode-frame
+                             (apply #'make-frame (frame-type frame) fields)))
+                    *client-packet-payload-limit*))
+            (progn
+              (push (apply #'make-frame
+                           (frame-type frame)
+                           (let ((single (copy-list (frame-fields frame))))
+                             (setf (getf single :ranges)
+                                   (%client-ack-ranges current))
+                             single))
+                    parts)
+              (setf current (list interval)))
+            (setf current candidate))))
+    (when current
+      (let ((fields (copy-list (frame-fields frame))))
+        (setf (getf fields :ranges) (%client-ack-ranges current))
+        (push (apply #'make-frame (frame-type frame) fields) parts)))
+    (nreverse parts)))
+
 (defun %client-split-frame (frame)
-  (if (not (member (frame-type frame) '(:stream :crypto)))
+  (if (member (frame-type frame) '(:ack :ack-ecn))
+      (%client-split-ack-frame frame)
+      (if (not (member (frame-type frame) '(:stream :crypto)))
       (list frame)
       (let* ((data (%client-frame-data frame))
              (length (length data))
@@ -90,7 +143,7 @@
                         (and (getf fields :fin) (= (+ at best) length)))
                   (push (apply #'make-frame (frame-type frame) fields) chunks))
                 (incf at best)))
-              (nreverse chunks))))))
+              (nreverse chunks)))))))
 
 (defun %client-frame-packet-groups (frames)
   (let ((groups nil) (current nil) (size 0))
@@ -99,13 +152,7 @@
         (let ((part-size (length (encode-frame part))))
           (when (> part-size *client-packet-payload-limit*)
             (error 'quic-encoding-error
-                   :message (format nil
-                                    "Frame exceeds the QUIC packet payload limit: type=~S offset=~S data=~D encoded=~D limit=~D"
-                                    (frame-type part)
-                                    (frame-field part :offset nil)
-                                    (length (%client-frame-data part))
-                                    part-size
-                                    *client-packet-payload-limit*)))
+                   :message "Frame exceeds the QUIC packet payload limit"))
           (if (and current
                    (> (+ size part-size) *client-packet-payload-limit*))
               (progn

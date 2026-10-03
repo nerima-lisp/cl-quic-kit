@@ -90,6 +90,17 @@
                 (cl-quic-kit:frame-field (second frames) :fin))
            "pending stream data resumes with the next offset and FIN")))
 
+(let* ((ranges (cons (cons 3000 0)
+                    (loop repeat 700 collect (list :gap 0 :range-length 0))))
+       (frame (cl-quic-kit:make-frame
+               :ack :largest-acknowledged 3000 :ack-delay 0 :ranges ranges))
+       (parts (cl-quic-kit::%client-split-frame frame)))
+  (check (and (> (length parts) 1)
+              (every (lambda (part)
+                       (<= (length (cl-quic-kit:encode-frame part)) 1100))
+                     parts))
+         "large ACK ranges split into packet-sized ACK frames"))
+
 (let ((server (cl-quic-kit:make-udp-socket :local-host "127.0.0.1"
                                            :local-port 0
                                            :non-blocking-p nil))
