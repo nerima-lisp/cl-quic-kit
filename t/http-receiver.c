@@ -75,7 +75,7 @@ int main(int argc, char **argv) {
   }
   long remaining = length - buffered;
   while (remaining > 0) {
-    size_t count = (size_t)(remaining < (long)sizeof(buffer) ? remaining : sizeof(buffer));
+    size_t count = remaining < (long)sizeof(buffer) ? (size_t)remaining : sizeof(buffer);
     if (read_all(client, buffer, count) < 0) {
       fprintf(stderr, "body ended with %ld bytes remaining\n", remaining);
       return 1;
@@ -86,7 +86,10 @@ int main(int argc, char **argv) {
     }
     remaining -= (long)count;
   }
-  dprintf(client, "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok");
+  static const char response[] =
+      "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok";
+  if (write(client, response, sizeof(response) - 1) != (ssize_t)(sizeof(response) - 1))
+    return 1;
   fprintf(stderr, "POST length=%ld octets=ok\n", length);
   close(client);
   close(server);
