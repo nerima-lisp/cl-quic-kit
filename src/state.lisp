@@ -5,6 +5,7 @@
 
 (defparameter *quic-idle-timeout-default* 30)
 (defparameter *quic-active-connection-id-limit-default* 2)
+(defconstant +max-quic-close-reason-size+ (- +max-quic-packet-size+ 64))
 
 (defun %connection-error-code (code)
   (if (integerp code) code
@@ -220,29 +221,38 @@
            (quic-connection-idle-timeout connection))))
 
 (defun %connection-reason-octets (reason)
-  (cond ((null reason) #())
-        ((stringp reason)
-         (let ((out (make-array 0 :element-type '(unsigned-byte 8)
-                                :adjustable t :fill-pointer 0)))
-           (loop for character across reason
-                 for code = (char-code character)
-                 for encoded = (cond
-                                  ((<= code #x7f) (vector code))
-                                  ((<= code #x7ff)
-                                   (vector (logior #xc0 (ash code -6))
-                                           (logior #x80 (logand code #x3f))))
-                                  ((<= code #xffff)
-                                   (vector (logior #xe0 (ash code -12))
-                                           (logior #x80 (logand (ash code -6) #x3f))
-                                           (logior #x80 (logand code #x3f))))
-                                  (t
-                                   (vector (logior #xf0 (ash code -18))
-                                           (logior #x80 (logand (ash code -12) #x3f))
-                                           (logior #x80 (logand (ash code -6) #x3f))
-                                           (logior #x80 (logand code #x3f)))))
-                 do (map nil (lambda (byte) (vector-push-extend byte out)) encoded)
-                 finally (return (copy-seq out)))))
-        (t (octets-copy reason))))
+  (let ((limit +max-quic-close-reason-size+))
+    (cond
+      ((null reason) #())
+      ((stringp reason)
+       (let ((out (make-array 0 :element-type '(unsigned-byte 8)
+                              :adjustable t :fill-pointer 0)))
+         (loop for character across reason
+               for code = (char-code character)
+               for encoded = (cond
+                                ((<= code #x7f) (vector code))
+                                ((<= code #x7ff)
+                                 (vector (logior #xc0 (ash code -6))
+                                         (logior #x80 (logand code #x3f))))
+                                ((<= code #xffff)
+                                 (vector (logior #xe0 (ash code -12))
+                                         (logior #x80 (logand (ash code -6) #x3f))
+                                         (logior #x80 (logand code #x3f))))
+                                (t
+                                 (vector (logior #xf0 (ash code -18))
+                                         (logior #x80 (logand (ash code -12) #x3f))
+                                         (logior #x80 (logand (ash code -6) #x3f))
+                                         (logior #x80 (logand code #x3f)))))
+               while (<= (+ (length out) (length encoded)) limit)
+               do (map nil (lambda (byte) (vector-push-extend byte out)) encoded))
+         (copy-seq out)))
+      (t
+       (let* ((octets (octets-copy reason))
+              (end (min limit (length octets))))
+         (loop while (and (plusp end)
+                          (= (logand (aref octets (1- end)) #xc0) #x80))
+               do (decf end))
+         (subseq octets 0 end))))))
 
 (defun connection-close (connection error-code &optional reason &rest options)
   (unless (or (eq (quic-connection-state connection) :closed)

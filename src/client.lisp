@@ -93,44 +93,7 @@
         (error 'randomness-unavailable :operation :connection-id)))))
 
 (defun %client-reason-octets (reason)
-  (let ((limit (- +max-quic-packet-size+ 64)))
-    (cond
-      ((null reason) #())
-      ((stringp reason)
-       (let ((out (make-array 0 :element-type '(unsigned-byte 8)
-                              :adjustable t :fill-pointer 0)))
-         (labels ((append-byte (byte)
-                    (when (< (length out) limit)
-                      (vector-push-extend byte out))))
-           (loop for character across reason
-                 for code = (char-code character)
-                 for encoded = (cond
-                                  ((<= code #x7f) (vector code))
-                                  ((<= code #x7ff)
-                                   (vector (logior #xc0 (ash code -6))
-                                           (logior #x80 (logand code #x3f))))
-                                  ((<= code #xffff)
-                                   (vector (logior #xe0 (ash code -12))
-                                           (logior #x80 (logand (ash code -6) #x3f))
-                                           (logior #x80 (logand code #x3f))))
-                                  (t
-                                   (vector (logior #xf0 (ash code -18))
-                                           (logior #x80 (logand (ash code -12) #x3f))
-                                           (logior #x80 (logand (ash code -6) #x3f))
-                                           (logior #x80 (logand code #x3f)))))
-                 while (<= (+ (length out) (length encoded)) limit)
-                 do (map nil #'append-byte encoded))
-           (copy-seq out))))
-      (t
-       (let* ((octets (%client-octets reason))
-              (end (min limit (length octets))))
-         (loop while (and (plusp end)
-                          (= (logand (aref octets (1- end)) #xc0) #x80))
-               do (decf end))
-         (loop while (and (< end (length octets))
-                          (= (logand (aref octets end) #xc0) #x80))
-               do (decf end))
-         (subseq octets 0 end))))))
+  (%connection-reason-octets reason))
 
 (defun %client-crypto-signature-scheme (scheme)
   (case scheme

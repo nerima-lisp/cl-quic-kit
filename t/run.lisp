@@ -77,6 +77,49 @@
                    :initial-element #x40))
     (cl-quic-kit:quic-encoding-error () (setf rejected t)))
   (check rejected "packet above the maximum UDP payload is rejected"))
+(let ((header (cl-quic-kit:make-packet-header
+               :type :short :destination-connection-id
+               (make-array 8 :element-type '(unsigned-byte 8))
+               :packet-number 0 :packet-number-length 1
+               :payload (make-array (- 65527 10)
+                                    :element-type '(unsigned-byte 8)))))
+  (check (= (length (cl-quic-kit:encode-packet-header header)) 65527)
+         "packet encoder accepts the maximum UDP payload"))
+(let ((rejected nil))
+  (handler-case
+      (cl-quic-kit:encode-packet-header
+       (cl-quic-kit:make-packet-header
+        :type :short :destination-connection-id
+        (make-array 8 :element-type '(unsigned-byte 8))
+        :packet-number 0 :packet-number-length 1
+        :payload (make-array (- 65527 9) :element-type '(unsigned-byte 8))))
+    (cl-quic-kit:quic-encoding-error () (setf rejected t)))
+  (check rejected "packet encoder rejects payload above the UDP maximum"))
+(let ((connection (cl-quic-kit:make-quic-connection :now-fn (lambda () 0))))
+  (cl-quic-kit:connection-close
+   connection :no-error
+   (make-string cl-quic-kit::+max-quic-close-reason-size+ :initial-element #\a))
+  (check (= (length (cl-quic-kit::quic-connection-closed-reason connection))
+            cl-quic-kit::+max-quic-close-reason-size+)
+         "connection close reason accepts the maximum UTF-8 size"))
+(let ((connection (cl-quic-kit:make-quic-connection :now-fn (lambda () 0))))
+  (cl-quic-kit:connection-close
+   connection :no-error
+   (make-string (1+ cl-quic-kit::+max-quic-close-reason-size+)
+                :initial-element #\a))
+  (check (= (length (cl-quic-kit::quic-connection-closed-reason connection))
+            cl-quic-kit::+max-quic-close-reason-size+)
+         "connection close reason truncates above the maximum UTF-8 size"))
+(let ((connection (cl-quic-kit:make-quic-connection :now-fn (lambda () 0))))
+  (cl-quic-kit:connection-close
+   connection :no-error
+   (concatenate 'string
+                (make-string (- cl-quic-kit::+max-quic-close-reason-size+ 1)
+                             :initial-element #\a)
+                "é"))
+  (check (= (length (cl-quic-kit::quic-connection-closed-reason connection))
+            (1- cl-quic-kit::+max-quic-close-reason-size+))
+         "connection close reason does not split UTF-8 characters"))
 (let ((rejected nil))
   (handler-case
       (cl-quic-kit:decode-frame

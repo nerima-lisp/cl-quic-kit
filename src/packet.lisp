@@ -122,6 +122,11 @@
       (%packet-error "Reserved bits must fit two bits"))
     reserved))
 
+(defun %packet-check-size (bytes)
+  (when (> (length bytes) +max-quic-packet-size+)
+    (%packet-error "QUIC packet exceeds the maximum UDP payload size"))
+  bytes)
+
 (defun encode-packet-header (header &key (include-payload t))
   (let* ((type (packet-header-type header))
          (long-p (packet-header-long-p header))
@@ -138,7 +143,8 @@
     (when long-p
       (unless (and (integerp version) (plusp version) (< version (ash 1 32)))
         (%packet-error "Long-header packets require a nonzero version")))
-    (if long-p
+    (%packet-check-size
+     (if long-p
         (case type
           (:retry
            (when (plusp reserved)
@@ -180,7 +186,7 @@
                (first (logior #x40 (ash reserved 4)
                               (if (packet-header-key-phase header) 4 0)
                               (1- pn-length))))
-          (%octets (%byte first) dcid pn (if include-payload payload #()))))))
+          (%octets (%byte first) dcid pn (if include-payload payload #())))))))
 
 (defun decode-packet-header (bytes &key (start 0) (short-header-dcid-length 0))
   (let* ((b (%octet-vector bytes))
