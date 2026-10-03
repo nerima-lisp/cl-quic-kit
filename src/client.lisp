@@ -371,7 +371,7 @@
          (key (%client-key client level :read))
          (pn-offset (getf layout :pn-offset))
          (packet (subseq bytes 0 (getf layout :end)))
-         (pn-length nil) (truncated nil) (largest nil)
+         (first-octet nil) (pn-length nil) (truncated nil) (largest nil)
          (number nil) (key-phase nil))
     (unless key (return-from %client-unprotect-packet nil))
     (when (< (length packet) (+ pn-offset 20))
@@ -384,7 +384,8 @@
                (unmasked-pn-length (1+ (logand unmasked-first 3)))
                (unmasked-key-phase (and (eq type :short)
                                         (logbitp 2 unmasked-first))))
-          (setf pn-length unmasked-pn-length
+          (setf first-octet unmasked-first
+                pn-length unmasked-pn-length
                 key-phase unmasked-key-phase)
           (when (> (+ pn-offset pn-length) (length packet))
             (error 'quic-encoding-error :message "truncated packet number"))
@@ -416,7 +417,7 @@
                        :destination-connection-id (getf layout :dcid)
                        :source-connection-id (getf layout :scid)
                        :packet-number number :packet-number-length pn-length
-                       :reserved-bits (ldb (byte 2 2) first)
+                       :reserved-bits (ldb (byte 2 2) first-octet)
                        :key-phase key-phase
                        :payload plaintext)))))
       (error (caught)
