@@ -823,24 +823,27 @@
                    :on-transport-parameters
                    (lambda (boundary parameters)
                      (declare (ignore boundary))
-                     (setf (quic-client-peer-transport-parameters client) parameters)
-                     (let ((flow (quic-client-flow-control client)))
-                       (when (zerop (flow-control-connection-sent flow))
-                         (setf (flow-control-state-connection-max-data flow)
-                               (%client-transport-parameter parameters 4 0)))
-                       (when (zerop (flow-control-stream-count flow :bidirectional))
-                         (setf (flow-control-state-max-streams-bidi flow)
-                               (%client-transport-parameter parameters 8 0)))
-                       (when (zerop (flow-control-stream-count flow :unidirectional))
-                         (setf (flow-control-state-max-streams-uni flow)
-                               (%client-transport-parameter parameters 9 0))))
-                     (maphash
-                      (lambda (id stream)
-                        (stream-set-max-send-offset
-                         stream (%client-stream-send-limit client id))
-                        (stream-set-max-receive-offset
-                         stream (%client-stream-receive-limit client id)))
-                      (quic-client-streams client))))))
+                     (let ((parameters (if (listp parameters)
+                                           parameters
+                                           (decode-transport-parameters parameters))))
+                       (setf (quic-client-peer-transport-parameters client) parameters)
+                       (let ((flow (quic-client-flow-control client)))
+                         (when (zerop (flow-control-connection-sent flow))
+                           (setf (flow-control-state-connection-max-data flow)
+                                 (%client-transport-parameter parameters 4 0)))
+                         (when (zerop (flow-control-stream-count flow :bidirectional))
+                           (setf (flow-control-state-max-streams-bidi flow)
+                                 (%client-transport-parameter parameters 8 0)))
+                         (when (zerop (flow-control-stream-count flow :unidirectional))
+                           (setf (flow-control-state-max-streams-uni flow)
+                                 (%client-transport-parameter parameters 9 0))))
+                       (maphash
+                        (lambda (id stream)
+                          (stream-set-max-send-offset
+                           stream (%client-stream-send-limit client id))
+                          (stream-set-max-receive-offset
+                           stream (%client-stream-receive-limit client id)))
+                        (quic-client-streams client)))))))
     (quic-client-tls-boundary client))
 
 (defun %client-driver-key-exchange (client)
