@@ -510,6 +510,19 @@
     (dolist (frame (getf record :frames))
       (%client-queue-frame client frame (%client-space-level (getf record :level))))))
 
+(defun %client-requeue-pto-probe (client space)
+  (let ((record (find-if
+                 (lambda (entry)
+                   (and (eq (getf entry :level) space)
+                        (not (getf entry :requeued-p))
+                        (some (lambda (frame)
+                                (not (member (frame-type frame)
+                                             '(:ack :ack-ecn :padding))))
+                              (getf entry :frames))))
+                 (quic-client-sent-packets client))))
+    (when record
+      (%client-requeue-record client record))))
+
 (defun %client-drop-records (client packets requeue-p)
   (dolist (packet packets)
     (let ((number (%client-sent-packet-number packet)))
@@ -1115,6 +1128,7 @@
                 (quic-client-recovery client) space :now at)))
       (when (and pto (>= at pto))
         (cl-quic-kit.recovery:on-pto-expired (quic-client-recovery client))
+        (%client-requeue-pto-probe client space)
         (%client-queue-frame client (make-frame :ping)
                              (%client-space-level space))))))
 
