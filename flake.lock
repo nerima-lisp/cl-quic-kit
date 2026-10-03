@@ -6,11 +6,11 @@
         "nixpkgs": "nixpkgs"
       },
       "locked": {
-        "lastModified": 1790920154,
-        "narHash": "sha256-3EZACudiOvkThjXTV9WUKMRDBK1Sd7QK1JSAvHodJls=",
+        "lastModified": 1791001391,
+        "narHash": "sha256-pkg8Q+gIETahn+spyymk1UHPFMm3ALbN36I79B4e6BE=",
         "owner": "nerima-lisp",
         "repo": "cl-crypto-kit",
-        "rev": "5be434a17f8756ffd921313fc198407726ede3a8",
+        "rev": "c595d4297126680984a828bfb447551a7af8d2d1",
         "type": "github"
       },
       "original": {
