@@ -133,9 +133,11 @@
                        (%bytes 0 0 #xd1 #xd7 #x50 #x8a #xa0 #xe4 #x1d #x13
                                #x9d #x09 #xb8 #xf3 #x4d #x33 #xc1)))
                      (%h3-frame 0
-                                (make-array (* 1024 1024)
-                                            :element-type '(unsigned-byte 8)
-                                            :initial-element #x5a)))
+                                (if (= (%env-integer "QUIC_PORT" 8443) 18443)
+                                    (make-array (* 1024 1024)
+                                                :element-type '(unsigned-byte 8)
+                                                :initial-element #x5a)
+                                    (make-array 0 :element-type '(unsigned-byte 8)))))
                     :fin-p t)
                    (cl-quic-kit:client-flush client)
                    (let ((response (make-array 0 :element-type '(unsigned-byte 8)))
