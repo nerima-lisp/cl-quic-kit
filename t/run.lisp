@@ -370,14 +370,17 @@
   (check (not (eq status :external))
          "TLS traffic secrets are not exposed as a public accessor"))
 
-(let ((client (cl-quic-kit:make-quic-client
+(let ((writes nil)
+      (client (cl-quic-kit:make-quic-client
                :local-connection-id (%client-test-octets '(17 18 19 20 21 22 23 24))
                :destination-connection-id (%client-test-octets '(25 26 27 28 29 30 31 32))
-               :disable-hostname-verification-p t)))
+               :disable-hostname-verification-p t
+               :io-write (lambda (connection bytes)
+                           (declare (ignore connection))
+                           (push bytes writes)))))
   (cl-quic-kit::%client-protocol-close client 7 "private implementation detail")
   (check (null (cl-quic-kit:frame-field
-                (cdr (first (cl-quic-kit::quic-client-pending-frames client)))
-                :reason))
+                (cl-quic-kit:decode-frame (first writes)) :reason))
          "protocol close does not disclose internal error text"))
 
 (let* ((destination (%client-test-octets '(16 17 18 19 20 21 22 23)))
