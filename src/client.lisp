@@ -16,6 +16,7 @@
   (application-write-key-phase 0) application-write-secret
   application-write-key-phase-first-packet-number
   (application-write-key-phase-acked-p t)
+  application-handshake-confirmed-p
   local-connection-id server-host server-port hostname alpn
   transport-parameters tls-key-exchange tls-provider tls-trust-anchors
   tls-verify-signature tls-signature-algorithms client-hello-wire)
@@ -362,13 +363,17 @@
         (logxor 1 (quic-client-application-read-key-phase client))
         (quic-client-application-read-key-update-packet-number client) number))
 
-(defun %client-rotate-application-write-key (client)
+(defun %client-rotate-application-write-key (client &key force-p (update-read-p t))
   (let* ((driver (quic-client-tls-driver client))
          (secret (quic-client-application-write-secret client))
          (hash (%client-driver-suite-hash driver))
          (length (if (eq hash :sha384) 48 32)))
     (when (and secret
-               (%client-application-write-key-update-allowed-p client))
+               (or force-p
+                   (and (quic-client-application-handshake-confirmed-p client)
+                        (%client-application-write-key-update-allowed-p client))))
+      (when update-read-p
+        (%client-rotate-application-read-key client))
       (%client-install-secret
        client :1-rtt :write
        (cl-quic-kit.protection::%expand-label
@@ -539,9 +544,7 @@
                   (progn
                     (multiple-value-bind (secret next-key)
                         (%client-next-application-key client :read)
-                      (unless (and secret next-key
-                                   (%client-application-write-key-update-allowed-p
-                                    client))
+                      (unless (and secret next-key)
                         (error 'quic-crypto-error
                                :message "application key phase update unavailable"))
                       (setf selected-key next-key)
@@ -552,7 +555,8 @@
           (when next-read-secret
             (%client-commit-application-read-key-update
              client next-read-secret number)
-            (%client-rotate-application-write-key client))
+            (%client-rotate-application-write-key
+             client :force-p t :update-read-p nil))
           (values level number
                   (make-packet-header
                    :type type :version (getf layout :version)
@@ -645,20 +649,6 @@
 (defun %client-ack-eliciting-p (frames)
   (some (lambda (frame)
           (not (member (frame-type frame) '(:ack :ack-ecn :padding)))) frames))
-
-(defun %client-ack-includes-packet-p (frame packet-number)
-  (let ((largest (frame-field frame :largest-acknowledged))
-        (ranges (frame-field frame :ranges)))
-    (when (and largest (<= packet-number largest))
-      (let ((smallest (- largest (if ranges
-                                    (cdar ranges)
-                                    (frame-field frame :first-range 0)))))
-        (when (<= smallest packet-number) (return-from %client-ack-includes-packet-p t))
-        (dolist (range (rest ranges) nil)
-          (setf largest (- smallest (getf range :gap) 2)
-                smallest (- largest (getf range :range-length)))
-          (when (<= smallest packet-number largest)
-            (return t)))))))
 
 (defun %client-frame-ranges (numbers)
   (let ((sorted (sort (remove-duplicates (copy-list numbers)) #'>)) (ranges nil))
@@ -773,11 +763,11 @@
     (let ((space (%client-level-space level)))
       (when (and (eq space :application)
                  (quic-client-application-write-key-phase-first-packet-number client)
-                 (%client-ack-includes-packet-p
-                  frame
-                  (quic-client-application-write-key-phase-first-packet-number
-                   client)))
-        (setf (quic-client-application-write-key-phase-acked-p client) t))
+                 (<= (quic-client-application-write-key-phase-first-packet-number
+                      client)
+                     (frame-field frame :largest-acknowledged)))
+        (setf (quic-client-application-write-key-phase-acked-p client) t
+              (quic-client-application-handshake-confirmed-p client) t))
       (%client-drop-records client space acked nil)
       (%client-drop-records client space lost t))))
 
@@ -849,6 +839,7 @@
        (connection-receive-frame (quic-client-connection client) frame))
       (:handshake-done
        (unless (quic-client-closed-p client)
+         (setf (quic-client-application-handshake-confirmed-p client) t)
          (connection-set-state (quic-client-connection client) :established)))
       (otherwise nil))))
 
@@ -891,6 +882,7 @@
                   :application-write-secret nil
                   :application-write-key-phase-first-packet-number nil
                   :application-write-key-phase-acked-p t
+                  :application-handshake-confirmed-p nil
                   :crypto-send-offsets nil
                   :peer-transport-parameters nil :closed-p nil :started-p nil
                   :flow-control

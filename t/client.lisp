@@ -127,20 +127,32 @@
          (old-key (cl-quic-kit.protection:make-key-set old-secret)))
     (dolist (direction '(:read :write))
       (cl-quic-kit::%client-set-key receiver :1-rtt direction old-key))
-    (cl-quic-kit::%client-set-key sender :1-rtt :write old-key)
+    (dolist (direction '(:read :write))
+      (cl-quic-kit::%client-set-key sender :1-rtt direction old-key))
     (setf (cl-quic-kit::quic-client-application-read-secret receiver) old-secret
           (cl-quic-kit::quic-client-application-write-secret receiver) old-secret
+          (cl-quic-kit::quic-client-application-read-secret sender) old-secret
           (cl-quic-kit::quic-client-application-write-secret sender) old-secret)
     (let ((old-wire (cl-quic-kit::%client-build-packet
                      sender :application (list (cl-quic-kit:make-frame :ping)))))
-      (check (cl-quic-kit:client-receive-datagram receiver old-wire)
-             "client path opens the current application key")
-      (check (cl-quic-kit::%client-rotate-application-write-key sender)
-             "client starts an application key update")
+          (check (cl-quic-kit:client-receive-datagram receiver old-wire)
+                 "client path opens the current application key")
+      (check (null (cl-quic-kit::%client-rotate-application-write-key sender))
+             "client does not update keys before handshake confirmation")
+      (setf (cl-quic-kit::quic-client-application-handshake-confirmed-p sender) t)
+         (check (cl-quic-kit::%client-rotate-application-write-key sender)
+                 "client starts an application key update")
       (let ((next-wire (cl-quic-kit::%client-build-packet
                         sender :application (list (cl-quic-kit:make-frame :ping)))))
         (check (cl-quic-kit:client-receive-datagram receiver next-wire)
                "client path opens the next application key")
+        (let ((peer-wire (cl-quic-kit::%client-build-packet
+                          receiver :application
+                          (list (cl-quic-kit:make-frame :ping)))))
+          (check (cl-quic-kit:client-receive-datagram sender peer-wire)
+                 "peer key update succeeds before the local write update is acknowledged")
+          (check (not (cl-quic-kit::quic-client-closed-p sender))
+                 "peer key update does not depend on local write ACK state"))
         (check (= (cl-quic-kit::quic-client-application-read-key-update-packet-number
                    receiver)
                   1)
@@ -160,6 +172,22 @@
                  "delayed old-generation packet does not close the connection")
           (check (null (cl-quic-kit::%client-rotate-application-write-key sender))
                  "client does not start another write update before an ACK")
+          (setf (cl-quic-kit::quic-client-application-write-key-phase-first-packet-number
+                 sender)
+                1)
+          (cl-quic-kit::%client-handle-ack
+           sender :1-rtt
+           (cl-quic-kit:make-frame
+            :ack :largest-acknowledged 2 :ack-delay 0
+            :ranges (list (cons 2 0))))
+          (check (cl-quic-kit::quic-client-application-write-key-phase-acked-p
+                  sender)
+                 "ACK marks the current write key generation acknowledged")
+          (check (cl-quic-kit::%client-rotate-application-write-key sender)
+                 "client starts the next write update after an ACK")
+          (setf (cl-quic-kit::quic-client-application-write-key-phase-acked-p
+                 receiver)
+                t)
           (let ((high-old (let ((late (funcall make-test-client
                                                 (test-octets
                                                 '(1 2 3 4 5 6 7 8)))))
