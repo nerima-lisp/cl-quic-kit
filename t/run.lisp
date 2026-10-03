@@ -523,6 +523,8 @@
          "packet number uses two bytes at the one-byte boundary")
 (check (= (cl-quic-kit::%client-packet-number-length 65536 0) 3)
          "packet number uses three bytes when twice the acknowledged range crosses 16 bits")
+(check (= (cl-quic-kit::%client-packet-number-length 485 254) 2)
+         "packet number length also represents the full packet number")
 
 (let ((client (cl-quic-kit:make-quic-client
                :disable-hostname-verification-p t)))

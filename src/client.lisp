@@ -422,7 +422,8 @@
   (let* ((range (if largest-acked
                     (max 1 (- number largest-acked))
                     (max 1 number)))
-         (bits (integer-length range)))
+         (bits (max (integer-length (max 1 number))
+                    (integer-length range))))
     (min 4 (max 1 (ceiling bits 8)))))
 
 (defun %client-sync-tls-secrets (client)
