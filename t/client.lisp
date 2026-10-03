@@ -5,7 +5,9 @@
                     :io-write (lambda (ignored bytes)
                                 (declare (ignore ignored))
                                 (push bytes writes)))))
-  (let* ((client (cl-quic-kit:make-quic-client :connection connection))
+  (let* ((client (cl-quic-kit:make-quic-client
+                  :connection connection
+                  :disable-hostname-verification-p t))
          (stream (cl-quic-kit:client-open-stream client nil))
          (payload (make-array 3 :element-type '(unsigned-byte 8)
                               :initial-contents '(7 8 9))))

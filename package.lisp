@@ -9,6 +9,8 @@
    #:require-crypto
    #:invalid-connection-id
    #:crypto-unavailable
+   #:hostname-required
+   #:randomness-unavailable
    #:quic-error
    #:quic-encoding-error
    #:quic-crypto-error
@@ -79,7 +81,7 @@
    #:client-start #:client-poll #:client-close
    #:quic-client-connection #:quic-client-udp-socket
    #:quic-client-closed-p
-   #:quic-client-tls-boundary #:quic-client-tls-secrets
+   #:quic-client-tls-boundary
    #:quic-client-peer-transport-parameters))
 
 (in-package #:cl-quic-kit)
@@ -97,7 +99,19 @@
   ((operation :initarg :operation :reader crypto-unavailable-operation))
   (:report (lambda (condition stream)
             (format stream "QUIC crypto operation ~A is unavailable; load cl-crypto-kit"
-                    (crypto-unavailable-operation condition)))))
+                     (crypto-unavailable-operation condition)))))
+
+(define-condition hostname-required (error) ()
+  (:report (lambda (condition stream)
+             (declare (ignore condition))
+             (write-string "A server hostname is required unless hostname verification is explicitly disabled"
+                           stream))))
+
+(define-condition randomness-unavailable (error)
+  ((operation :initarg :operation :reader randomness-unavailable-operation))
+  (:report (lambda (condition stream)
+             (format stream "CSPRNG operation ~A is unavailable or failed"
+                     (randomness-unavailable-operation condition)))))
 
 (defun connection-id-p (value)
   "Return true when VALUE is a QUIC connection ID octet vector.

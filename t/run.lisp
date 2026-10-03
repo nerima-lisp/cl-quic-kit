@@ -305,12 +305,14 @@
 (load (merge-pathnames "client.lisp"
                        (or *load-truename* *default-pathname-defaults*)))
 
-(let* ((client (cl-quic-kit:make-quic-client))
+(let* ((client (cl-quic-kit:make-quic-client
+               :disable-hostname-verification-p t))
        (control (cl-quic-kit:client-open-stream client nil :stream-type :control)))
   (check (= (cl-quic-kit::stream-send-offset control) 1)
          "HTTP/3 unidirectional stream reserves its type byte"))
 
-(let ((client (cl-quic-kit:make-quic-client)))
+(let ((client (cl-quic-kit:make-quic-client
+               :disable-hostname-verification-p t)))
   (setf (cl-quic-kit::quic-client-received-packets client)
         (list (cons :1-rtt '(6 5 3 2))))
   (let ((frame (cl-quic-kit::%client-ack-frame client :1-rtt)))
@@ -326,6 +328,58 @@
 (defun %client-test-octets (values)
   (make-array (length values) :element-type '(unsigned-byte 8)
               :initial-contents values))
+
+(let ((caught nil))
+  (handler-case
+      (cl-quic-kit:make-quic-client
+       :disable-hostname-verification-p nil)
+    (cl-quic-kit:hostname-required () (setf caught t)))
+  (check caught "client construction rejects an omitted hostname by default"))
+
+(let* ((symbol (find-symbol "RANDOM-OCTETS" "CRYPTO-KIT"))
+       (original (and symbol (fboundp symbol) (symbol-function symbol)))
+       (caught nil))
+  (unwind-protect
+       (progn
+         (setf (symbol-function symbol)
+               (lambda (length)
+                 (declare (ignore length))
+                 (error "test CSPRNG failure")))
+         (handler-case
+             (cl-quic-kit:make-quic-client
+              :disable-hostname-verification-p t)
+           (cl-quic-kit:randomness-unavailable () (setf caught t))))
+    (if original
+        (setf (symbol-function symbol) original)
+        (fmakunbound symbol)))
+  (check caught "client aborts when its CSPRNG fails"))
+
+(let ((caught nil))
+  (let ((cl-quic-kit.protection::*hkdf-extract* nil))
+    (handler-case
+        (cl-quic-kit:make-quic-client
+         :local-connection-id (%client-test-octets '(1 2 3 4 5 6 7 8))
+         :destination-connection-id (%client-test-octets '(9 10 11 12 13 14 15 16))
+         :disable-hostname-verification-p t)
+      (cl-quic-kit.protection:crypto-not-implemented () (setf caught t))))
+  (check caught "initial secret derivation reports unavailable crypto"))
+
+(multiple-value-bind (symbol status)
+    (find-symbol "QUIC-CLIENT-TLS-SECRETS" "CL-QUIC-KIT")
+  (declare (ignore symbol))
+  (check (not (eq status :external))
+         "TLS traffic secrets are not exposed as a public accessor"))
+
+(let ((client (cl-quic-kit:make-quic-client
+               :local-connection-id (%client-test-octets '(17 18 19 20 21 22 23 24))
+               :destination-connection-id (%client-test-octets '(25 26 27 28 29 30 31 32))
+               :disable-hostname-verification-p t)))
+  (cl-quic-kit::%client-protocol-close client 7 "private implementation detail")
+  (check (null (cl-quic-kit:frame-field
+                (cl-quic-kit:connection-close-frame
+                 (cl-quic-kit:quic-client-connection client))
+                :reason))
+         "protocol close does not disclose internal error text"))
 
 (let* ((destination (%client-test-octets '(16 17 18 19 20 21 22 23)))
        (sender-id (%client-test-octets '(32 33 34 35 36 37 38 39)))
@@ -343,6 +397,7 @@
        (receiver (cl-quic-kit:make-quic-client
                   :local-connection-id receiver-id
                   :destination-connection-id destination
+                  :disable-hostname-verification-p t
                   :io-write (lambda (connection bytes)
                               (declare (ignore connection))
                               (setf ack-wire bytes))
@@ -416,8 +471,9 @@
   (let ((idle-wire nil))
     (let ((idle-client
             (cl-quic-kit:make-quic-client
-             :local-connection-id sender-id
-             :destination-connection-id destination
+            :local-connection-id sender-id
+            :destination-connection-id destination
+             :disable-hostname-verification-p t
              :idle-timeout 5
              :io-write (lambda (connection bytes)
                          (declare (ignore connection))
@@ -442,7 +498,8 @@
 
   (let ((mismatched (cl-quic-kit:make-quic-client
                      :local-connection-id sender-id
-                     :destination-connection-id destination)))
+                     :destination-connection-id destination
+                     :disable-hostname-verification-p t)))
     (cl-quic-kit:client-receive-datagram
      mismatched
      (cl-quic-kit:encode-version-negotiation
@@ -490,7 +547,8 @@
            "Retry retransmits ClientHello with the Retry token")
     (let ((mismatched (cl-quic-kit:make-quic-client
                        :local-connection-id sender-id
-                       :destination-connection-id destination)))
+                       :destination-connection-id destination
+                       :disable-hostname-verification-p t)))
       (cl-quic-kit:client-receive-datagram
        mismatched
        (cl-quic-kit:encode-packet-header

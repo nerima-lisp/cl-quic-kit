@@ -5,7 +5,7 @@
 (defstruct (quic-client (:constructor %make-quic-client))
   connection udp-socket tls-boundary tls-driver
   streams next-bidi-stream next-uni-stream
-  pending-frames crypto-send-offsets tls-secrets
+  pending-frames crypto-send-offsets
   peer-transport-parameters closed-p started-p
   flow-control
   initial-destination-connection-id remote-connection-id retry-token
@@ -79,10 +79,18 @@
 
 (defun %client-random-octets (length)
   (let ((random (%client-function "CRYPTO-KIT" "RANDOM-OCTETS")))
-    (if random
-        (funcall random length)
-        (make-array length :element-type '(unsigned-byte 8)
-                    :initial-element 0))))
+    (unless random
+      (error 'randomness-unavailable :operation :connection-id))
+    (handler-case
+        (let ((value (funcall random length)))
+          (unless (and (typep value '(simple-array (unsigned-byte 8) (*)))
+                       (= (length value) length))
+            (error 'randomness-unavailable :operation :connection-id))
+          value)
+      (randomness-unavailable (condition)
+        (error condition))
+      (error ()
+        (error 'randomness-unavailable :operation :connection-id)))))
 
 (defun %client-reason-octets (reason)
   (cond ((null reason) #())
@@ -563,12 +571,15 @@
 
 (defun make-quic-client (&key connection udp-socket tls-boundary tls-driver
                               local-connection-id destination-connection-id
-                              server-host server-port hostname (alpn '("h3"))
+                              server-host server-port hostname
+                              disable-hostname-verification-p (alpn '("h3"))
                               transport-parameters tls-key-exchange tls-provider
                               tls-trust-anchors tls-verify-signature now-fn
                               tls-signature-algorithms
                               idle-timeout io-write on-close)
   "Create a protected QUIC client and its HTTP stream facade."
+  (unless (or hostname disable-hostname-verification-p)
+    (error 'hostname-required))
   (let* ((udp (or udp-socket
                   (and server-host server-port
                        (make-udp-socket :remote-host server-host
@@ -588,7 +599,7 @@
                   :connection connection :udp-socket udp :tls-boundary tls-boundary
                   :tls-driver tls-driver :streams (make-hash-table :test #'eql)
                   :next-bidi-stream 0 :next-uni-stream 2 :pending-frames nil
-                  :crypto-send-offsets nil :tls-secrets nil
+                  :crypto-send-offsets nil
                   :peer-transport-parameters nil :closed-p nil :started-p nil
                   :flow-control
                   (make-flow-control-state
@@ -609,11 +620,9 @@
                   :tls-trust-anchors tls-trust-anchors
                   :tls-verify-signature tls-verify-signature
                   :tls-signature-algorithms tls-signature-algorithms)))
-    (handler-case
-        (let ((initial (cl-quic-kit.protection:derive-initial-secrets destination)))
-          (%client-set-key client :initial :write (getf initial :client))
-          (%client-set-key client :initial :read (getf initial :server)))
-      (error () nil))
+    (let ((initial (cl-quic-kit.protection:derive-initial-secrets destination)))
+      (%client-set-key client :initial :write (getf initial :client))
+      (%client-set-key client :initial :read (getf initial :server)))
     client))
 
 (defun client-open-stream (client request &key stream-type timeout deadline)
@@ -817,9 +826,7 @@
                                                         :data wire) level)))
                    :on-secret
                    (lambda (boundary level direction secret)
-                     (declare (ignore boundary))
-                     (push (list level direction secret)
-                           (quic-client-tls-secrets client)))
+                     (declare (ignore boundary level direction secret)))
                    :on-transport-parameters
                    (lambda (boundary parameters)
                      (declare (ignore boundary))
@@ -962,11 +969,12 @@
   client)
 
 (defun %client-protocol-close (client code reason)
+  (declare (ignore reason))
   (unless (quic-client-closed-p client)
     (setf (quic-client-closed-p client) t)
     (%client-queue-frame
      client (make-frame :connection-close :error-code code :frame-type 0
-                        :reason (%client-reason-octets reason))
+                        :reason #())
      (if (%client-key client :1-rtt :write) :1-rtt :initial))
     (connection-set-state (quic-client-connection client) :closing)
     (client-flush client)))
