@@ -23,11 +23,11 @@
     "cl-crypto-kit_2": {
       "flake": false,
       "locked": {
-        "lastModified": 1790995866,
-        "narHash": "sha256-47ca6LMbuFu/V/P8YifwbLCFnIttStzBwWNnnl8b5vo=",
+        "lastModified": 1791001391,
+        "narHash": "sha256-pkg8Q+gIETahn+spyymk1UHPFMm3ALbN36I79B4e6BE=",
         "owner": "nerima-lisp",
         "repo": "cl-crypto-kit",
-        "rev": "65c7792fbbd229a0953a59444be2fb2ebc9843c0",
+        "rev": "c595d4297126680984a828bfb447551a7af8d2d1",
         "type": "github"
       },
       "original": {
