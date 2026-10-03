@@ -4,7 +4,6 @@
   inputs.nixpkgs.url = "github:NixOS/nixpkgs/nixpkgs-unstable";
   inputs.cl-crypto-kit.url = "github:nerima-lisp/cl-crypto-kit/takeokunn-crypto-integration";
   inputs.cl-tls-kit.url = "github:nerima-lisp/cl-tls-kit/takeokunn-tls13-handshake";
-  inputs.cl-tls-kit.inputs.cl-crypto-kit.url = "github:nerima-lisp/cl-crypto-kit/takeokunn-crypto-integration";
 
   outputs = { self, nixpkgs, cl-crypto-kit, cl-tls-kit }:
     let
