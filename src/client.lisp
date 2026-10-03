@@ -12,6 +12,7 @@
   packet-numbers received-packets keys recovery sent-packets clock
   (application-read-key-phase 0)
   application-read-old-key application-read-secret
+  (application-write-key-phase 0) application-write-secret
   local-connection-id server-host server-port hostname alpn
   transport-parameters tls-key-exchange tls-provider tls-trust-anchors
   tls-verify-signature tls-signature-algorithms client-hello-wire)
@@ -235,8 +236,10 @@
           (setf (cl-quic-kit.protection:key-set-hp new-key)
                 (cl-quic-kit.protection:key-set-hp old-key)))
         (%client-set-key client wire-level direction new-key))
-      (when (and (eq wire-level :1-rtt) (eq direction :read))
-        (setf (quic-client-application-read-secret client) secret))
+      (when (eq wire-level :1-rtt)
+        (if (eq direction :read)
+            (setf (quic-client-application-read-secret client) secret)
+            (setf (quic-client-application-write-secret client) secret)))
       (let ((boundary (quic-client-tls-boundary client))
             (emit (%client-function "CL-TLS-KIT" "QUIC-TLS-BOUNDARY-EMIT-SECRET")))
         (when (and boundary emit)
@@ -265,6 +268,22 @@
        :replace-p t :preserve-hp t)
       (setf (quic-client-application-read-key-phase client)
             (logxor 1 (quic-client-application-read-key-phase client)))
+      t)))
+
+(defun %client-rotate-application-write-key (client)
+  (let* ((driver (quic-client-tls-driver client))
+         (secret (quic-client-application-write-secret client))
+         (hash (%client-driver-suite-hash driver))
+         (length (if (eq hash :sha384) 48 32)))
+    (when (and driver secret)
+      (%client-install-secret
+       client :1-rtt :write
+       (cl-quic-kit.protection::%expand-label
+        hash secret "quic ku"
+        (make-array 0 :element-type '(unsigned-byte 8)) length)
+       :replace-p t :preserve-hp t)
+      (setf (quic-client-application-write-key-phase client)
+            (logxor 1 (quic-client-application-write-key-phase client)))
       t)))
 
 (defun %client-sync-tls-secrets (client)
@@ -418,7 +437,8 @@
                   (setf selected-key
                         (quic-client-application-read-old-key client))
                   (progn
-                    (unless (%client-rotate-application-read-key client)
+                    (unless (and (%client-rotate-application-read-key client)
+                                 (%client-rotate-application-write-key client))
                       (error 'quic-crypto-error
                              :message "application key phase update unavailable"))
                     (setf selected-key (%client-key client :1-rtt :read)))))))
@@ -472,6 +492,10 @@
                               :source-connection-id scid :token token
                               :packet-number number
                               :packet-number-length pn-length
+                              :key-phase (and (eq type :short)
+                                              (= (quic-client-application-write-key-phase
+                                                  client)
+                                                 1))
                               :payload (make-array (+ (length payload) 16)
                                                    :element-type '(unsigned-byte 8)))))
                  (multiple-value-bind (wire pn-offset)
@@ -727,6 +751,8 @@
                   :application-read-key-phase 0
                   :application-read-old-key nil
                   :application-read-secret nil
+                  :application-write-key-phase 0
+                  :application-write-secret nil
                   :crypto-send-offsets nil
                   :peer-transport-parameters nil :closed-p nil :started-p nil
                   :flow-control
