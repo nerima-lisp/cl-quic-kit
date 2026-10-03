@@ -546,12 +546,15 @@
     (when record
       (%client-requeue-record client record))))
 
-(defun %client-drop-records (client packets requeue-p)
+(defun %client-drop-records (client space packets requeue-p)
   (dolist (packet packets)
     (let ((number (%client-sent-packet-number packet)))
       (when number
-        (let ((record (find number (quic-client-sent-packets client)
-                            :key (lambda (entry) (getf entry :number)))))
+        (let ((record (find-if
+                       (lambda (entry)
+                         (and (eq (getf entry :level) space)
+                              (= (getf entry :number) number)))
+                       (quic-client-sent-packets client))))
           (when record
             (when requeue-p (%client-requeue-record client record))
             (setf (quic-client-sent-packets client)
@@ -572,9 +575,9 @@
 (defun %client-send-frames (client level frames)
   (let* ((wire-level (if (eq level :application) :1-rtt level))
          (space (%client-level-space wire-level))
-         (number (or (1- (or (%client-level-value
-                              (quic-client-packet-numbers client) wire-level)
-                         0))))
+         (number (or (%client-level-value
+                      (quic-client-packet-numbers client) wire-level)
+                     0))
          (packet (%client-build-packet client level frames)))
     (when packet
       (connection-write (quic-client-connection client) packet)
@@ -593,8 +596,9 @@
        (frame-field frame :largest-acknowledged)
        (frame-field frame :ranges)
        :ack-delay (frame-field frame :ack-delay 0))
-    (%client-drop-records client acked nil)
-    (%client-drop-records client lost t)))
+    (let ((space (%client-level-space level)))
+      (%client-drop-records client space acked nil)
+      (%client-drop-records client space lost t))))
 
 (defun %client-receive-frames (client level number frames)
   (let ((space (%client-level-space level)))
@@ -1149,7 +1153,7 @@
         (cl-quic-kit.recovery:on-loss-timeout
          (quic-client-recovery client) space :now at)
       (declare (ignore loss))
-      (%client-drop-records client lost t))
+      (%client-drop-records client space lost t))
     (let ((pto (cl-quic-kit.recovery:pto-deadline
                 (quic-client-recovery client) space :now at)))
       (when (and pto (>= at pto))
