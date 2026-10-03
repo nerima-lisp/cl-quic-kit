@@ -60,7 +60,7 @@ int main(int argc, char **argv) {
   int drop_percent = argc >= 5 ? parse_percentage(argv[4]) : 0;
   int mutate_1rtt = argc >= 6 ? parse_nonnegative(argv[5]) : 0;
   if (listen_port < 0 || upstream_port < 0 || drops_remaining < 0 ||
-      drop_percent < 0 || mutate_1rtt < 0 || mutate_1rtt > 1) {
+      drop_percent < 0 || mutate_1rtt < 0 || mutate_1rtt > 7) {
     fputs("invalid UDP proxy argument\n", stderr);
     return 2;
   }
@@ -147,10 +147,34 @@ int main(int argc, char **argv) {
       }
       if (mutate_1rtt && !mutated_1rtt && received > 20 &&
           (buffer[0] & 0x80u) == 0) {
-        buffer[received - 1] ^= 1;
+        int mutation_mode = mutate_1rtt;
+        switch (mutate_1rtt) {
+        case 1:
+          buffer[received - 1] ^= 1;
+          break;
+        case 2:
+          buffer[0] ^= 0x08;
+          break;
+        case 3:
+          buffer[9] ^= 1;
+          break;
+        case 4:
+          --received;
+          break;
+        case 5:
+          buffer[received / 2] ^= 1;
+          break;
+        case 6:
+          buffer[8] ^= 1;
+          break;
+        case 7:
+          buffer[1] ^= 1;
+          break;
+        }
         mutated_1rtt = true;
-        fprintf(stderr, "udp-proxy mutated server 1-rtt packet (%zd bytes)\n",
-                received);
+        fprintf(stderr,
+                "udp-proxy mutated server 1-rtt packet mode=%d (%zd bytes)\n",
+                mutation_mode, received);
       }
       if (sendto(socket_fd, buffer, (size_t)received, 0,
                  (struct sockaddr *)&client_address,

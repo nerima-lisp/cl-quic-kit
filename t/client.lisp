@@ -99,7 +99,82 @@
               (every (lambda (part)
                        (<= (length (cl-quic-kit:encode-frame part)) 1100))
                      parts))
-         "large ACK ranges split into packet-sized ACK frames"))
+         "large ACK ranges split into packet-sized ACK frames")
+  (let ((previous-largest 3001))
+    (dolist (part parts)
+      (let* ((part-ranges (cl-quic-kit:frame-field part :ranges))
+             (largest (cl-quic-kit:frame-field part :largest-acknowledged)))
+        (check (and (= largest (caar part-ranges))
+                    (< largest previous-largest))
+               "split ACK largest acknowledged matches its first range")
+        (setf previous-largest largest)))))
+
+(flet ((test-octets (values)
+         (make-array (length values) :element-type '(unsigned-byte 8)
+                     :initial-contents values)))
+  (let* ((destination (test-octets '(90 91 92 93 94 95 96 97)))
+       (old-secret (test-octets
+                    '(0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15
+                      16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31)))
+       (make-test-client
+         (lambda (local)
+           (cl-quic-kit:make-quic-client
+            :local-connection-id local
+            :destination-connection-id destination
+            :disable-hostname-verification-p t))))
+  (let* ((sender (funcall make-test-client (test-octets '(1 2 3 4 5 6 7 8))))
+         (receiver (funcall make-test-client (test-octets '(11 12 13 14 15 16 17 18))))
+         (old-key (cl-quic-kit.protection:make-key-set old-secret)))
+    (dolist (direction '(:read :write))
+      (cl-quic-kit::%client-set-key receiver :1-rtt direction old-key))
+    (cl-quic-kit::%client-set-key sender :1-rtt :write old-key)
+    (setf (cl-quic-kit::quic-client-application-read-secret receiver) old-secret
+          (cl-quic-kit::quic-client-application-write-secret receiver) old-secret
+          (cl-quic-kit::quic-client-application-write-secret sender) old-secret)
+    (let ((old-wire (cl-quic-kit::%client-build-packet
+                     sender :application (list (cl-quic-kit:make-frame :ping)))))
+      (check (cl-quic-kit:client-receive-datagram receiver old-wire)
+             "client path opens the current application key")
+      (check (cl-quic-kit::%client-rotate-application-write-key sender)
+             "client starts an application key update")
+      (let ((next-wire (cl-quic-kit::%client-build-packet
+                        sender :application (list (cl-quic-kit:make-frame :ping)))))
+        (check (cl-quic-kit:client-receive-datagram receiver next-wire)
+               "client path opens the next application key")
+        (check (= (cl-quic-kit::quic-client-application-read-key-update-packet-number
+                   receiver)
+                  1)
+               "client records the first packet number of the new read generation")
+        (let ((delayed-old (let ((late (funcall make-test-client
+                                                (test-octets
+                                                 '(1 2 3 4 5 6 7 8)))))
+                             (cl-quic-kit::%client-set-key late :1-rtt :write old-key)
+                             (setf (cl-quic-kit::quic-client-application-write-secret late)
+                                   old-secret)
+                             (cl-quic-kit::%client-build-packet
+                              late :application
+                              (list (cl-quic-kit:make-frame :ping))))))
+          (check (cl-quic-kit:client-receive-datagram receiver delayed-old)
+                 "client path opens a delayed old-generation packet")
+          (check (not (cl-quic-kit::quic-client-closed-p receiver))
+                 "delayed old-generation packet does not close the connection")
+          (check (null (cl-quic-kit::%client-rotate-application-write-key sender))
+                 "client does not start another write update before an ACK")
+          (let ((high-old (let ((late (funcall make-test-client
+                                                (test-octets
+                                                '(1 2 3 4 5 6 7 8)))))
+                            (cl-quic-kit::%client-set-key late :1-rtt :write old-key)
+                            (setf (cl-quic-kit::quic-client-application-write-secret late)
+                                  old-secret
+                                  (cl-quic-kit::quic-client-packet-numbers late)
+                                  '((:1-rtt . 2)))
+                            (cl-quic-kit::%client-build-packet
+                             late :application
+                             (list (cl-quic-kit:make-frame :ping))))))
+            (check (null (cl-quic-kit:client-receive-datagram receiver high-old))
+                   "client rejects an old-key packet at or after the update boundary"))
+          (check (cl-quic-kit::quic-client-closed-p receiver)
+                 "an invalid key phase closes the connection")))))))
 
 (let ((server (cl-quic-kit:make-udp-socket :local-host "127.0.0.1"
                                            :local-port 0

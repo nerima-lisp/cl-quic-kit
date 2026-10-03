@@ -20,11 +20,16 @@
 (defun %env-integer (name default)
   (parse-integer (%env name (princ-to-string default))))
 
+(defun %env-flag (name)
+  (string= (%env name "0") "1"))
+
 (defparameter *body-size*
   (%env-integer "QUIC_BODY_SIZE"
                 (if (= (%env-integer "QUIC_PORT" 8443) 18443)
                     (* 1024 1024)
                     0)))
+
+(defparameter *unknown-length-p* (%env-flag "QUIC_UNKNOWN_LENGTH"))
 
 (defun %octets (string)
   (map '(vector (unsigned-byte 8)) #'char-code string))
@@ -140,7 +145,7 @@
                         (%bytes 0 0 (if (plusp *body-size*) #xd4 #xd1)
                                 #xd7 #x50 #x8a #xa0 #xe4 #x1d #x13
                                 #x9d #x09 #xb8 #xf3 #x4d #x33 #xc1)
-                        (if (plusp *body-size*)
+                        (if (and (plusp *body-size*) (not *unknown-length-p*))
                             (%append-octets
                              (%bytes #x54 (length (princ-to-string *body-size*)))
                              (%octets (princ-to-string *body-size*)))

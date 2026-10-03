@@ -12,7 +12,10 @@
   packet-numbers received-packets keys recovery sent-packets clock
   (application-read-key-phase 0)
   application-read-old-key application-read-secret
+  application-read-key-update-packet-number
   (application-write-key-phase 0) application-write-secret
+  application-write-key-phase-first-packet-number
+  (application-write-key-phase-acked-p t)
   local-connection-id server-host server-port hostname alpn
   transport-parameters tls-key-exchange tls-provider tls-trust-anchors
   tls-verify-signature tls-signature-algorithms client-hello-wire)
@@ -79,12 +82,18 @@
               ranges)
         (setf previous-smallest (- largest range-length))))))
 
+(defun %client-ack-part-fields (frame intervals)
+  (let ((fields (copy-list (frame-fields frame)))
+        (ranges (%client-ack-ranges intervals)))
+    (setf (getf fields :largest-acknowledged) (caar ranges)
+          (getf fields :ranges) ranges)
+    fields))
+
 (defun %client-split-ack-frame (frame)
   (let ((parts nil) (current nil))
     (dolist (interval (%client-ack-intervals frame))
       (let* ((candidate (append current (list interval)))
-             (fields (copy-list (frame-fields frame))))
-        (setf (getf fields :ranges) (%client-ack-ranges candidate))
+             (fields (%client-ack-part-fields frame candidate)))
         (if (and current
                  (> (length (encode-frame
                              (apply #'make-frame (frame-type frame) fields)))
@@ -92,17 +101,14 @@
             (progn
               (push (apply #'make-frame
                            (frame-type frame)
-                           (let ((single (copy-list (frame-fields frame))))
-                             (setf (getf single :ranges)
-                                   (%client-ack-ranges current))
-                             single))
+                           (%client-ack-part-fields frame current))
                     parts)
               (setf current (list interval)))
             (setf current candidate))))
     (when current
-      (let ((fields (copy-list (frame-fields frame))))
-        (setf (getf fields :ranges) (%client-ack-ranges current))
-        (push (apply #'make-frame (frame-type frame) fields) parts)))
+      (push (apply #'make-frame (frame-type frame)
+                   (%client-ack-part-fields frame current))
+            parts))
     (nreverse parts)))
 
 (defun %client-split-frame (frame)
@@ -273,7 +279,7 @@
         (flow-control-update-max-streams flow direction maximum))))
 
 (defun %client-driver-suite-cipher (driver)
-  (case (%client-driver-slot driver "TLS13-CLIENT-DRIVER-SUITE")
+  (case (and driver (%client-driver-slot driver "TLS13-CLIENT-DRIVER-SUITE"))
     (#x1302 :aes-256-gcm)
     (#x1303 :chacha20-poly1305)
     (otherwise :aes-128-gcm)))
@@ -301,7 +307,7 @@
                    (funcall emit boundary tls-level direction secret))))))))
 
 (defun %client-driver-suite-hash (driver)
-  (if (= (%client-driver-slot driver "TLS13-CLIENT-DRIVER-SUITE") #x1302)
+  (if (and driver (= (%client-driver-slot driver "TLS13-CLIENT-DRIVER-SUITE") #x1302))
       :sha384
       :sha256))
 
@@ -310,7 +316,7 @@
          (secret (quic-client-application-read-secret client))
          (hash (%client-driver-suite-hash driver))
          (length (if (eq hash :sha384) 48 32)))
-    (when (and driver secret)
+    (when secret
       (setf (quic-client-application-read-old-key client)
             (%client-key client :1-rtt :read))
       (%client-install-secret
@@ -323,12 +329,46 @@
             (logxor 1 (quic-client-application-read-key-phase client)))
       t)))
 
+(defun %client-next-application-key (client direction)
+  (let* ((driver (quic-client-tls-driver client))
+         (secret (if (eq direction :read)
+                     (quic-client-application-read-secret client)
+                     (quic-client-application-write-secret client)))
+         (hash (%client-driver-suite-hash driver))
+         (length (if (eq hash :sha384) 48 32)))
+    (when secret
+      (let ((next-secret
+              (cl-quic-kit.protection::%expand-label
+               hash secret "quic ku"
+               (make-array 0 :element-type '(unsigned-byte 8)) length)))
+        (values next-secret
+                (let ((next-key (cl-quic-kit.protection:make-key-set
+                                 next-secret
+                                 :cipher (%client-driver-suite-cipher driver))))
+                  (setf (cl-quic-kit.protection:key-set-hp next-key)
+                        (cl-quic-kit.protection:key-set-hp
+                         (%client-key client :1-rtt direction)))
+                  next-key))))))
+
+(defun %client-application-write-key-update-allowed-p (client)
+  (quic-client-application-write-key-phase-acked-p client))
+
+(defun %client-commit-application-read-key-update (client secret number)
+  (setf (quic-client-application-read-old-key client)
+        (%client-key client :1-rtt :read))
+  (%client-install-secret client :1-rtt :read secret :replace-p t
+                          :preserve-hp t)
+  (setf (quic-client-application-read-key-phase client)
+        (logxor 1 (quic-client-application-read-key-phase client))
+        (quic-client-application-read-key-update-packet-number client) number))
+
 (defun %client-rotate-application-write-key (client)
   (let* ((driver (quic-client-tls-driver client))
          (secret (quic-client-application-write-secret client))
          (hash (%client-driver-suite-hash driver))
          (length (if (eq hash :sha384) 48 32)))
-    (when (and driver secret)
+    (when (and secret
+               (%client-application-write-key-update-allowed-p client))
       (%client-install-secret
        client :1-rtt :write
        (cl-quic-kit.protection::%expand-label
@@ -336,7 +376,10 @@
         (make-array 0 :element-type '(unsigned-byte 8)) length)
        :replace-p t :preserve-hp t)
       (setf (quic-client-application-write-key-phase client)
-            (logxor 1 (quic-client-application-write-key-phase client)))
+            (logxor 1 (quic-client-application-write-key-phase client))
+            (quic-client-application-write-key-phase-first-packet-number client)
+            nil
+            (quic-client-application-write-key-phase-acked-p client) nil)
       t)))
 
 (defun %client-sync-tls-secrets (client)
@@ -481,23 +524,35 @@
              (associated (subseq unmasked 0 (+ pn-offset pn-length)))
              (ciphertext (subseq unmasked (+ pn-offset pn-length)))
              (key-phase (and (eq type :short) (logbitp 2 first)))
-             (selected-key key))
+             (selected-key key)
+             (next-read-secret nil))
         (when (eq level :1-rtt)
           (let ((current-phase (quic-client-application-read-key-phase client)))
             (unless (eq key-phase (= current-phase 1))
               (if (and (quic-client-application-read-old-key client)
-                       (eq key-phase (= (logxor current-phase 1) 1)))
+                       (quic-client-application-read-key-update-packet-number client)
+                       (< number
+                          (quic-client-application-read-key-update-packet-number
+                           client)))
                   (setf selected-key
                         (quic-client-application-read-old-key client))
                   (progn
-                    (unless (and (%client-rotate-application-read-key client)
-                                 (%client-rotate-application-write-key client))
-                      (error 'quic-crypto-error
-                             :message "application key phase update unavailable"))
-                    (setf selected-key (%client-key client :1-rtt :read)))))))
+                    (multiple-value-bind (secret next-key)
+                        (%client-next-application-key client :read)
+                      (unless (and secret next-key
+                                   (%client-application-write-key-update-allowed-p
+                                    client))
+                        (error 'quic-crypto-error
+                               :message "application key phase update unavailable"))
+                      (setf selected-key next-key)
+                      (setf next-read-secret secret)))))))
         (let ((plaintext
                 (cl-quic-kit.protection:unprotect-payload
                  selected-key number ciphertext associated)))
+          (when next-read-secret
+            (%client-commit-application-read-key-update
+             client next-read-secret number)
+            (%client-rotate-application-write-key client))
           (values level number
                   (make-packet-header
                    :type type :version (getf layout :version)
@@ -590,6 +645,20 @@
 (defun %client-ack-eliciting-p (frames)
   (some (lambda (frame)
           (not (member (frame-type frame) '(:ack :ack-ecn :padding)))) frames))
+
+(defun %client-ack-includes-packet-p (frame packet-number)
+  (let ((largest (frame-field frame :largest-acknowledged))
+        (ranges (frame-field frame :ranges)))
+    (when (and largest (<= packet-number largest))
+      (let ((smallest (- largest (if ranges
+                                    (cdar ranges)
+                                    (frame-field frame :first-range 0)))))
+        (when (<= smallest packet-number) (return-from %client-ack-includes-packet-p t))
+        (dolist (range (rest ranges) nil)
+          (setf largest (- smallest (getf range :gap) 2)
+                smallest (- largest (getf range :range-length)))
+          (when (<= smallest packet-number largest)
+            (return t)))))))
 
 (defun %client-frame-ranges (numbers)
   (let ((sorted (sort (remove-duplicates (copy-list numbers)) #'>)) (ranges nil))
@@ -686,6 +755,12 @@
          :ack-eliciting-p (%client-ack-eliciting-p frames)
          :in-flight-p (%client-ack-eliciting-p frames) :sent-at sent-at)
         (%client-record-sent client space number frames sent-at))
+      (when (and (eq wire-level :1-rtt)
+                 (%client-ack-eliciting-p frames)
+                 (null (quic-client-application-write-key-phase-first-packet-number
+                        client)))
+        (setf (quic-client-application-write-key-phase-first-packet-number client)
+              number))
       packet)))
 
 (defun %client-handle-ack (client level frame)
@@ -696,6 +771,13 @@
        (frame-field frame :ranges)
        :ack-delay (frame-field frame :ack-delay 0))
     (let ((space (%client-level-space level)))
+      (when (and (eq space :application)
+                 (quic-client-application-write-key-phase-first-packet-number client)
+                 (%client-ack-includes-packet-p
+                  frame
+                  (quic-client-application-write-key-phase-first-packet-number
+                   client)))
+        (setf (quic-client-application-write-key-phase-acked-p client) t))
       (%client-drop-records client space acked nil)
       (%client-drop-records client space lost t))))
 
@@ -804,8 +886,11 @@
                   :application-read-key-phase 0
                   :application-read-old-key nil
                   :application-read-secret nil
+                  :application-read-key-update-packet-number nil
                   :application-write-key-phase 0
                   :application-write-secret nil
+                  :application-write-key-phase-first-packet-number nil
+                  :application-write-key-phase-acked-p t
                   :crypto-send-offsets nil
                   :peer-transport-parameters nil :closed-p nil :started-p nil
                   :flow-control
@@ -1057,7 +1142,11 @@
               (when (not (getf layout :long-p)) (return)))))
         last-header)
     (quic-error (condition)
-      (%client-protocol-close client 7 (quic-error-message condition)) nil)
+      (%client-protocol-close
+       client 7
+       (if (typep condition 'quic-crypto-error)
+           (quic-crypto-error-message condition)
+           (quic-error-message condition))) nil)
     (error (condition)
       (%client-protocol-close client 7 (princ-to-string condition)) nil)))
 
