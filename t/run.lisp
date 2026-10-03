@@ -509,6 +509,31 @@
                   '((6 . 1) (:gap 0 :range-length 1)))
            "ACK encodes the gap between disjoint packet ranges")))
 
+(let ((client (cl-quic-kit:make-quic-client
+               :disable-hostname-verification-p t)))
+  (setf (cl-quic-kit::quic-client-received-packets client)
+        (list (cons :1-rtt '(5 131071 6))))
+  (check (= (cl-quic-kit::%client-largest-received-packet-number client :1-rtt)
+            131071)
+         "packet number reconstruction uses the largest received packet"))
+
+(check (= (cl-quic-kit::%client-packet-number-length 255 nil) 1)
+         "packet number uses one byte at the lower boundary")
+(check (= (cl-quic-kit::%client-packet-number-length 256 nil) 2)
+         "packet number uses two bytes at the one-byte boundary")
+(check (= (cl-quic-kit::%client-packet-number-length 65536 0) 3)
+         "packet number uses three bytes when twice the acknowledged range crosses 16 bits")
+
+(let ((client (cl-quic-kit:make-quic-client
+               :disable-hostname-verification-p t)))
+  (setf (cl-quic-kit::quic-client-application-read-old-key client) :old
+        (cl-quic-kit::quic-client-application-read-key-update-packet-number client) 7
+        (cl-quic-kit::quic-client-application-read-old-key-retire-at client) 1)
+  (cl-quic-kit::%client-discard-expired-read-key client 1)
+  (check (and (null (cl-quic-kit::quic-client-application-read-old-key client))
+              (null (cl-quic-kit::quic-client-application-read-key-update-packet-number client)))
+         "old read keys are discarded at the retirement deadline"))
+
 (check (eq (cl-quic-kit::%client-crypto-signature-scheme
             :ecdsa-secp256r1-sha256)
            :ecdsa-p256-sha256)

@@ -109,6 +109,24 @@
                "split ACK largest acknowledged matches its first range")
         (setf previous-largest largest)))))
 
+(let* ((ranges (cons (cons 3000 0)
+                    (loop repeat 700 collect (list :gap 0 :range-length 0))))
+       (frame (cl-quic-kit:make-frame
+               :ack-ecn :largest-acknowledged 3000 :ack-delay 0 :ranges ranges
+               :ect0 7 :ect1 11 :ecn-ce 13))
+       (parts (cl-quic-kit::%client-split-frame frame)))
+  (check (and (> (length parts) 1)
+              (every (lambda (part)
+                       (and (eq (cl-quic-kit:frame-type part) :ack-ecn)
+                            (<= (length (cl-quic-kit:encode-frame part)) 1100)
+                            (= (cl-quic-kit:frame-field part :ect0) 7)
+                            (= (cl-quic-kit:frame-field part :ect1) 11)
+                            (= (cl-quic-kit:frame-field part :ecn-ce) 13)
+                            (= (length (cl-quic-kit:frame-field part :ranges))
+                               (length (cl-quic-kit::%client-ack-intervals part)))))
+                     parts))
+         "split ACK ECN preserves counters, size, and ranges"))
+
 (flet ((test-octets (values)
          (make-array (length values) :element-type '(unsigned-byte 8)
                      :initial-contents values)))
@@ -140,8 +158,25 @@
       (check (null (cl-quic-kit::%client-rotate-application-write-key sender))
              "client does not update keys before handshake confirmation")
       (setf (cl-quic-kit::quic-client-application-handshake-confirmed-p sender) t)
-         (check (cl-quic-kit::%client-rotate-application-write-key sender)
+        (check (cl-quic-kit::%client-rotate-application-write-key sender)
                  "client starts an application key update")
+      (let ((delayed-peer-old
+              (let ((late (funcall make-test-client
+                                   (test-octets '(21 22 23 24 25 26 27 28)))))
+                (cl-quic-kit::%client-set-key late :1-rtt :write old-key)
+                (setf (cl-quic-kit::quic-client-application-write-secret late)
+                      old-secret
+                      (cl-quic-kit::quic-client-packet-numbers late)
+                      '((:1-rtt . 1)))
+                (cl-quic-kit::%client-build-packet
+                 late :application (list (cl-quic-kit:make-frame :ping))))))
+                (check (cl-quic-kit:client-receive-datagram sender delayed-peer-old)
+               "local write update leaves the peer's old read key usable"))
+      (cl-quic-kit::%client-prepare-next-application-read-key sender)
+      (cl-quic-kit::%client-prepare-next-application-read-key receiver)
+      (check (and (cl-quic-kit::quic-client-application-read-next-key sender)
+                  (cl-quic-kit::quic-client-application-read-next-key receiver))
+             "current and next read keys are prepared before key phase processing")
       (let ((next-wire (cl-quic-kit::%client-build-packet
                         sender :application (list (cl-quic-kit:make-frame :ping)))))
         (check (cl-quic-kit:client-receive-datagram receiver next-wire)
@@ -179,10 +214,24 @@
            sender :1-rtt
            (cl-quic-kit:make-frame
             :ack :largest-acknowledged 2 :ack-delay 0
-            :ranges (list (cons 2 0))))
+            :ranges (list (cons 2 1))))
           (check (cl-quic-kit::quic-client-application-write-key-phase-acked-p
                   sender)
                  "ACK marks the current write key generation acknowledged")
+          (setf (cl-quic-kit::quic-client-application-write-key-phase-acked-p
+                 sender)
+                nil)
+          (cl-quic-kit::%client-handle-ack
+           sender :1-rtt
+           (cl-quic-kit:make-frame
+            :ack :largest-acknowledged 2 :ack-delay 0
+            :ranges (list (cons 2 0) (list :gap 0 :range-length 0))))
+          (check (not (cl-quic-kit::quic-client-application-write-key-phase-acked-p
+                       sender))
+                 "ACK outside the update packet range does not authorize a key update")
+          (setf (cl-quic-kit::quic-client-application-write-key-phase-acked-p
+                 sender)
+                t)
           (check (cl-quic-kit::%client-rotate-application-write-key sender)
                  "client starts the next write update after an ACK")
           (setf (cl-quic-kit::quic-client-application-write-key-phase-acked-p
