@@ -378,6 +378,7 @@
                :io-write (lambda (connection bytes)
                            (declare (ignore connection))
                            (push bytes writes)))))
+  (setf (cl-quic-kit::quic-client-keys client) nil)
   (cl-quic-kit::%client-protocol-close client 7 "private implementation detail")
   (check (null (cl-quic-kit:frame-field
                 (cl-quic-kit:decode-frame (first writes)) :reason))
