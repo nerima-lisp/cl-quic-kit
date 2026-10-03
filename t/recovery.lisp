@@ -18,6 +18,29 @@
                      (+ 10 (* 2 333/1000)))
                   "PTO is anchored to the last ack-eliciting send time"))
 
+(let ((state (cl-quic-kit.recovery:make-recovery-state :clock (lambda () 0))))
+  (cl-quic-kit.recovery:record-sent-packet state :application 8 1200 :sent-at 0)
+  (cl-quic-kit.recovery:record-sent-packet state :application 9 1200 :sent-at 0)
+  (cl-quic-kit.recovery:record-sent-packet state :application 10 1200 :sent-at 0)
+  (multiple-value-bind (acked lost)
+      (cl-quic-kit.recovery:on-ack-frame
+       state :application 10 '((10 . 2)) :received-at 0)
+    (recovery-check (and (= (length acked) 3) (null lost))
+                    "wire ACK first range length is converted to packet endpoints")))
+
+(let ((state (cl-quic-kit.recovery:make-recovery-state :clock (lambda () 0))))
+  (dolist (number '(0 1 4 5 6 9))
+    (cl-quic-kit.recovery:record-sent-packet state :application number 1200
+                                             :sent-at 0))
+  (multiple-value-bind (acked lost)
+      (cl-quic-kit.recovery:on-ack-frame
+       state :application 9
+       '((9 . 1) (:gap 1 :range-length 1) (:gap 0 :range-length 1))
+       :received-at 0)
+    (declare (ignore lost))
+    (recovery-check (= (length acked) 4)
+                    "wire ACK gaps are converted to disjoint packet endpoints")))
+
 (let ((state (cl-quic-kit.recovery:make-recovery-state :clock (lambda () 1))))
   (cl-quic-kit.recovery:record-sent-packet state :application 1 1200 :sent-at 0)
   (cl-quic-kit.recovery:record-sent-packet state :application 2 1200 :sent-at 0)

@@ -81,7 +81,7 @@
             sleep 0.05
           done
           if ! HOME="$TMPDIR" XDG_CACHE_HOME="$XDG_CACHE_HOME" \
-            CADDY_ROOT="$TMPDIR/self.crt" QUIC_PORT=18443 \
+            CADDY_ROOT="$TMPDIR/self.crt" QUIC_PORT=18443 QUIC_BODY_SIZE=1048576 \
             sbcl --non-interactive --load t/http3-loopback.lisp; then
             cat "$TMPDIR/caddy.log"
             exit 1
@@ -103,7 +103,20 @@
             sleep 0.05
           done
           if ! HOME="$TMPDIR" XDG_CACHE_HOME="$XDG_CACHE_HOME" \
-            CADDY_ROOT="$TMPDIR/self.crt" QUIC_PORT=18444 \
+            CADDY_ROOT="$TMPDIR/self.crt" QUIC_PORT=18444 QUIC_BODY_SIZE=1048576 \
+            sbcl --non-interactive --load t/http3-loopback.lisp; then
+            cat "$TMPDIR/caddy.log"
+            cat "$TMPDIR/proxy.log"
+            exit 1
+          fi
+          if ! HOME="$TMPDIR" XDG_CACHE_HOME="$XDG_CACHE_HOME" \
+            CADDY_ROOT="$TMPDIR/self.crt" QUIC_PORT=18443 QUIC_BODY_SIZE=8388608 \
+            sbcl --non-interactive --load t/http3-loopback.lisp; then
+            cat "$TMPDIR/caddy.log"
+            exit 1
+          fi
+          if ! HOME="$TMPDIR" XDG_CACHE_HOME="$XDG_CACHE_HOME" \
+            CADDY_ROOT="$TMPDIR/self.crt" QUIC_PORT=18444 QUIC_BODY_SIZE=8388608 \
             sbcl --non-interactive --load t/http3-loopback.lisp; then
             cat "$TMPDIR/caddy.log"
             cat "$TMPDIR/proxy.log"

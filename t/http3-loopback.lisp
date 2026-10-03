@@ -20,6 +20,12 @@
 (defun %env-integer (name default)
   (parse-integer (%env name (princ-to-string default))))
 
+(defparameter *body-size*
+  (%env-integer "QUIC_BODY_SIZE"
+                (if (= (%env-integer "QUIC_PORT" 8443) 18443)
+                    (* 1024 1024)
+                    0)))
+
 (defun %octets (string)
   (map '(vector (unsigned-byte 8)) #'char-code string))
 
@@ -128,16 +134,21 @@
                      (%h3-frame
                       1
                       (%append-octets
-                       ;; QPACK static entries 17, 23, 0, and 1 encode
-                       ;; :method GET, :scheme https, :authority, and :path /.
-                       (%bytes 0 0 #xd1 #xd7 #x50 #x8a #xa0 #xe4 #x1d #x13
-                               #x9d #x09 #xb8 #xf3 #x4d #x33 #xc1)))
+                       ;; QPACK static entries 17/20, 23, 0, and 1 encode
+                       ;; :method GET/POST, :scheme https, :authority, and :path /.
+                       (%append-octets
+                        (%bytes 0 0 (if (plusp *body-size*) #xd4 #xd1)
+                                #xd7 #x50 #x8a #xa0 #xe4 #x1d #x13
+                                #x9d #x09 #xb8 #xf3 #x4d #x33 #xc1)
+                        (if (plusp *body-size*)
+                            (%append-octets
+                             (%bytes #x54 (length (princ-to-string *body-size*)))
+                             (%octets (princ-to-string *body-size*)))
+                            #()))))
                      (%h3-frame 0
-                                (if (= (%env-integer "QUIC_PORT" 8443) 18443)
-                                    (make-array (* 1024 1024)
-                                                :element-type '(unsigned-byte 8)
-                                                :initial-element #x5a)
-                                    (make-array 0 :element-type '(unsigned-byte 8)))))
+                                (make-array *body-size*
+                                            :element-type '(unsigned-byte 8)
+                                            :initial-element #x5a)))
                     :fin-p t)
                    (cl-quic-kit:client-flush client)
                    (let ((response (make-array 0 :element-type '(unsigned-byte 8)))

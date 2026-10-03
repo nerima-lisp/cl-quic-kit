@@ -547,9 +547,11 @@
    (quic-client-recovery client) space))
 
 (defun %client-send-frames (client level frames)
-  (let* ((space (%client-level-space level))
+  (let* ((wire-level (if (eq level :application) :1-rtt level))
+         (space (%client-level-space wire-level))
          (number (or (1- (or (%client-level-value
-                              (quic-client-packet-numbers client) level) 0)) 0))
+                              (quic-client-packet-numbers client) wire-level)
+                         0))))
          (packet (%client-build-packet client level frames)))
     (when packet
       (connection-write (quic-client-connection client) packet)
