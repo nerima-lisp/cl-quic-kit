@@ -112,7 +112,7 @@
                               "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f"))
                  (next-secret
                    (funcall (protection-function p "%EXPAND-LABEL")
-                            :sha256 old-secret "traffic upd"
+                            :sha256 old-secret "quic ku"
                             (make-array 0 :element-type '(unsigned-byte 8)) 32))
                  (old-key (funcall (protection-function p "MAKE-KEY-SET") old-secret))
                  (next-key (funcall (protection-function p "MAKE-KEY-SET") next-secret))

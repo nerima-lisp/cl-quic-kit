@@ -11,7 +11,7 @@
   initial-destination-connection-id remote-connection-id retry-token
   packet-numbers received-packets keys recovery sent-packets clock
   (application-read-key-phase 0)
-  application-read-old-key
+  application-read-old-key application-read-secret
   local-connection-id server-host server-port hostname alpn
   transport-parameters tls-key-exchange tls-provider tls-trust-anchors
   tls-verify-signature tls-signature-algorithms client-hello-wire)
@@ -235,6 +235,8 @@
           (setf (cl-quic-kit.protection:key-set-hp new-key)
                 (cl-quic-kit.protection:key-set-hp old-key)))
         (%client-set-key client wire-level direction new-key))
+      (when (and (eq wire-level :1-rtt) (eq direction :read))
+        (setf (quic-client-application-read-secret client) secret))
       (let ((boundary (quic-client-tls-boundary client))
             (emit (%client-function "CL-TLS-KIT" "QUIC-TLS-BOUNDARY-EMIT-SECRET")))
         (when (and boundary emit)
@@ -242,19 +244,25 @@
            (%client-level-space level) (lambda (tls-level)
                    (funcall emit boundary tls-level direction secret))))))))
 
+(defun %client-driver-suite-hash (driver)
+  (if (= (%client-driver-slot driver "TLS13-CLIENT-DRIVER-SUITE") #x1302)
+      :sha384
+      :sha256))
+
 (defun %client-rotate-application-read-key (client)
   (let* ((driver (quic-client-tls-driver client))
-         (state (%client-driver-slot driver
-                                     "TLS13-CLIENT-DRIVER-APPLICATION-READ-STATE"))
-         (update (%client-function "CL-TLS-KIT" "TLS13-UPDATE-TRAFFIC-SECRET"))
-         (secret-reader (%client-function "CL-TLS-KIT"
-                                          "TLS13-TRAFFIC-STATE-SECRET")))
-    (when (and driver state update secret-reader)
+         (secret (quic-client-application-read-secret client))
+         (hash (%client-driver-suite-hash driver))
+         (length (if (eq hash :sha384) 48 32)))
+    (when (and driver secret)
       (setf (quic-client-application-read-old-key client)
             (%client-key client :1-rtt :read))
-      (funcall update state)
-      (%client-install-secret client :1-rtt :read (funcall secret-reader state)
-                              :replace-p t :preserve-hp t)
+      (%client-install-secret
+       client :1-rtt :read
+       (cl-quic-kit.protection::%expand-label
+        hash secret "quic ku"
+        (make-array 0 :element-type '(unsigned-byte 8)) length)
+       :replace-p t :preserve-hp t)
       (setf (quic-client-application-read-key-phase client)
             (logxor 1 (quic-client-application-read-key-phase client)))
       t)))
@@ -718,6 +726,7 @@
                   :pending-stream-writes nil
                   :application-read-key-phase 0
                   :application-read-old-key nil
+                  :application-read-secret nil
                   :crypto-send-offsets nil
                   :peer-transport-parameters nil :closed-p nil :started-p nil
                   :flow-control
