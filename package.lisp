@@ -75,7 +75,8 @@
    #:udp-socket #:make-udp-socket #:udp-socket-local-port
    #:udp-send #:udp-receive #:udp-close
    #:quic-client #:make-quic-client #:client-open-stream
-   #:client-write-stream #:client-read-stream #:client-close-stream
+   #:client-write-stream #:client-stream-write-pending-p
+   #:client-read-stream #:client-close-stream
    #:client-flush #:client-receive-frame #:client-receive-datagram
    #:make-client-tls-boundary #:make-client-tls-driver #:client-tls-feed
    #:client-start #:client-poll #:client-close

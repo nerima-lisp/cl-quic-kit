@@ -1120,6 +1120,17 @@
     (error 'type-error :datum octets :expected-type '(vector (unsigned-byte 8))))
   (%client-write-stream-available client stream octets fin-p))
 
+(defun client-stream-write-pending-p (client stream)
+  "Return true when CLIENT still has unsent data for STREAM."
+  (or (find stream (quic-client-pending-stream-writes client)
+            :key #'first :test #'eq)
+      (some (lambda (entry)
+              (let ((frame (cdr entry)))
+                (and (eq (frame-type frame) :stream)
+                     (= (stream-id stream)
+                        (frame-field frame :stream-id)))))
+            (quic-client-pending-frames client))))
+
 (defun client-read-stream (client stream &key timeout deadline)
   (%client-check-deadline client timeout deadline)
   (multiple-value-bind (data fin) (stream-read stream)
