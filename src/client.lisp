@@ -10,6 +10,7 @@
   flow-control
   initial-destination-connection-id remote-connection-id retry-token
   packet-numbers received-packets keys recovery sent-packets clock
+  pto-probe-budgets pto-probe-frames
   (application-read-key-phase 0)
   application-read-old-key application-read-next-key application-read-next-secret
   application-read-secret application-read-key-update-packet-number
@@ -55,6 +56,10 @@
   (setf (quic-client-pending-frames client)
         (nconc (quic-client-pending-frames client) (list (cons level frame))))
   frame)
+
+(defun %client-queue-pto-probe (client frame level)
+  (push frame (quic-client-pto-probe-frames client))
+  (%client-queue-frame client frame level))
 
 (defparameter *client-packet-payload-limit* 1100)
 
@@ -734,7 +739,18 @@
   (unless (getf record :requeued-p)
     (setf (getf record :requeued-p) t)
     (dolist (frame (getf record :frames))
+      (push frame (quic-client-pto-probe-frames client))
       (%client-queue-frame client frame (%client-space-level (getf record :level))))))
+
+(defun %client-pto-probe-budget (client space)
+  (cdr (assoc space (quic-client-pto-probe-budgets client))))
+
+(defun (setf %client-pto-probe-budget) (value client space)
+  (let ((entry (assoc space (quic-client-pto-probe-budgets client))))
+    (if entry
+        (setf (cdr entry) value)
+        (push (cons space value) (quic-client-pto-probe-budgets client)))
+    value))
 
 (defun %client-requeue-pto-probe (client space)
   (let ((record (find-if
@@ -781,8 +797,31 @@
          (number (or (%client-level-value
                       (quic-client-packet-numbers client) wire-level)
                      0))
-         (packet (%client-build-packet client level frames)))
+         (packet (%client-build-packet client level frames))
+         (probe-p (some (lambda (frame)
+                          (member frame (quic-client-pto-probe-frames client)
+                                  :test #'eq))
+                        frames)))
     (when packet
+      (when (and (%client-ack-eliciting-p frames)
+                 (not (and probe-p (plusp (%client-pto-probe-budget client space))))
+                 (> (+ (cl-quic-kit.recovery:recovery-state-bytes-in-flight
+                        (quic-client-recovery client))
+                       (length packet))
+                    (cl-quic-kit.recovery:recovery-state-cwnd
+                     (quic-client-recovery client))))
+        ;; %client-build-packet allocated this packet number, but the packet
+        ;; must remain queued until the congestion window opens.
+        (setf (quic-client-packet-numbers client)
+              (%client-set-level-value
+               (quic-client-packet-numbers client) wire-level number))
+        (return-from %client-send-frames :blocked))
+      (when probe-p
+        (setf (%client-pto-probe-budget client space)
+              (max 0 (1- (%client-pto-probe-budget client space))))
+        (setf (quic-client-pto-probe-frames client)
+              (set-difference (quic-client-pto-probe-frames client) frames
+                              :test #'eq)))
       (connection-write (quic-client-connection client) packet)
       (let ((sent-at (funcall (quic-client-clock client))))
         (cl-quic-kit.recovery:record-sent-packet
@@ -815,7 +854,8 @@
         (setf (quic-client-application-write-key-phase-acked-p client) t
               (quic-client-application-handshake-confirmed-p client) t))
       (%client-drop-records client space acked nil)
-      (%client-drop-records client space lost t))))
+      (%client-drop-records client space lost t)
+      (values acked lost))))
 
 (defun %client-ack-includes-packet-p (frame packet-number)
   (some (lambda (interval)
@@ -835,10 +875,15 @@
     (cl-quic-kit.recovery:on-packet-received
      (quic-client-recovery client) space number
      :ack-eliciting-p (%client-ack-eliciting-p frames)))
-  (dolist (frame frames)
-    (case (frame-type frame)
-      ((:ack :ack-ecn) (%client-handle-ack client level frame))
+  (let ((flush-p nil))
+    (dolist (frame frames)
+      (case (frame-type frame)
+      ((:ack :ack-ecn)
+       (multiple-value-bind (acked lost) (%client-handle-ack client level frame)
+         (when (or acked lost)
+           (setf flush-p t))))
       (:max-data
+       (setf flush-p t)
        (%client-apply-max-data client (frame-field frame :maximum 0)))
       (:max-streams-bidi
        (%client-apply-max-streams client :bidirectional
@@ -847,6 +892,7 @@
        (%client-apply-max-streams client :unidirectional
                                   (frame-field frame :maximum 0)))
       (:max-stream-data
+       (setf flush-p t)
        (let ((stream (gethash (frame-field frame :stream-id)
                               (quic-client-streams client))))
          (unless stream
@@ -894,7 +940,9 @@
        (unless (quic-client-closed-p client)
          (setf (quic-client-application-handshake-confirmed-p client) t)
          (connection-set-state (quic-client-connection client) :established)))
-      (otherwise nil))))
+      (otherwise nil)))
+    (when flush-p
+      (client-flush client))))
 
 (defun make-quic-client (&key connection udp-socket tls-boundary tls-driver
                               local-connection-id destination-connection-id
@@ -951,7 +999,9 @@
                   :remote-connection-id destination :retry-token #()
                   :packet-numbers nil :received-packets nil :keys nil
                   :recovery (cl-quic-kit.recovery:make-recovery-state :clock clock)
-                  :sent-packets nil :clock clock :local-connection-id local
+                  :sent-packets nil :clock clock
+                  :pto-probe-budgets nil :pto-probe-frames nil
+                  :local-connection-id local
                   :server-host server-host :server-port server-port
                   :hostname hostname :alpn alpn
                   :transport-parameters (or transport-parameters
@@ -1102,11 +1152,20 @@
             (push (cons (car entry) (list (cdr entry))) groups))))
     (dolist (group groups)
       (let ((frames (reverse (cdr group))))
-        (dolist (packet-frames (%client-frame-packet-groups frames))
-          (unless (%client-send-frames client (car group) packet-frames)
-            (dolist (frame packet-frames)
-              (connection-write (quic-client-connection client)
-                                (encode-frame frame))))))))
+        (loop for remaining on (%client-frame-packet-groups frames)
+              for packet-frames = (car remaining)
+              do
+          (let ((result (%client-send-frames client (car group) packet-frames)))
+            (cond
+              ((eq result :blocked)
+               (dolist (unsent remaining)
+                 (dolist (frame unsent)
+                   (%client-queue-frame client frame (car group))))
+               (return))
+              ((null result)
+               (dolist (frame packet-frames)
+                 (connection-write (quic-client-connection client)
+                                   (encode-frame frame))))))))))
   t)
 
 (defun %client-find-or-create-peer-stream (client id)
@@ -1399,9 +1458,10 @@
                 (quic-client-recovery client) space :now at)))
       (when (and pto (>= at pto))
         (cl-quic-kit.recovery:on-pto-expired (quic-client-recovery client))
+        (setf (%client-pto-probe-budget client space) 2)
         (%client-requeue-pto-probe client space)
-        (%client-queue-frame client (make-frame :ping)
-                             (%client-space-level space))))))
+        (%client-queue-pto-probe client (make-frame :ping)
+                                 (%client-space-level space))))))
 
 (defun client-poll (client &optional at)
   "Drive UDP receive, ACK generation, loss/PTO probes, and idle timeout."
