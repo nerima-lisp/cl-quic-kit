@@ -264,12 +264,12 @@
 (defun %client-check-deadline (client timeout deadline)
   (let ((now (funcall (quic-client-clock client))))
     (when (and timeout (not (and (numberp timeout) (>= timeout 0))))
-      (error 'quic-error))
+      (error 'quic-error :message "Client timeout must be a non-negative number"))
     (when (and deadline (not (numberp deadline)))
-      (error 'quic-error))
+      (error 'quic-error :message "Client deadline must be a number"))
     (when (and (or deadline timeout)
                (<= (or deadline (+ now timeout)) now))
-      (error 'quic-error))))
+      (error 'quic-error :message "Client deadline has already expired"))))
 
 (defun %client-apply-max-data (client maximum)
   (let ((flow (quic-client-flow-control client)))
@@ -1113,7 +1113,8 @@
 (defun client-write-stream (client stream octets &key (fin-p nil) timeout deadline)
   (%client-check-deadline client timeout deadline)
   (unless (eq (gethash (stream-id stream) (quic-client-streams client)) stream)
-    (error 'quic-error))
+    (error 'quic-error
+           :message "Cannot write to a stream that is not registered with the client"))
   (unless (and (arrayp octets) (= (array-rank octets) 1)
                (subtypep (array-element-type octets) '(unsigned-byte 8)))
     (error 'type-error :datum octets :expected-type '(vector (unsigned-byte 8))))
@@ -1135,7 +1136,10 @@
 
 (defun client-close-stream (client stream &key condition)
   (declare (ignore condition))
-  (when (gethash (stream-id stream) (quic-client-streams client))
+  (when (eq (gethash (stream-id stream) (quic-client-streams client)) stream)
+    (setf (quic-client-pending-stream-writes client)
+          (delete stream (quic-client-pending-stream-writes client)
+                  :key #'first :test #'eq))
     (unless (stream-finished-p stream) (ignore-errors (stream-finish stream)))
     (remhash (stream-id stream) (quic-client-streams client)))
   t)
@@ -1320,7 +1324,8 @@
           (error 'crypto-unavailable :operation :x25519))
         (list :generate
               (lambda (group)
-                (unless (= group #x001d) (error 'quic-error))
+                (unless (= group #x001d)
+                  (error 'quic-error :message "Unsupported X25519 key exchange group"))
                 (let ((private (funcall random 32)))
                   (values private (funcall base private))))
               :shared-secret
@@ -1358,7 +1363,9 @@
                                          (if (= type 20) :handshake :application)))
                               (boundary (quic-client-tls-boundary client))
                               (before (length (quic-client-pending-frames client))))
-                         (unless boundary (error 'quic-error))
+                         (unless boundary
+                           (error 'quic-error
+                                  :message "QUIC TLS boundary is not configured"))
                          (%client-tls-level-call
                           level
                           (lambda (tls-level)
