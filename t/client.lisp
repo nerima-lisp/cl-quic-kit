@@ -55,6 +55,8 @@
    client stream (make-array 1 :element-type '(unsigned-byte 8)))
   (check (cl-quic-kit::quic-client-pending-stream-writes client)
          "flow-limited stream writes remain pending before close")
+  (check (cl-quic-kit:client-stream-write-pending-p client stream)
+         "pending stream writes are reported through the public client API")
   (cl-quic-kit:client-close-stream client stream)
   (cl-quic-kit:client-flush client)
   (check (null (cl-quic-kit::quic-client-pending-stream-writes client))
@@ -218,6 +220,8 @@
            "client flush does not exceed the congestion window")
     (check (cl-quic-kit::quic-client-pending-frames client)
            "congestion-window blocked stream packets remain queued")
+    (check (cl-quic-kit:client-stream-write-pending-p client stream)
+           "congestion-window blocked stream frames are reported as pending")
     (let ((writes-before-ack (length writes)))
       (cl-quic-kit::%client-handle-ack
        client :1-rtt
@@ -229,7 +233,13 @@
       (check (> (length writes) writes-before-ack)
              "ACK frees the congestion window and resumes queued stream data")
       (check (cl-quic-kit::quic-client-pending-frames client)
-             "ACK flush preserves packet groups after the blocked stream packet"))))
+             "ACK flush preserves packet groups after the blocked stream packet")
+      (setf (cl-quic-kit.recovery:recovery-state-cwnd
+             (cl-quic-kit::quic-client-recovery client))
+            most-positive-fixnum)
+      (cl-quic-kit:client-flush client)
+      (check (not (cl-quic-kit:client-stream-write-pending-p client stream))
+             "stream write is no longer pending after the queued frame is sent"))))
 
 (let* ((ranges (cons (cons 3000 0)
                     (loop repeat 700 collect (list :gap 0 :range-length 0))))
