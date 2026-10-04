@@ -1,0 +1,821 @@
+(require :asdf)
+(when (find-package :asdf)
+  (asdf:load-system "cl-crypto-kit")
+  (asdf:load-system "cl-tls-kit"))
+
+(defun test-path (path)
+  (merge-pathnames path
+                   (if (and (find-package :asdf)
+                            (asdf:find-system "cl-quic-kit/tests" nil))
+                       (asdf:system-source-directory "cl-quic-kit/tests")
+                       (merge-pathnames "../"
+                                        (or *load-truename*
+                                            *default-pathname-defaults*)))))
+
+(load (test-path "package.lisp"))
+
+(dolist (file '("src/varint.lisp" "src/packet.lisp" "src/frame.lisp"
+                "src/flow-control.lisp" "src/stream.lisp" "src/state.lisp"
+                "src/udp.lisp" "src/protection.lisp" "src/recovery.lisp"
+                "src/client.lisp"))
+  (load (test-path file)))
+
+(when (and (find-package "CRYPTO-KIT")
+           (find-package "CL-QUIC-KIT.PROTECTION"))
+  (let ((p (find-package "CL-QUIC-KIT.PROTECTION"))
+        (crypto (lambda (name) (symbol-function (find-symbol name "CRYPTO-KIT")))))
+    (funcall (find-symbol "CONFIGURE-CRYPTO-BACKEND" p)
+             :hkdf-extract (funcall crypto "HKDF-EXTRACT")
+             :hkdf-expand (funcall crypto "HKDF-EXPAND")
+             :aead-seal (funcall crypto "AEAD-SEAL")
+             :aead-open (funcall crypto "AEAD-OPEN")
+             :aes-ecb (funcall crypto "AES-ENCRYPT-BLOCK")
+             :chacha20 (funcall crypto "CHACHA20-KEYSTREAM")
+             :constant-time-equal (funcall crypto "CONSTANT-TIME-EQUAL"))))
+
+(in-package #:cl-user)
+
+(defparameter *tests-run* 0)
+
+(defun check (condition description)
+  (incf *tests-run*)
+  (unless condition
+    (error "Test failed: ~A" description)))
+
+(defun strict-utf8-p (octets)
+  (labels ((continuation-p (byte) (<= #x80 byte #xbf)))
+    (loop with index = 0
+          while (< index (length octets))
+          do (let* ((lead (aref octets index))
+                    (remaining (- (length octets) index))
+                    (width (cond
+                             ((<= lead #x7f) 1)
+                             ((and (<= #xc2 lead #xdf) (>= remaining 2)
+                                   (continuation-p (aref octets (1+ index))))
+                              2)
+                             ((and (or (= lead #xe0) (<= #xe1 lead #xec)
+                                       (= lead #xed) (<= #xee lead #xef))
+                                   (>= remaining 3)
+                                   (or (and (= lead #xe0)
+                                            (<= #xa0 (aref octets (1+ index)) #xbf))
+                                       (and (or (<= #xe1 lead #xec)
+                                                (<= #xee lead #xef))
+                                            (continuation-p (aref octets (1+ index))))
+                                       (and (= lead #xed)
+                                            (<= #x80 (aref octets (1+ index)) #x9f)))
+                                   (continuation-p (aref octets (+ index 2))))
+                              3)
+                             ((and (or (= lead #xf0) (<= #xf1 lead #xf3)
+                                       (= lead #xf4))
+                                   (>= remaining 4)
+                                   (or (and (= lead #xf0)
+                                            (<= #x90 (aref octets (1+ index)) #xbf))
+                                       (and (<= #xf1 lead #xf3)
+                                            (continuation-p (aref octets (1+ index))))
+                                       (and (= lead #xf4)
+                                            (<= #x80 (aref octets (1+ index)) #x8f)))
+                                   (continuation-p (aref octets (+ index 2)))
+                                   (continuation-p (aref octets (+ index 3))))
+                              4))))
+               (unless width (return nil))
+               (incf index width))
+          finally (return t))))
+
+;; Keep the RFC 9001 packet-protection vectors in the flake check, including
+;; the deterministic Retry integrity vector from Appendix A.
+(load (test-path "t/protection.lisp"))
+
+(check (= cl-quic-kit:*quic-version-1* #x00000001)
+       "QUIC v1 has the RFC 9000 version number")
+(check (cl-quic-kit:connection-id-p (make-array 0 :element-type '(unsigned-byte 8)))
+       "an empty connection ID is valid")
+(check (cl-quic-kit:connection-id-p (make-array 20 :element-type '(unsigned-byte 8)))
+       "a twenty-octet connection ID is valid")
+(check (not (cl-quic-kit:connection-id-p (make-array 21 :element-type '(unsigned-byte 8))))
+       "a twenty-one-octet connection ID is invalid")
+(let ((rejected nil))
+  (handler-case
+      (cl-quic-kit:validate-connection-id "not-octets")
+    (cl-quic-kit:invalid-connection-id () (setf rejected t)))
+  (check rejected "malformed connection IDs are rejected"))
+(let ((encoded (cl-quic-kit:encode-varint 494)))
+  (multiple-value-bind (value size) (cl-quic-kit:decode-varint encoded)
+    (check (and (= value 494) (= size 2)) "varint round trip")))
+(let ((encoded (cl-quic-kit:encode-varint (1- (ash 1 62)))))
+  (multiple-value-bind (value size) (cl-quic-kit:decode-varint encoded)
+    (check (and (= value (1- (ash 1 62))) (= size 8))
+           "maximum QUIC varint round trip")))
+(let ((rejected nil))
+  (handler-case (cl-quic-kit:encode-varint (ash 1 62))
+    (cl-quic-kit:quic-encoding-error () (setf rejected t)))
+  (check rejected "varints above the maximum are rejected"))
+(let ((bytes (make-array 65527 :element-type '(unsigned-byte 8))))
+  (setf (aref bytes 0) #x40)
+  (multiple-value-bind (header end) (cl-quic-kit:decode-packet-header bytes)
+    (check (and (eq (cl-quic-kit:packet-header-type header) :short)
+                (= end 65527))
+           "maximum UDP payload packet is accepted")))
+(let ((rejected nil))
+  (handler-case
+      (cl-quic-kit:decode-packet-header
+       (make-array 65528 :element-type '(unsigned-byte 8)
+                   :initial-element #x40))
+    (cl-quic-kit:quic-encoding-error () (setf rejected t)))
+  (check rejected "packet above the maximum UDP payload is rejected"))
+(let ((header (cl-quic-kit:make-packet-header
+               :type :short :destination-connection-id
+               (make-array 8 :element-type '(unsigned-byte 8))
+               :packet-number 0 :packet-number-length 1
+               :payload (make-array (- 65527 10)
+                                    :element-type '(unsigned-byte 8)))))
+  (check (= (length (cl-quic-kit:encode-packet-header header)) 65527)
+         "packet encoder accepts the maximum UDP payload"))
+(let ((rejected nil))
+  (handler-case
+      (cl-quic-kit:encode-packet-header
+       (cl-quic-kit:make-packet-header
+        :type :short :destination-connection-id
+        (make-array 8 :element-type '(unsigned-byte 8))
+        :packet-number 0 :packet-number-length 1
+        :payload (make-array (- 65527 9) :element-type '(unsigned-byte 8))))
+    (cl-quic-kit:quic-encoding-error () (setf rejected t)))
+  (check rejected "packet encoder rejects payload above the UDP maximum"))
+(let ((connection (cl-quic-kit:make-quic-connection :now-fn (lambda () 0))))
+  (cl-quic-kit:connection-close
+   connection :no-error
+   (make-string cl-quic-kit::+max-quic-close-reason-size+ :initial-element #\a))
+  (check (= (length (cl-quic-kit::quic-connection-closed-reason connection))
+            cl-quic-kit::+max-quic-close-reason-size+)
+         "connection close reason accepts the maximum UTF-8 size"))
+(let ((connection (cl-quic-kit:make-quic-connection :now-fn (lambda () 0))))
+  (cl-quic-kit:connection-close
+   connection :no-error
+   (make-string (1+ cl-quic-kit::+max-quic-close-reason-size+)
+                :initial-element #\a))
+  (check (= (length (cl-quic-kit::quic-connection-closed-reason connection))
+            cl-quic-kit::+max-quic-close-reason-size+)
+         "connection close reason truncates above the maximum UTF-8 size"))
+(let ((connection (cl-quic-kit:make-quic-connection :now-fn (lambda () 0))))
+  (cl-quic-kit:connection-close
+   connection :no-error
+   (concatenate 'string
+                (make-string (- cl-quic-kit::+max-quic-close-reason-size+ 1)
+                             :initial-element #\a)
+                "é"))
+  (check (= (length (cl-quic-kit::quic-connection-closed-reason connection))
+            (1- cl-quic-kit::+max-quic-close-reason-size+))
+         "connection close reason does not split UTF-8 characters"))
+(dolist (case '((2 #(195 169) #\é)
+                (3 #(226 130 172) #\€)
+                (4 #(240 144 144 128) #\𐀀)))
+  (destructuring-bind (width character string-character) case
+    (loop for cut from 1 below width
+          for prefix-length = (- cl-quic-kit::+max-quic-close-reason-size+ cut)
+          for reason = (concatenate '(vector (unsigned-byte 8))
+                                    (make-array prefix-length
+                                                :element-type '(unsigned-byte 8)
+                                                :initial-element #x61)
+                                    (subseq character 0 cut))
+          for output = (cl-quic-kit::%connection-reason-octets reason)
+          do (check (= (length output) prefix-length)
+                    "raw close reason drops every incomplete UTF-8 suffix")
+             (check (strict-utf8-p output)
+                    "raw close reason has a strict UTF-8 prefix"))
+    (let* ((prefix-length (- cl-quic-kit::+max-quic-close-reason-size+ width))
+           (reason (concatenate '(vector (unsigned-byte 8))
+                                (make-array prefix-length
+                                            :element-type '(unsigned-byte 8)
+                                            :initial-element #x61)
+                                character))
+           (output (cl-quic-kit::%connection-reason-octets reason)))
+      (check (= (length output) cl-quic-kit::+max-quic-close-reason-size+)
+             "raw close reason keeps a character complete at the limit")
+      (check (strict-utf8-p output)
+             "raw close reason boundary output is strict UTF-8"))
+    (loop for cut from 1 below width
+          for prefix-length = (- cl-quic-kit::+max-quic-close-reason-size+ cut)
+          for reason = (concatenate 'string
+                                    (make-string prefix-length :initial-element #\a)
+                                    (string string-character))
+          for output = (cl-quic-kit::%connection-reason-octets reason)
+          do (check (= (length output) prefix-length)
+                    "string close reason drops every oversized UTF-8 character")
+             (check (strict-utf8-p output)
+                    "string close reason has a strict UTF-8 prefix"))
+    (let* ((prefix-length (- cl-quic-kit::+max-quic-close-reason-size+ width))
+           (reason (concatenate 'string
+                                (make-string prefix-length :initial-element #\a)
+                                (string string-character)))
+           (output (cl-quic-kit::%connection-reason-octets reason)))
+      (check (= (length output) cl-quic-kit::+max-quic-close-reason-size+)
+             "string close reason keeps a character complete at the limit")
+      (check (strict-utf8-p output)
+             "string close reason boundary output is strict UTF-8"))))
+(dolist (invalid '((#x80 #xbf #x80)
+                   (#xc0 #x80)
+                   (#xe0 #x80 #x80)
+                   (#xed #xa0 #x80)
+                   (#xf0 #x80 #x80 #x80)
+                   (#xf4 #x90 #x80 #x80)
+                   (#xe2 #x28 #xa1)))
+  (let* ((prefix (make-array 9 :element-type '(unsigned-byte 8) :initial-element #x61))
+         (reason (concatenate '(vector (unsigned-byte 8)) prefix invalid))
+         (output (cl-quic-kit::%connection-reason-octets reason)))
+    (check (= (length output) (length prefix))
+           "raw close reason stops before invalid UTF-8")
+    (check (strict-utf8-p output)
+           "invalid raw close reason still returns strict UTF-8")))
+(let ((rejected nil))
+  (handler-case
+      (cl-quic-kit:decode-frame
+       (concatenate '(vector (unsigned-byte 8))
+                    (cl-quic-kit:encode-varint #x06)
+                    (cl-quic-kit:encode-varint 0)
+                    (cl-quic-kit:encode-varint 0)))
+    (cl-quic-kit:quic-encoding-error () (setf rejected t)))
+  (check (not rejected) "zero-length CRYPTO frame is accepted"))
+(let ((rejected nil))
+  (handler-case
+      (cl-quic-kit:decode-frame
+       (concatenate '(vector (unsigned-byte 8))
+                    (cl-quic-kit:encode-varint #x06)
+                    (cl-quic-kit:encode-varint 0)
+                    (cl-quic-kit:encode-varint (1- (ash 1 62)))
+                    #(1)))
+    (cl-quic-kit:quic-encoding-error () (setf rejected t)))
+  (check rejected "frame length beyond remaining bytes is rejected"))
+(let* ((frame (cl-quic-kit:make-frame :ping))
+       (decoded (cl-quic-kit:decode-frame (cl-quic-kit:encode-frame frame))))
+  (check (eq (cl-quic-kit:frame-type decoded) :ping) "PING frame round trip"))
+(let* ((dcid (make-array 4 :element-type '(unsigned-byte 8) :initial-contents '(1 2 3 4)))
+       (scid (make-array 3 :element-type '(unsigned-byte 8) :initial-contents '(5 6 7)))
+       (token (make-array 2 :element-type '(unsigned-byte 8) :initial-contents '(8 9)))
+       (payload (make-array 3 :element-type '(unsigned-byte 8) :initial-contents '(10 11 12)))
+       (header (cl-quic-kit:make-packet-header
+                :type :initial :version cl-quic-kit:*quic-version-1*
+                :destination-connection-id dcid :source-connection-id scid
+                :token token :packet-number #x1234 :packet-number-length 2 :payload payload))
+       (encoded (cl-quic-kit:encode-packet-header header)))
+  (multiple-value-bind (decoded end) (cl-quic-kit:decode-packet-header encoded)
+    (check (and (= end (length encoded)) (= (cl-quic-kit:packet-header-version decoded) 1)
+                (= (cl-quic-kit:packet-header-packet-number decoded) #x1234)
+                (equalp (cl-quic-kit:packet-header-payload decoded) payload))
+           "long header packet round trip")))
+(let* ((dcid (make-array 2 :element-type '(unsigned-byte 8) :initial-contents '(1 2)))
+       (payload (make-array 2 :element-type '(unsigned-byte 8) :initial-contents '(3 4)))
+       (header (cl-quic-kit:make-packet-header
+                :type :short :destination-connection-id dcid :packet-number #x7f
+                :reserved-bits 3 :key-phase t :payload payload))
+       (encoded (cl-quic-kit:encode-packet-header header)))
+  (multiple-value-bind (decoded end)
+      (cl-quic-kit:decode-packet-header encoded :short-header-dcid-length 2)
+    (check (and (= end (length encoded)) (= (cl-quic-kit:packet-header-reserved-bits decoded) 3)
+                (cl-quic-kit:packet-header-key-phase decoded)
+                (equalp (cl-quic-kit:packet-header-payload decoded) payload))
+           "short header packet round trip")))
+(let* ((tag (make-array 16 :element-type '(unsigned-byte 8) :initial-element #xaa))
+       (header (cl-quic-kit:make-packet-header
+                :type :retry :version 1 :destination-connection-id #() :source-connection-id #(1)
+                :token #(2 3) :retry-integrity-tag tag))
+       (decoded (multiple-value-list
+                 (cl-quic-kit:decode-packet-header
+                  (cl-quic-kit:encode-packet-header header)))))
+  (check (and (equalp (cl-quic-kit:packet-header-token (first decoded)) #(2 3))
+              (equalp (cl-quic-kit:packet-header-retry-integrity-tag (first decoded)) tag))
+         "Retry packet preserves token and integrity tag"))
+(let* ((encoded (cl-quic-kit:encode-version-negotiation #(1 2) #(3) '(1 #x6b3343cf)))
+       (decoded (cl-quic-kit:decode-version-negotiation encoded)))
+  (check (equal (getf decoded :versions) '(1 #x6b3343cf))
+         "Version Negotiation round trip"))
+(let* ((parameters '((1 . 30) (4 . 1200) (0 . #(1 2)) (12 . #())))
+       (decoded (cl-quic-kit:decode-transport-parameters
+                 (cl-quic-kit:encode-transport-parameters parameters))))
+  (check (equalp decoded parameters) "transport parameter integer and opaque values round trip"))
+(let* ((frame (cl-quic-kit:make-frame :ack-ecn :largest-acknowledged 10 :ack-delay 2
+                                      :ranges (list (cons 10 2) (list :gap 1 :range-length 1))
+                                      :ect0 3 :ect1 4 :ecn-ce 5))
+       (decoded (cl-quic-kit:decode-frame (cl-quic-kit:encode-frame frame))))
+  (check (and (eq (cl-quic-kit:frame-type decoded) :ack-ecn)
+              (= (cl-quic-kit:frame-field decoded :ect0) 3)
+              (= (length (cl-quic-kit:frame-field decoded :ranges)) 2))
+         "ACK ECN ranges round trip"))
+(let* ((encoded (cl-quic-kit:encode-frames
+                 (list (cl-quic-kit:make-frame :padding :count 3)
+                       (cl-quic-kit:make-frame :application-close :error-code 7 :reason #(1 2)))))
+       (decoded (cl-quic-kit:decode-frames encoded)))
+  (check (and (= (cl-quic-kit:frame-field (first decoded) :count) 3)
+              (eq (cl-quic-kit:frame-type (second decoded)) :application-close))
+         "PADDING and application close frames round trip"))
+(let* ((stream (cl-quic-kit:make-stream 0 :local-initiator :client))
+       (payload (make-array 3 :element-type '(unsigned-byte 8)
+                            :initial-contents '(1 2 3))))
+  (cl-quic-kit:stream-receive-data stream 0 payload :fin t)
+  (multiple-value-bind (data fin) (cl-quic-kit:stream-read stream)
+    (check (and fin (equalp data payload)) "ordered stream data and FIN")))
+(let ((clock 0) (connection nil))
+  (setf connection (cl-quic-kit:make-quic-connection
+                    :now-fn (lambda () clock) :idle-timeout 10))
+  (cl-quic-kit:connection-set-state connection :established)
+  (setf clock 10)
+  (check (cl-quic-kit:connection-check-idle-timeout connection clock)
+         "idle timeout closes established connection"))
+(let ((clock 0) (writes nil)
+      (cid (make-array 8 :element-type '(unsigned-byte 8) :initial-element 1)))
+  (let ((connection (cl-quic-kit:make-quic-connection
+                    :local-connection-id cid :now-fn (lambda () clock)
+                    :active-connection-id-limit 2
+                    :io-write (lambda (connection bytes)
+                                (declare (ignore connection))
+                                (push bytes writes)))))
+    (check (= (length (cl-quic-kit:connection-local-connection-ids connection)) 1)
+           "the original connection ID is active")
+    (cl-quic-kit:connection-handle-new-connection-id
+     connection 1 (make-array 8 :element-type '(unsigned-byte 8) :initial-element 2))
+    (check (= (length (cl-quic-kit:connection-remote-connection-ids connection)) 1)
+           "NEW_CONNECTION_ID is tracked")
+    (cl-quic-kit:connection-handle-new-connection-id
+     connection 2 (make-array 8 :element-type '(unsigned-byte 8) :initial-element 3))
+    (cl-quic-kit:connection-handle-new-connection-id
+     connection 3 (make-array 8 :element-type '(unsigned-byte 8) :initial-element 4))
+    (check (eq (cl-quic-kit:connection-state connection) :closing)
+           "active connection ID limit starts a transport close")
+    (check (= (length writes) 1) "transport close is written through injected I/O")))
+(let ((writes nil)
+      (cid (make-array 8 :element-type '(unsigned-byte 8) :initial-element 1)))
+  (let ((connection (cl-quic-kit:make-quic-connection
+                    :local-connection-id cid
+                    :io-write (lambda (connection bytes)
+                                (declare (ignore connection))
+                                (push bytes writes)))))
+    (cl-quic-kit:connection-handle-new-connection-id
+     connection 1 (make-array 8 :element-type '(unsigned-byte 8) :initial-element 2)
+     :retire-prior-to 2)
+    (check (null (cl-quic-kit:connection-remote-connection-ids connection))
+           "NEW_CONNECTION_ID retires IDs below Retire Prior To before adding")
+    (check (= (length writes) 1)
+           "a NEW_CONNECTION_ID below Retire Prior To is retired on receipt")
+    (cl-quic-kit:connection-handle-new-connection-id
+     connection 1 (make-array 8 :element-type '(unsigned-byte 8) :initial-element 3)
+     :retire-prior-to 2)
+    (check (eq (cl-quic-kit:connection-state connection) :closing)
+           "reusing a connection ID sequence with a different ID closes the connection")))
+(let ((clock 0) (writes nil))
+  (let ((connection (cl-quic-kit:make-quic-connection
+                    :now-fn (lambda () clock) :idle-timeout 10
+                    :io-write (lambda (connection bytes)
+                                (declare (ignore connection))
+                                (push bytes writes)))))
+    (cl-quic-kit:connection-set-state connection :established)
+    (cl-quic-kit:connection-close connection 42 "終了")
+    (check (eq (cl-quic-kit:connection-state connection) :closing)
+           "CONNECTION_CLOSE enters closing")
+    (check (equalp (cl-quic-kit::quic-connection-closed-reason connection)
+                   #(231 181 130 228 186 134))
+           "connection close stores a non-ASCII UTF-8 reason")
+    (check (= (length writes) 1) "CONNECTION_CLOSE uses injected output")
+    (cl-quic-kit:connection-receive-frame
+     connection (cl-quic-kit:make-frame :application-close :error-code 7 :reason #()))
+    (check (eq (cl-quic-kit:connection-state connection) :draining)
+           "peer application close enters draining")
+    (setf clock 30)
+    (check (cl-quic-kit:connection-poll connection clock)
+           "draining deadline closes the connection")))
+(let ((connection (cl-quic-kit:make-quic-connection :now-fn (lambda () 0)))
+      (bad-packet (make-array 1 :element-type '(unsigned-byte 8) :initial-element 255)))
+  (check (null (cl-quic-kit:connection-receive-packet connection bad-packet))
+         "malformed packet is rejected")
+  (check (eq (cl-quic-kit:connection-state connection) :closing)
+         "malformed packet schedules CONNECTION_CLOSE"))
+(let ((state (cl-quic-kit.recovery:make-recovery-state :clock (lambda () 0))))
+  (cl-quic-kit.recovery:on-packet-received state :initial 1)
+  (check (cl-quic-kit.recovery:ack-needed-p state :initial :now 0)
+         "ack eliciting packet schedules ACK"))
+(let ((state (cl-quic-kit.recovery:make-recovery-state :clock (lambda () 0))))
+  (cl-quic-kit.recovery:record-sent-packet state :application 1 1200 :sent-at 0)
+  (multiple-value-bind (acked lost)
+      (cl-quic-kit.recovery:on-ack-frame state :application 1 '((1 1))
+                                         :received-at 1/10)
+    (check (and (= (length acked) 1) (null lost))
+           "ACK acknowledges the largest sent packet")
+    (check (and (= (cl-quic-kit.recovery:recovery-state-latest-rtt state) 1/10)
+                (= (cl-quic-kit.recovery:recovery-state-smoothed-rtt state) 1/10)
+                (= (cl-quic-kit.recovery:recovery-state-rtt-variance state) 1/20)
+                (= (cl-quic-kit.recovery:recovery-state-min-rtt state) 1/10))
+           "first ACK initializes RTT sample state")))
+(let ((state (cl-quic-kit.recovery:make-recovery-state :clock (lambda () 0))))
+  (dotimes (number 4)
+    (cl-quic-kit.recovery:record-sent-packet state :application (1+ number) 1200
+                                             :sent-at 0))
+  (multiple-value-bind (acked lost)
+      (cl-quic-kit.recovery:on-ack-frame state :application 4 '((4 4))
+                                         :received-at 0)
+    (check (= (length acked) 1) "packet threshold ACK keeps the largest packet")
+    (check (= (length lost) 1) "packet threshold marks packet three numbers behind lost")))
+(let ((state (cl-quic-kit.recovery:make-recovery-state :clock (lambda () 1))))
+  (cl-quic-kit.recovery:record-sent-packet state :application 1 1200 :sent-at 0)
+  (cl-quic-kit.recovery:record-sent-packet state :application 2 1200
+                                           :ack-eliciting-p nil :in-flight-p nil
+                                           :sent-at 0)
+  (cl-quic-kit.recovery:on-ack-frame state :application 2 '((2 2))
+                                     :received-at 0)
+  (check (= (cl-quic-kit.recovery:loss-timeout state :application)
+            (* 9/8 333/1000))
+         "loss timeout exposes the earliest time-threshold deadline"))
+(let ((state (cl-quic-kit.recovery:make-recovery-state :clock (lambda () 0))))
+  (cl-quic-kit.recovery:record-sent-packet state :application 1 1200 :sent-at 0
+                                           :ack-eliciting-p nil :in-flight-p nil)
+  (check (null (cl-quic-kit.recovery:pto-deadline state :application))
+         "non-ack-eliciting packets do not arm PTO")
+  (cl-quic-kit.recovery:record-sent-packet state :application 2 1200 :sent-at 0)
+  (check (= (cl-quic-kit.recovery:pto-deadline state :application) (* 2 333/1000))
+         "initial PTO uses twice the initial RTT")
+  (let ((probe (cl-quic-kit.recovery:on-pto-expired state)))
+    (check (and (= (getf probe :probe-count) 2)
+                (= (getf probe :pto-count) 1))
+           "PTO expiry requests two probe packets"))
+  (check (= (cl-quic-kit.recovery:pto-deadline state :application)
+            (+ (* 2 333/1000) (* 2 333/1000)))
+         "PTO deadline doubles after an expiry"))
+(let ((state (cl-quic-kit.recovery:make-recovery-state :clock (lambda () 4))))
+  (cl-quic-kit.recovery:record-sent-packet state :application 0 1200 :sent-at 0)
+  (cl-quic-kit.recovery:on-ack-frame state :application 0 '((0 0))
+                                     :received-at 1/10)
+  (dotimes (number 3)
+    (cl-quic-kit.recovery:record-sent-packet state :application (1+ number) 1200
+                                             :sent-at number))
+  (cl-quic-kit.recovery:record-sent-packet state :application 4 1200
+                                           :ack-eliciting-p nil :in-flight-p nil
+                                           :sent-at 3)
+  (multiple-value-bind (acked lost)
+      (cl-quic-kit.recovery:on-ack-frame state :application 4 '((4 4))
+                                         :received-at 4)
+    (declare (ignore acked))
+    (check (= (length lost) 3) "time-threshold loss reports all overdue packets")
+    (check (cl-quic-kit.recovery:recovery-state-persistent-congestion-p state)
+           "a loss span of three PTOs enters persistent congestion")
+    (check (= (cl-quic-kit.recovery:recovery-state-cwnd state) 2400)
+           "persistent congestion reduces cwnd to the minimum window")))
+(let ((state (cl-quic-kit.recovery:make-recovery-state :clock (lambda () 0)
+                                                        :initial-cwnd 12000)))
+  (check (= (progn (cl-quic-kit.recovery:newreno-on-ack state 1200) 13200)
+            (cl-quic-kit.recovery:recovery-state-cwnd state))
+         "NewReno slow start increases cwnd by acknowledged bytes")
+  (cl-quic-kit.recovery:newreno-on-loss state :at 1)
+  (check (and (= (cl-quic-kit.recovery:recovery-state-cwnd state) 6600)
+              (= (cl-quic-kit.recovery:recovery-state-ssthresh state) 6600))
+         "NewReno loss enters congestion avoidance at half cwnd")
+  (cl-quic-kit.recovery:newreno-on-ack state 1200 :sent-at 1)
+  (check (= (cl-quic-kit.recovery:recovery-state-cwnd state) 6600)
+         "ACKs for pre-recovery packets do not grow cwnd")
+  (cl-quic-kit.recovery:newreno-on-ack state 1200 :sent-at 2)
+  (check (= (cl-quic-kit.recovery:recovery-state-cwnd state) 6818)
+         "NewReno congestion avoidance grows cwnd by MSS squared over cwnd"))
+(let ((state (cl-quic-kit.recovery:make-recovery-state :clock (lambda () 0))))
+  (cl-quic-kit.recovery:record-sent-packet state :application 0 1200 :sent-at 0)
+  (cl-quic-kit.recovery:record-sent-packet state :application 1 1200 :sent-at 0)
+  (cl-quic-kit.recovery:record-sent-packet state :application 2 1200 :sent-at 0)
+  (multiple-value-bind (acked lost)
+      (cl-quic-kit.recovery:on-ack-frame state :application 2 '((2 2))
+                                         :received-at 1/10)
+    (check (and (= (length acked) 1) (null lost))
+           "ACK leaves below-threshold packets for time loss detection"))
+  (multiple-value-bind (lost deadline)
+      (cl-quic-kit.recovery:on-loss-timeout state :application :now 1)
+    (check (and deadline (= (length lost) 2))
+           "time-threshold loss removes and returns expired packets")))
+(load (test-path "t/protection.lisp"))
+(let ((socket (cl-quic-kit:make-udp-socket :local-host "127.0.0.1"
+                                            :local-port 0)))
+  (unwind-protect
+       (multiple-value-bind (data length address)
+           (cl-quic-kit:udp-receive socket)
+         (check (and (null data) (null length) (null address))
+                "non-blocking UDP receive reports no datagram cleanly"))
+    (cl-quic-kit:udp-close socket)))
+(load (test-path "t/client.lisp"))
+
+(let* ((client (cl-quic-kit:make-quic-client
+               :disable-hostname-verification-p t))
+       (control (cl-quic-kit:client-open-stream client nil :stream-type :control)))
+  (check (= (cl-quic-kit::stream-send-offset control) 1)
+         "HTTP/3 unidirectional stream reserves its type byte"))
+
+(let ((client (cl-quic-kit:make-quic-client
+               :disable-hostname-verification-p t)))
+  (setf (cl-quic-kit::quic-client-received-packets client)
+        (list (cons :1-rtt '(6 5 3 2))))
+  (let ((frame (cl-quic-kit::%client-ack-frame client :1-rtt)))
+    (check (equal (cl-quic-kit:frame-field frame :ranges)
+                  '((6 . 1) (:gap 0 :range-length 1)))
+           "ACK encodes the gap between disjoint packet ranges")))
+
+(let ((client (cl-quic-kit:make-quic-client
+               :disable-hostname-verification-p t)))
+  (setf (cl-quic-kit::quic-client-received-packets client)
+        (list (cons :1-rtt '(5 131071 6))))
+  (check (= (cl-quic-kit::%client-largest-received-packet-number client :1-rtt)
+            131071)
+         "packet number reconstruction uses the largest received packet"))
+
+(check (= (cl-quic-kit::%client-packet-number-length 255 nil) 1)
+         "packet number uses one byte at the lower boundary")
+(check (= (cl-quic-kit::%client-packet-number-length 256 nil) 2)
+         "packet number uses two bytes at the one-byte boundary")
+(check (= (cl-quic-kit::%client-packet-number-length 65536 0) 3)
+         "packet number uses three bytes when twice the acknowledged range crosses 16 bits")
+(check (= (cl-quic-kit::%client-packet-number-length 485 254) 2)
+         "packet number length also represents the full packet number")
+
+(let ((client (cl-quic-kit:make-quic-client
+               :disable-hostname-verification-p t)))
+  (setf (cl-quic-kit::quic-client-application-read-old-key client) :old
+        (cl-quic-kit::quic-client-application-read-key-update-packet-number client) 7
+        (cl-quic-kit::quic-client-application-read-old-key-retire-at client) 1)
+  (cl-quic-kit::%client-discard-expired-read-key client 1)
+  (check (and (null (cl-quic-kit::quic-client-application-read-old-key client))
+              (null (cl-quic-kit::quic-client-application-read-key-update-packet-number client)))
+         "old read keys are discarded at the retirement deadline"))
+
+(check (eq (cl-quic-kit::%client-crypto-signature-scheme
+            :ecdsa-secp256r1-sha256)
+           :ecdsa-p256-sha256)
+       "TLS ECDSA scheme is normalized at the client provider boundary")
+
+(defun %client-test-octets (values)
+  (make-array (length values) :element-type '(unsigned-byte 8)
+              :initial-contents values))
+
+(define-condition test-wire-captured (error)
+  ((bytes :initarg :bytes :reader test-wire-captured-bytes)))
+
+(let ((caught nil))
+  (handler-case
+      (cl-quic-kit:make-quic-client
+       :disable-hostname-verification-p nil)
+    (cl-quic-kit:hostname-required () (setf caught t)))
+  (check caught "client construction rejects an omitted hostname by default"))
+
+(let* ((symbol (find-symbol "RANDOM-OCTETS" "CRYPTO-KIT"))
+       (original (and symbol (fboundp symbol) (symbol-function symbol)))
+       (caught nil))
+  (unwind-protect
+       (progn
+         (setf (symbol-function symbol)
+               (lambda (length)
+                 (declare (ignore length))
+                 (error "test CSPRNG failure")))
+         (handler-case
+             (cl-quic-kit:make-quic-client
+              :disable-hostname-verification-p t)
+           (cl-quic-kit:randomness-unavailable () (setf caught t))))
+    (if original
+        (setf (symbol-function symbol) original)
+        (fmakunbound symbol)))
+  (check caught "client aborts when its CSPRNG fails"))
+
+(let ((caught nil))
+  (let ((cl-quic-kit.protection::*hkdf-extract* nil))
+    (handler-case
+        (cl-quic-kit:make-quic-client
+         :local-connection-id (%client-test-octets '(1 2 3 4 5 6 7 8))
+         :destination-connection-id (%client-test-octets '(9 10 11 12 13 14 15 16))
+         :disable-hostname-verification-p t)
+      (cl-quic-kit.protection:crypto-not-implemented () (setf caught t))))
+  (check caught "initial secret derivation reports unavailable crypto"))
+
+(multiple-value-bind (symbol status)
+    (find-symbol "QUIC-CLIENT-TLS-SECRETS" "CL-QUIC-KIT")
+  (declare (ignore symbol))
+  (check (not (eq status :external))
+         "TLS traffic secrets are not exposed as a public accessor"))
+
+(let ((wire nil)
+      (client (cl-quic-kit:make-quic-client
+               :local-connection-id (%client-test-octets '(17 18 19 20 21 22 23 24))
+               :destination-connection-id (%client-test-octets '(25 26 27 28 29 30 31 32))
+               :disable-hostname-verification-p t
+               :io-write (lambda (connection bytes)
+                           (declare (ignore connection))
+                           (error 'test-wire-captured :bytes bytes)))))
+  (setf (cl-quic-kit::quic-client-keys client) nil)
+  (handler-case
+      (cl-quic-kit::%client-protocol-close client 7 "private implementation detail")
+    (test-wire-captured (condition)
+      (setf wire (test-wire-captured-bytes condition))))
+  (check (and wire
+              (equalp (cl-quic-kit:frame-field
+                       (cl-quic-kit:decode-frame wire) :reason)
+                      #(112 114 105 118 97 116 101 32 105 109 112 108 101 109 101 110 116 97 116 105 111 110 32 100 101 116 97 105 108)))
+         "protocol close carries its UTF-8 reason"))
+
+(let ((wire nil)
+      (client (cl-quic-kit:make-quic-client
+               :local-connection-id (%client-test-octets '(17 18 19 20 21 22 23 24))
+               :destination-connection-id (%client-test-octets '(25 26 27 28 29 30 31 32))
+               :disable-hostname-verification-p t
+               :io-write (lambda (connection bytes)
+                           (declare (ignore connection))
+                           (error 'test-wire-captured :bytes bytes)))))
+  (setf (cl-quic-kit::quic-client-keys client) nil)
+  (handler-case
+      (cl-quic-kit:client-close client :error-code 7 :reason "終了")
+    (test-wire-captured (condition)
+      (setf wire (test-wire-captured-bytes condition))))
+  (let ((reason (cl-quic-kit:frame-field
+                 (cl-quic-kit:decode-frame wire) :reason)))
+    (check (equalp reason #(231 181 130 228 186 134))
+           "client close sends a non-ASCII UTF-8 reason")))
+
+(let* ((destination (%client-test-octets '(16 17 18 19 20 21 22 23)))
+       (sender-id (%client-test-octets '(32 33 34 35 36 37 38 39)))
+       (receiver-id (%client-test-octets '(48 49 50 51 52 53 54 55)))
+       (wire nil)
+       (ack-wire nil)
+       (sender (cl-quic-kit:make-quic-client
+                :local-connection-id sender-id
+                :destination-connection-id destination
+                :hostname "localhost"
+                :io-write (lambda (connection bytes)
+                            (declare (ignore connection))
+                            (setf wire bytes))
+                :now-fn (lambda () 0)))
+       (receiver (cl-quic-kit:make-quic-client
+                  :local-connection-id receiver-id
+                  :destination-connection-id destination
+                  :disable-hostname-verification-p t
+                  :io-write (lambda (connection bytes)
+                              (declare (ignore connection))
+                              (setf ack-wire bytes))
+                  :now-fn (lambda () 0))))
+  (cl-quic-kit:client-start sender)
+  (check (and wire (>= (length wire) 1200))
+         "client-start emits a protected Initial packet of at least 1200 octets")
+  (cl-quic-kit::%client-set-key
+   receiver :initial :read (cl-quic-kit::%client-key sender :initial :write))
+  (cl-quic-kit::%client-set-key
+   receiver :initial :write (cl-quic-kit::%client-key sender :initial :read))
+  (check (cl-quic-kit:client-receive-datagram receiver wire)
+         "peer decrypts the protected Initial packet")
+  (setf wire nil ack-wire nil)
+  (cl-quic-kit:client-poll receiver 0)
+  (check ack-wire "peer emits an ACK packet after receiving an ack-eliciting Initial")
+  (check (cl-quic-kit:client-receive-datagram sender ack-wire)
+         "client decrypts the Initial ACK")
+  (setf ack-wire nil)
+  (cl-quic-kit:client-poll receiver 0)
+  (check (null ack-wire) "an ACK is not retransmitted after being sent")
+
+  (let ((handshake-secret
+          (%client-test-octets
+           '(96 97 98 99 100 101 102 103 104 105 106 107 108 109 110 111
+             112 113 114 115 116 117 118 119 120 121 122 123 124 125 126 127)))
+        (application-secret
+          (%client-test-octets
+           '(64 65 66 67 68 69 70 71 72 73 74 75 76 77 78 79
+             80 81 82 83 84 85 86 87 88 89 90 91 92 93 94 95))))
+    (cl-quic-kit::%client-set-key
+     sender :handshake :write
+     (cl-quic-kit.protection:make-key-set handshake-secret))
+    (cl-quic-kit::%client-set-key
+     receiver :handshake :read
+     (cl-quic-kit::%client-key sender :handshake :write))
+    (cl-quic-kit::%client-set-key
+     receiver :handshake :write
+     (cl-quic-kit::%client-key sender :handshake :write))
+    (cl-quic-kit::%client-set-key
+     sender :handshake :read
+     (cl-quic-kit::%client-key receiver :handshake :write))
+    (setf wire nil)
+    (cl-quic-kit::%client-queue-frame sender (cl-quic-kit:make-frame :ping)
+                                      :handshake)
+    (cl-quic-kit:client-flush sender)
+    (check wire "client encrypts a Handshake packet")
+    (check (cl-quic-kit:client-receive-datagram receiver wire)
+           "peer decrypts the Handshake packet")
+    (setf ack-wire nil)
+    (cl-quic-kit:client-poll receiver 0)
+    (check ack-wire "peer emits an ACK packet after receiving a Handshake packet")
+    (check (cl-quic-kit:client-receive-datagram sender ack-wire)
+           "client decrypts the Handshake ACK")
+
+    (cl-quic-kit::%client-set-key
+     sender :1-rtt :write
+     (cl-quic-kit.protection:make-key-set application-secret))
+    (cl-quic-kit::%client-set-key
+     receiver :1-rtt :read
+     (cl-quic-kit::%client-key sender :1-rtt :write))
+    (let* ((stream (cl-quic-kit:client-open-stream sender nil))
+           (request (%client-test-octets
+                     '(71 69 84 32 47 32 72 84 84 80 47 51 10))))
+      (cl-quic-kit:client-write-stream sender stream request :fin-p t)
+      (setf wire nil)
+      (cl-quic-kit:client-flush sender)
+      (check wire "client encrypts a 1-RTT STREAM packet")
+      (setf wire nil)
+      (cl-quic-kit:client-poll sender (* 2 333/1000))
+      (check wire "PTO sends a protected 1-RTT probe after the stream packet is dropped")
+      (check (cl-quic-kit:client-receive-datagram receiver wire)
+             "peer decrypts the 1-RTT PTO probe with retransmitted stream data")
+      (let ((peer-stream (gethash 0 (cl-quic-kit::quic-client-streams receiver))))
+        (multiple-value-bind (data fin)
+            (cl-quic-kit:client-read-stream receiver peer-stream)
+          (check (and (equalp data request) fin)
+                 "PTO retransmission preserves stream data and FIN")))))
+
+  (let ((idle-wire nil))
+    (let ((idle-client
+            (cl-quic-kit:make-quic-client
+            :local-connection-id sender-id
+            :destination-connection-id destination
+             :disable-hostname-verification-p t
+             :idle-timeout 5
+             :io-write (lambda (connection bytes)
+                         (declare (ignore connection))
+                         (setf idle-wire bytes))
+             :now-fn (lambda () 0))))
+      (cl-quic-kit:client-poll idle-client 5)
+      (check (and (cl-quic-kit::quic-client-closed-p idle-client) idle-wire)
+             "idle timeout emits a protected CONNECTION_CLOSE")))
+
+  (let* ((vn (cl-quic-kit:encode-version-negotiation
+              sender-id destination (list cl-quic-kit:*quic-version-1* #x6b3343cf)))
+         (bad (make-array 1 :element-type '(unsigned-byte 8) :initial-element #xff)))
+    (check (null (cl-quic-kit:client-receive-datagram sender vn))
+           "client accepts Version Negotiation advertising QUIC v1")
+    (cl-quic-kit:client-receive-datagram receiver bad)
+    (check (and (cl-quic-kit::quic-client-closed-p receiver)
+                (eq (cl-quic-kit:connection-state
+                     (cl-quic-kit::quic-client-connection receiver))
+                    :closing)
+                ack-wire)
+           "malformed packet transitions the client to protocol close"))
+
+  (let ((mismatched (cl-quic-kit:make-quic-client
+                     :local-connection-id sender-id
+                     :destination-connection-id destination
+                     :disable-hostname-verification-p t)))
+    (cl-quic-kit:client-receive-datagram
+     mismatched
+     (cl-quic-kit:encode-version-negotiation
+      receiver-id destination (list cl-quic-kit:*quic-version-1*)))
+    (check (cl-quic-kit:quic-client-closed-p mismatched)
+           "Version Negotiation for another connection is rejected"))
+
+  (let* ((retry-token (%client-test-octets '(6 7)))
+         (retry-scid (%client-test-octets '(80 81 82 83 84 85 86 87)))
+         (zero-tag (make-array 16 :element-type '(unsigned-byte 8)
+                               :initial-element 0))
+         (without-tag
+           (cl-quic-kit:encode-packet-header
+            (cl-quic-kit:make-packet-header
+             :type :retry :version cl-quic-kit:*quic-version-1*
+             :destination-connection-id sender-id
+             :source-connection-id retry-scid :token retry-token
+             :retry-integrity-tag zero-tag)))
+         (pseudo (subseq without-tag 0 (- (length without-tag) 16)))
+         (tag (cl-quic-kit:retry-integrity-tag
+               pseudo :original-destination-connection-id destination))
+         (retry
+           (cl-quic-kit:encode-packet-header
+            (cl-quic-kit:make-packet-header
+             :type :retry :version cl-quic-kit:*quic-version-1*
+             :destination-connection-id sender-id
+             :source-connection-id retry-scid :token retry-token
+             :retry-integrity-tag tag))))
+    (setf (cl-quic-kit::quic-client-closed-p sender) nil)
+    (check (null (cl-quic-kit:client-receive-datagram sender retry))
+           "client processes a valid Retry packet")
+    (check (and (equalp (cl-quic-kit::quic-client-retry-token sender) retry-token)
+                (equalp (cl-quic-kit::quic-client-remote-connection-id sender)
+                        retry-scid))
+           "Retry replaces the token and remote connection ID")
+    (check (zerop (or (cl-quic-kit::%client-level-value
+                       (cl-quic-kit::quic-client-packet-numbers sender) :initial)
+                      0))
+           "Retry resets the Initial packet number space")
+    (setf wire nil)
+    (cl-quic-kit:client-flush sender)
+    (check (and wire
+                (equalp (getf (cl-quic-kit::%client-layout wire) :token)
+                        retry-token))
+           "Retry retransmits ClientHello with the Retry token")
+    (let ((mismatched (cl-quic-kit:make-quic-client
+                       :local-connection-id sender-id
+                       :destination-connection-id destination
+                       :disable-hostname-verification-p t)))
+      (cl-quic-kit:client-receive-datagram
+       mismatched
+       (cl-quic-kit:encode-packet-header
+        (cl-quic-kit:make-packet-header
+         :type :retry :version cl-quic-kit:*quic-version-1*
+         :destination-connection-id receiver-id
+         :source-connection-id retry-scid :token retry-token
+         :retry-integrity-tag tag)))
+      (check (cl-quic-kit:quic-client-closed-p mismatched)
+             "Retry for another connection is rejected"))))
+(load (test-path "t/codec.lisp"))
+(load (test-path "t/state.lisp"))
+(load (test-path "t/recovery.lisp"))
+(load (test-path "t/stream-flow-control.lisp"))
+(load (test-path "t/client.lisp"))
+(format t "~D tests passed.~%" *tests-run*)
