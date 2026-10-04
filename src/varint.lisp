@@ -1,12 +1,14 @@
 (in-package #:cl-quic-kit)
 
-(define-condition quic-error (error) ())
-(define-condition quic-encoding-error (quic-error)
-  ((message :initarg :message :reader quic-error-message))
+(define-condition quic-error (error)
+  ((message :initarg :message :reader quic-error-message
+            :initform "QUIC error"))
   (:report (lambda (c s) (write-string (quic-error-message c) s))))
-(define-condition quic-crypto-error (quic-error)
-  ((message :initarg :message :reader quic-crypto-error-message))
-  (:report (lambda (c s) (write-string (quic-crypto-error-message c) s))))
+(define-condition quic-encoding-error (quic-error) ())
+(define-condition quic-crypto-error (quic-error) ())
+
+(defun quic-crypto-error-message (condition)
+  (quic-error-message condition))
 
 (defun ensure-octets (value)
   (unless (typep value '(simple-array (unsigned-byte 8) (*)))

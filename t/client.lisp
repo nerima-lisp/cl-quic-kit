@@ -21,6 +21,103 @@
                   (equalp (cl-quic-kit:frame-field frame :data) payload))
              "client stream writes are encoded through the injected connection I/O"))))
 
+(let* ((connection (cl-quic-kit:make-quic-connection))
+       (client (cl-quic-kit:make-quic-client
+                :connection connection
+                :local-connection-id (make-array 8 :element-type '(unsigned-byte 8))
+                :destination-connection-id (make-array 8 :element-type '(unsigned-byte 8))
+                :disable-hostname-verification-p t))
+       (stream (cl-quic-kit:client-open-stream client nil))
+       (message nil)
+       (report nil))
+  (cl-quic-kit:client-close-stream client stream)
+  (handler-case
+      (cl-quic-kit:client-write-stream
+       client stream (make-array 1 :element-type '(unsigned-byte 8)))
+    (cl-quic-kit:quic-error (condition)
+      (setf message (cl-quic-kit::quic-error-message condition)
+            report (princ-to-string condition))))
+  (check (and (string= message
+                       "Cannot write to a stream that is not registered with the client")
+               (string= report message))
+          "unregistered stream writes report an explicit QUIC error"))
+
+(let* ((connection (cl-quic-kit:make-quic-connection))
+       (client (cl-quic-kit:make-quic-client
+                :connection connection
+                :local-connection-id (make-array 8 :element-type '(unsigned-byte 8))
+                :destination-connection-id (make-array 8 :element-type '(unsigned-byte 8))
+                :disable-hostname-verification-p t))
+       (stream (cl-quic-kit:client-open-stream client nil))
+       (flow (cl-quic-kit::quic-client-flow-control client)))
+  (setf (cl-quic-kit::flow-control-state-connection-max-data flow) 0)
+  (cl-quic-kit:client-write-stream
+   client stream (make-array 1 :element-type '(unsigned-byte 8)))
+  (check (cl-quic-kit::quic-client-pending-stream-writes client)
+         "flow-limited stream writes remain pending before close")
+  (cl-quic-kit:client-close-stream client stream)
+  (cl-quic-kit:client-flush client)
+  (check (null (cl-quic-kit::quic-client-pending-stream-writes client))
+         "closing a stream drops its pending writes before a later flush"))
+
+(let* ((client (cl-quic-kit:make-quic-client
+                :connection (cl-quic-kit:make-quic-connection)
+                :local-connection-id (make-array 8 :element-type '(unsigned-byte 8))
+                :destination-connection-id (make-array 8 :element-type '(unsigned-byte 8))
+                :disable-hostname-verification-p t))
+       (stream (cl-quic-kit:client-open-stream client nil))
+       (replacement (cl-quic-kit:make-stream (cl-quic-kit:stream-id stream)
+                                             :local-initiator :client)))
+  (cl-quic-kit:client-close-stream client replacement)
+  (check (eq (gethash (cl-quic-kit:stream-id stream)
+                      (cl-quic-kit::quic-client-streams client))
+             stream)
+         "closing a different stream object does not remove the registered stream"))
+
+(let* ((writes nil)
+       (connection (cl-quic-kit:make-quic-connection
+                   :io-write (lambda (ignored bytes)
+                               (declare (ignore ignored))
+                               (push bytes writes))))
+       (client (cl-quic-kit:make-quic-client
+                :connection connection
+                :local-connection-id (make-array 8 :element-type '(unsigned-byte 8))
+                :destination-connection-id (make-array 8 :element-type '(unsigned-byte 8))
+                :disable-hostname-verification-p t))
+       (stream (cl-quic-kit:client-open-stream client nil))
+       (flow (cl-quic-kit::quic-client-flow-control client))
+       (size 524288)
+       (payload (make-array size :element-type '(unsigned-byte 8))))
+  (dotimes (index size)
+    (setf (aref payload index) (mod index 251)))
+  (setf (cl-quic-kit::flow-control-state-connection-max-data flow) 0)
+  (cl-quic-kit:client-write-stream client stream payload :fin-p t)
+  (cl-quic-kit:client-flush client)
+  (cl-quic-kit:flow-control-update-max-data flow size)
+  (cl-quic-kit:client-flush client)
+  (let* ((frames (remove-if-not
+                  (lambda (frame)
+                    (eq (cl-quic-kit:frame-type frame) :stream))
+                  (mapcar #'cl-quic-kit:decode-frame (reverse writes))))
+         (expected-offset 0)
+         (last-frame (car (last frames))))
+    (check (and frames
+                (every (lambda (frame)
+                        (let ((offset (cl-quic-kit:frame-field frame :offset))
+                              (data (cl-quic-kit:frame-field frame :data)))
+                          (prog1 (= offset expected-offset)
+                            (incf expected-offset (length data)))))
+                       frames)
+                (= expected-offset size)
+                (cl-quic-kit:frame-field last-frame :fin)
+                (equalp (apply #'concatenate '(vector (unsigned-byte 8))
+                               (mapcar (lambda (frame)
+                                         (cl-quic-kit:frame-field frame :data))
+                                       frames))
+                        payload)
+                (null (cl-quic-kit::quic-client-pending-stream-writes client)))
+           "a 524288-byte pending stream write resumes at its offset and preserves FIN")))
+
 (dolist (size '(65526 65527 65528 1048576 8388608))
   (let* ((writes nil)
          (connection (cl-quic-kit:make-quic-connection
