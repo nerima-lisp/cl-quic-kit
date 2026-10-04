@@ -34,6 +34,9 @@
                   :disable-hostname-verification-p t))
          (stream (cl-quic-kit:client-open-stream client nil))
          (payload (make-array size :element-type '(unsigned-byte 8))))
+    (setf (cl-quic-kit.recovery:recovery-state-cwnd
+           (cl-quic-kit::quic-client-recovery client))
+          most-positive-fixnum)
     (dotimes (index size)
       (setf (aref payload index) (mod index 251)))
     (cl-quic-kit:client-write-stream client stream payload :fin-p t)
@@ -89,6 +92,47 @@
                 (= (length (cl-quic-kit:frame-field (second frames) :data)) 6)
                 (cl-quic-kit:frame-field (second frames) :fin))
            "pending stream data resumes with the next offset and FIN")))
+
+(let* ((writes nil)
+       (connection (cl-quic-kit:make-quic-connection
+                   :io-write (lambda (ignored bytes)
+                               (declare (ignore ignored))
+                               (push bytes writes))))
+       (client (cl-quic-kit:make-quic-client
+                :connection connection
+                :local-connection-id (make-array 8 :element-type '(unsigned-byte 8))
+                :destination-connection-id (make-array 8 :element-type '(unsigned-byte 8))
+                :disable-hostname-verification-p t))
+       (secret (make-array 32 :element-type '(unsigned-byte 8)
+                           :initial-element 7)))
+  (cl-quic-kit::%client-set-key
+   client :1-rtt :write (cl-quic-kit.protection:make-key-set secret))
+  (setf (cl-quic-kit.recovery:recovery-state-cwnd
+         (cl-quic-kit::quic-client-recovery client))
+        1200)
+  (let ((stream (cl-quic-kit:client-open-stream client nil))
+        (payload (make-array 4096 :element-type '(unsigned-byte 8))))
+    (cl-quic-kit:client-write-stream client stream payload :fin-p t)
+    (cl-quic-kit:client-flush client)
+    (check (<= (cl-quic-kit.recovery:recovery-state-bytes-in-flight
+                (cl-quic-kit::quic-client-recovery client))
+               (cl-quic-kit.recovery:recovery-state-cwnd
+                (cl-quic-kit::quic-client-recovery client)))
+           "client flush does not exceed the congestion window")
+    (check (cl-quic-kit::quic-client-pending-frames client)
+           "congestion-window blocked stream packets remain queued")
+    (let ((writes-before-ack (length writes)))
+      (cl-quic-kit::%client-handle-ack
+       client :1-rtt
+       (cl-quic-kit:make-frame :ack
+                               :largest-acknowledged 0
+                               :ack-delay 0
+                               :ranges (list (cons 0 0))))
+      (cl-quic-kit:client-flush client)
+      (check (> (length writes) writes-before-ack)
+             "ACK frees the congestion window and resumes queued stream data")
+      (check (cl-quic-kit::quic-client-pending-frames client)
+             "ACK flush preserves packet groups after the blocked stream packet"))))
 
 (let* ((ranges (cons (cons 3000 0)
                     (loop repeat 700 collect (list :gap 0 :range-length 0))))
