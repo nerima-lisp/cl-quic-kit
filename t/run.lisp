@@ -519,6 +519,8 @@
 
 (check (= (cl-quic-kit::%client-packet-number-length 255 nil) 1)
          "packet number uses one byte at the lower boundary")
+(check (= (cl-quic-kit::%client-packet-number-length 128 0) 2)
+         "packet number uses two bytes when the unacknowledged range doubles")
 (check (= (cl-quic-kit::%client-packet-number-length 256 nil) 2)
          "packet number uses two bytes at the one-byte boundary")
 (check (= (cl-quic-kit::%client-packet-number-length 65536 0) 3)
