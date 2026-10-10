@@ -10,6 +10,7 @@
   flow-control
   initial-destination-connection-id remote-connection-id retry-token
   packet-numbers received-packets keys recovery sent-packets clock
+  (authentication-failures 0)
   pto-probe-budgets pto-probe-frames
   (application-read-key-phase 0)
   application-read-old-key application-read-next-key application-read-next-secret
@@ -545,6 +546,15 @@
     (dotimes (index length number)
       (setf number (+ (ash number 8) (aref bytes (+ at index)))))))
 
+(defun %client-authentication-failed (client key)
+  ;; RFC 9001 section 6.6 counts failures across the connection's keys.
+  (let ((failures (incf (quic-client-authentication-failures client)))
+        (limit (ecase (cl-quic-kit.protection:key-set-cipher key)
+                 ((:aes-128-gcm :aes-256-gcm) (expt 2 52))
+                 (:chacha20-poly1305 (expt 2 36)))))
+    (when (> failures limit)
+      (%client-protocol-close client #xf "QUIC AEAD integrity limit reached"))))
+
 (defun %client-unprotect-packet (client bytes layout)
   (let* ((type (getf layout :type))
          (level (case type (:initial :initial) (:handshake :handshake)
@@ -554,7 +564,7 @@
          (packet (subseq bytes 0 (getf layout :end))))
     (unless key (return-from %client-unprotect-packet nil))
     (when (< (length packet) (+ pn-offset 20))
-      (error 'quic-encoding-error :message "packet is too short for header protection"))
+      (return-from %client-unprotect-packet nil))
     (let* ((sample (subseq packet (+ pn-offset 4) (+ pn-offset 20)))
            (unmasked4 (cl-quic-kit.protection:remove-header-protection
                        key packet sample pn-offset 4 (getf layout :long-p)))
@@ -589,14 +599,22 @@
                     (let ((secret (quic-client-application-read-next-secret client))
                           (next-key (quic-client-application-read-next-key client)))
                       (unless (and secret next-key)
-                        (error 'quic-crypto-error
-                               :message "application key phase update unavailable"))
+                        (return-from %client-unprotect-packet nil))
                       (setf selected-key next-key)
                       (setf next-read-secret secret
                             next-read-key next-key)))))))
         (let ((plaintext
-                (cl-quic-kit.protection:unprotect-payload
-                 selected-key number ciphertext associated)))
+                (handler-case
+                    (cl-quic-kit.protection:unprotect-payload
+                     selected-key number ciphertext associated)
+                  (crypto-kit:aead-authentication-failure ()
+                    (%client-authentication-failed client selected-key)
+                    (return-from %client-unprotect-packet nil))))
+              (reserved-bits
+                (ldb (byte 2 (if (getf layout :long-p) 2 3)) first)))
+          (when (plusp reserved-bits)
+            (%client-protocol-close client #xa "QUIC packet has nonzero reserved bits")
+            (return-from %client-unprotect-packet nil))
           (when next-read-secret
             (%client-commit-application-read-key-update
              client next-read-secret next-read-key number)
@@ -608,7 +626,7 @@
                    :destination-connection-id (getf layout :dcid)
                    :source-connection-id (getf layout :scid)
                    :packet-number number :packet-number-length pn-length
-                   :reserved-bits (ldb (byte 2 2) first)
+                   :reserved-bits reserved-bits
                    :key-phase key-phase
                    :payload plaintext)))))))
 
@@ -864,6 +882,30 @@
             (<= smallest packet-number largest)))
         (%client-ack-intervals frame)))
 
+(defun %client-replenish-receive-credit (client consumed &optional stream)
+  (when (and (plusp consumed)
+             (not (quic-client-closed-p client))
+             (member (connection-state (quic-client-connection client))
+                     '(:handshaking :established)))
+    (let* ((flow (quic-client-flow-control client))
+           (connection-limit (flow-control-connection-receive-limit flow))
+           (connection-maximum
+             (min *quic-max-offset* (+ connection-limit consumed))))
+      (when stream
+        (incf (stream-receive-credit-returned stream) consumed))
+      (when (and stream (not (stream-receive-reset-p stream)))
+        (let* ((stream-limit (stream-receive-max-offset stream))
+               (stream-maximum (min *quic-max-offset* (+ stream-limit consumed))))
+          (when (> stream-maximum stream-limit)
+            (stream-set-max-receive-offset stream stream-maximum)
+            (%client-queue-frame
+             client (make-frame :max-stream-data :stream-id (stream-id stream)
+                                :maximum stream-maximum) :1-rtt))))
+      (when (> connection-maximum connection-limit)
+        (flow-control-update-max-receive-data flow connection-maximum)
+        (%client-queue-frame
+         client (make-frame :max-data :maximum connection-maximum) :1-rtt)))))
+
 (defun %client-receive-frames (client level number frames)
   (let ((space (%client-level-space level)))
     (connection-touch (quic-client-connection client))
@@ -906,9 +948,12 @@
                               (quic-client-streams client))))
          (unless stream
            (error 'quic-encoding-error :message "RESET_STREAM for unknown stream"))
-         (stream-reset-receive
-          stream (frame-field frame :application-protocol-error-code 0)
-          (frame-field frame :final-size 0))))
+         (multiple-value-bind (event discarded)
+             (stream-reset-receive
+              stream (frame-field frame :application-protocol-error-code 0)
+              (frame-field frame :final-size 0))
+           (declare (ignore event))
+           (%client-replenish-receive-credit client discarded stream))))
       (:stop-sending
        (let ((stream (gethash (frame-field frame :stream-id)
                               (quic-client-streams client))))
@@ -1056,6 +1101,21 @@
        (- (flow-control-connection-max-data (quic-client-flow-control client))
           (flow-control-connection-sent (quic-client-flow-control client)))))
 
+(defun %client-queue-stream-blocked-frames (client stream)
+  (let ((flow (quic-client-flow-control client)))
+    (when (>= (stream-send-offset stream) (stream-send-max-offset stream))
+      (%client-queue-frame
+       client (make-frame :stream-data-blocked
+                          :stream-id (stream-id stream)
+                          :maximum (stream-send-max-offset stream))
+       :1-rtt))
+    (when (>= (flow-control-connection-sent flow)
+              (flow-control-connection-max-data flow))
+      (%client-queue-frame
+       client (make-frame :data-blocked
+                          :maximum (flow-control-connection-max-data flow))
+       :1-rtt))))
+
 (defun %client-queue-pending-stream-write (client stream octets fin-p)
   (setf (quic-client-pending-stream-writes client)
         (nconc (quic-client-pending-stream-writes client)
@@ -1066,11 +1126,7 @@
          (count (min credit (length octets)))
          (data (subseq octets 0 count)))
     (when (and (zerop count) (plusp (length octets)))
-      (%client-queue-frame
-       client (make-frame :data-blocked
-                          :maximum (flow-control-connection-max-data
-                                    (quic-client-flow-control client)))
-       :1-rtt)
+      (%client-queue-stream-blocked-frames client stream)
       (%client-queue-pending-stream-write client stream octets fin-p)
       (return-from %client-write-stream-available nil))
     (let* ((result (handler-case
@@ -1101,11 +1157,7 @@
       (if (plusp (%client-stream-send-credit client stream))
           (%client-write-stream-available client stream octets fin-p)
           (progn
-            (%client-queue-frame
-             client (make-frame :data-blocked
-                                :maximum (flow-control-connection-max-data
-                                          (quic-client-flow-control client)))
-             :1-rtt)
+            (%client-queue-stream-blocked-frames client stream)
             (push entry (quic-client-pending-stream-writes client))
             (return)))))
   client)
@@ -1133,16 +1185,11 @@
 
 (defun client-read-stream (client stream &key timeout deadline)
   (%client-check-deadline client timeout deadline)
+  (unless (eq (gethash (stream-id stream) (quic-client-streams client)) stream)
+    (error 'quic-error
+           :message "Cannot read from a stream that is not registered with the client"))
   (multiple-value-bind (data fin) (stream-read stream)
-    (let ((maximum (+ (stream-read-offset stream) 65536)))
-      (stream-set-max-receive-offset stream maximum)
-      (%client-queue-frame
-       client (make-frame :max-stream-data :stream-id (stream-id stream)
-                          :maximum maximum) :1-rtt)
-      (flow-control-update-max-receive-data
-       (quic-client-flow-control client)
-       (max maximum (flow-control-connection-receive-limit
-                     (quic-client-flow-control client)))))
+    (%client-replenish-receive-credit client (length data) stream)
     (values data fin)))
 
 (defun client-close-stream (client stream &key condition)
@@ -1244,14 +1291,19 @@
                  :message "QUIC datagram exceeds the maximum UDP payload size"))
         (loop while (< at (length bytes)) do
           (let* ((slice (subseq bytes at))
-                 (layout (%client-layout
-                           slice :short-header-dcid-length short-header-dcid-length)))
+                 (layout (handler-case
+                             (%client-layout
+                              slice :short-header-dcid-length short-header-dcid-length)
+                           (quic-encoding-error ()
+                             (return-from client-receive-datagram last-header)))))
             (case (getf layout :type)
               (:version-negotiation (%client-handle-version-negotiation client slice)
                                     (return))
               (:retry (%client-handle-retry client slice) (return)))
             (multiple-value-bind (level number header)
                 (%client-unprotect-packet client slice layout)
+              (when (quic-client-closed-p client)
+                (return-from client-receive-datagram last-header))
               (when header
                 (when (and (member level '(:initial :handshake))
                            (plusp (length (packet-header-source-connection-id header))))
@@ -1263,14 +1315,9 @@
               (setf at (+ at (getf layout :end)))
               (when (not (getf layout :long-p)) (return)))))
         last-header)
-    (quic-error (condition)
-      (%client-protocol-close
-       client 7
-       (if (typep condition 'quic-crypto-error)
-           (quic-crypto-error-message condition)
-           (quic-error-message condition))) nil)
-    (error (condition)
-      (%client-protocol-close client 7 (princ-to-string condition)) nil)))
+    (error ()
+      (%client-protocol-close client 7 "QUIC receive failure")
+      nil)))
 
 (defun make-client-tls-boundary (client &key transport-parameters)
   "Attach cl-tls-kit's QUIC CRYPTO boundary."
@@ -1506,7 +1553,16 @@
     (connection-poll (quic-client-connection client) now)))
 
 (defun client-close (client &key (error-code :no-error) reason)
-  (%client-protocol-close
-   client (if (integerp error-code) error-code (%connection-error-code error-code)) reason)
-  (when (quic-client-udp-socket client) (udp-close (quic-client-udp-socket client)))
+  (let ((primary-error nil))
+    (unwind-protect
+         (handler-case
+             (%client-protocol-close
+              client (if (integerp error-code) error-code (%connection-error-code error-code)) reason)
+           (error (condition)
+             (setf primary-error condition)
+             (error condition)))
+      (when (quic-client-udp-socket client)
+        (handler-case (udp-close (quic-client-udp-socket client))
+          (error (condition)
+            (unless primary-error (error condition)))))))
   t)

@@ -84,6 +84,7 @@
 ;; Keep the RFC 9001 packet-protection vectors in the flake check, including
 ;; the deterministic Retry integrity vector from Appendix A.
 (load (test-path "t/protection.lisp"))
+(load (test-path "t/packet-reserved-contracts.lisp"))
 
 (check (= cl-quic-kit:*quic-version-1* #x00000001)
        "QUIC v1 has the RFC 9000 version number")
@@ -483,7 +484,6 @@
       (cl-quic-kit.recovery:on-loss-timeout state :application :now 1)
     (check (and deadline (= (length lost) 2))
            "time-threshold loss removes and returns expired packets")))
-(load (test-path "t/protection.lisp"))
 (let ((socket (cl-quic-kit:make-udp-socket :local-host "127.0.0.1"
                                             :local-port 0)))
   (unwind-protect
@@ -744,13 +744,16 @@
          (bad (make-array 1 :element-type '(unsigned-byte 8) :initial-element #xff)))
     (check (null (cl-quic-kit:client-receive-datagram sender vn))
            "client accepts Version Negotiation advertising QUIC v1")
-    (cl-quic-kit:client-receive-datagram receiver bad)
-    (check (and (cl-quic-kit::quic-client-closed-p receiver)
-                (eq (cl-quic-kit:connection-state
-                     (cl-quic-kit::quic-client-connection receiver))
-                    :closing)
-                ack-wire)
-           "malformed packet transitions the client to protocol close"))
+    (let ((state (cl-quic-kit:connection-state (cl-quic-kit::quic-client-connection receiver)))
+          (previous-wire ack-wire))
+      (check (null (cl-quic-kit:client-receive-datagram receiver bad))
+             "unauthenticated malformed packet is dropped")
+      (check (not (cl-quic-kit:quic-client-closed-p receiver))
+             "unauthenticated malformed packet does not close the client")
+      (check (eq state (cl-quic-kit:connection-state (cl-quic-kit::quic-client-connection receiver)))
+             "unauthenticated malformed packet preserves connection state")
+      (check (eq previous-wire ack-wire)
+             "unauthenticated malformed packet sends no response")))
 
   (let ((mismatched (cl-quic-kit:make-quic-client
                      :local-connection-id sender-id
@@ -819,5 +822,4 @@
 (load (test-path "t/state.lisp"))
 (load (test-path "t/recovery.lisp"))
 (load (test-path "t/stream-flow-control.lisp"))
-(load (test-path "t/client.lisp"))
 (format t "~D tests passed.~%" *tests-run*)

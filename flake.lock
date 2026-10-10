@@ -77,16 +77,16 @@
         "nixpkgs": "nixpkgs_2"
       },
       "locked": {
-        "lastModified": 1791017550,
-        "narHash": "sha256-M7ozdy9Kg7oN4OD6+NSDZUQBaxD0FM4Xpdhs1NVsk4s=",
+        "lastModified": 1791723692,
+        "narHash": "sha256-5ENPhkkY5Lc3Ml9LAPFTfg6U0OuxaWp/Uypmfuo72to=",
         "owner": "nerima-lisp",
         "repo": "cl-tls-kit",
-        "rev": "db0ee988fd3ba5b218c0ff1a0182df2b2ad01c76",
+        "rev": "f39e05059c572bb51df93dd25f619d64d6749ecc",
         "type": "github"
       },
       "original": {
         "owner": "nerima-lisp",
-        "ref": "takeokunn-tls13-handshake",
+        "ref": "v0.1.2",
         "repo": "cl-tls-kit",
         "type": "github"
       }
