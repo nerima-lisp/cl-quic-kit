@@ -130,11 +130,17 @@
              (length (length data))
              (chunks nil)
              (at 0))
-        (if (zerop length)
+        (if (or (zerop length)
+                (and (<= length *client-packet-payload-limit*)
+                     (<= (length (encode-frame frame))
+                         *client-packet-payload-limit*)))
             (list frame)
             (progn
               (loop while (< at length) do
-              (let* ((remaining (- length at)) (low 1) (high remaining) (best 0))
+              (let* ((remaining (- length at))
+                     (low 1)
+                     (high (min remaining *client-packet-payload-limit*))
+                     (best 0))
                 (loop while (<= low high) do
                   (let* ((middle (floor (+ low high) 2))
                          (fields (copy-list (frame-fields frame))))
@@ -1220,9 +1226,11 @@
           (let ((result (%client-send-frames client (car group) packet-frames)))
             (cond
               ((eq result :blocked)
-               (dolist (unsent remaining)
-                 (dolist (frame unsent)
-                   (%client-queue-frame client frame (car group))))
+               (setf (quic-client-pending-frames client)
+                     (nconc (quic-client-pending-frames client)
+                            (loop for unsent in remaining
+                                  nconc (loop for frame in unsent
+                                              collect (cons (car group) frame)))))
                (return))
               ((null result)
                (dolist (frame packet-frames)

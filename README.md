@@ -44,6 +44,10 @@ Stream-operation `:timeout` is relative and `:deadline` absolute in the client c
 `:deadline` takes precedence. These keywords only check expiry on entry, not enforce a blocking wait budget.
 The default idle timeout is 30 seconds and is checked by `client-poll`; enforce overall wait budgets in the caller.
 
+Rational smoothed RTT and RTT variance estimates are rounded to a nanosecond grid to bound arithmetic
+precision across repeated ACKs. Raw latest and minimum samples are retained; floating-point estimates
+keep their existing recurrence.
+
 Packet reserved bits (short-header mask `#x18`, long-header mask `#x0c`) are checked after payload authentication.
 Authenticated nonzero bits close the connection with `PROTOCOL_VIOLATION` (`#x0a`). AEAD authentication failures
 are discarded and counted across the connection's keys; successful packets do not reset the count. Exceeding

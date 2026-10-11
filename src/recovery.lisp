@@ -24,6 +24,7 @@
 (defconstant +packet-threshold+ 3)
 (defconstant +time-threshold+ 9/8)
 (defconstant +minimum-window+ 2)
+(defconstant +rtt-ticks-per-second+ 1000000000)
 
 (defstruct (packet-number-space (:constructor %make-space (name)))
   name (largest-received -1) (largest-acked -1) (ack-eliciting-count 0)
@@ -159,6 +160,12 @@
 (defun %acked-p (number ranges)
   (some (lambda (range) (<= (first range) number (second range))) (%ack-ranges ranges)))
 
+(defun %bounded-rtt (seconds)
+  ;; Exact EWMA coefficients otherwise grow rational denominators on every ACK.
+  (if (rationalp seconds)
+      (/ (round (* seconds +rtt-ticks-per-second+)) +rtt-ticks-per-second+)
+      seconds))
+
 (defun %rtt-update (state latest ack-delay sampled-at)
   (let* ((min-rtt (recovery-state-min-rtt state))
          (adjusted (if (and min-rtt (>= latest (+ min-rtt ack-delay)))
@@ -167,14 +174,14 @@
     (setf (recovery-state-latest-rtt state) latest
           (recovery-state-min-rtt state) (if min-rtt (min min-rtt latest) latest))
     (if (null old)
-        (setf (recovery-state-smoothed-rtt state) latest
-              (recovery-state-rtt-variance state) (/ latest 2)
+        (setf (recovery-state-smoothed-rtt state) (%bounded-rtt latest)
+              (recovery-state-rtt-variance state) (%bounded-rtt (/ latest 2))
               (recovery-state-first-rtt-sample-time state) sampled-at)
         (setf (recovery-state-rtt-variance state)
-              (+ (* 3/4 (recovery-state-rtt-variance state))
-                 (* 1/4 (abs (- old adjusted))))
+              (%bounded-rtt (+ (* 3/4 (recovery-state-rtt-variance state))
+                               (* 1/4 (abs (- old adjusted)))))
               (recovery-state-smoothed-rtt state)
-              (+ (* 7/8 old) (* 1/8 adjusted))))))
+              (%bounded-rtt (+ (* 7/8 old) (* 1/8 adjusted)))))))
 
 (defun %pto (state &optional space-name)
   (if (recovery-state-smoothed-rtt state)
