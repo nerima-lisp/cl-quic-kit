@@ -163,14 +163,16 @@
      (setf (symbol-function 'cl-quic-kit::%server-random-octets)
            original)))
  "Retry source CID generation retries a collision with its Initial destination CID")
-(check (let ((server (cl-quic-kit:make-quic-server
-                     :local-address "127.0.0.1" :local-port 0
-                     :max-connections 1)))
-          (unwind-protect
-               (plusp (cl-quic-kit:udp-socket-local-port
-                       (cl-quic-kit::quic-server-udp-socket server)))
-            (cl-quic-kit:quic-server-close server)))
-       "server binds its UDP socket when none is supplied")
+(check
+ (let ((server (cl-quic-kit:make-quic-server
+                :local-address "127.0.0.1" :local-port 0
+                :max-connections 1)))
+   (unwind-protect
+        (and (plusp (cl-quic-kit:udp-socket-local-port
+                     (cl-quic-kit::quic-server-udp-socket server)))
+             (= (cl-quic-kit::quic-server-max-connections server) 1))
+     (cl-quic-kit:quic-server-close server)))
+ "server binds its UDP socket and stores max-connections for CID routing")
 (check (server-test-type-error-p
         (lambda () (cl-quic-kit:make-quic-server :max-connections 0)))
        "server rejects zero max-connections")
@@ -567,11 +569,26 @@
                                                  :source-connection-id)
                                            wide-dcid))
                                      "Version Negotiation accepts and echoes 24-octet connection IDs")
-                              (cl-quic-kit:udp-send
-                               peer
-                               (cl-quic-kit:encode-version-negotiation
-                                source-cid destination-cid
-                                (list cl-quic-kit:*quic-version-1*)))
+                              (let ((received-before
+                                     (loop for path being the hash-values
+                                           of (cl-quic-kit::quic-server-paths server)
+                                           sum (cl-quic-kit::server-amplification-state-received path))))
+                                (cl-quic-kit:udp-send
+                                 peer
+                                 (cl-quic-kit:encode-version-negotiation
+                                  source-cid destination-cid
+                                  (list cl-quic-kit:*quic-version-1*)))
+                                (cl-quic-kit:udp-send
+                                 peer
+                                 (server-test-initial-packet
+                                  #xfaceb00c destination-cid source-cid #() 1199))
+                                (server-test-poll-until
+                                 server
+                                 (lambda ()
+                                   (> (loop for path being the hash-values
+                                              of (cl-quic-kit::quic-server-paths server)
+                                            sum (cl-quic-kit::server-amplification-state-received path))
+                                      received-before))))
                               (cl-quic-kit:quic-server-poll server)
                               (multiple-value-bind (response length address)
                                   (cl-quic-kit:udp-receive peer)
