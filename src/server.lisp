@@ -589,10 +589,38 @@
 (defun %server-complete-connection (server-connection)
   (unless (server-connection-handshake-complete-p server-connection)
     (let ((peer-bytes
-            (server-connection-peer-transport-parameters server-connection)))
+           (server-connection-peer-transport-parameters server-connection)))
       (unless peer-bytes
         (error 'quic-error :message "TLS completed without peer transport parameters"))
-      (let* ((peer-parameters (decode-transport-parameters peer-bytes))
+      (let* ((peer-parameters
+              (handler-case
+                  (let ((parameters
+                         (decode-transport-parameters
+                          peer-bytes :sender-role :client)))
+                    (let ((source-cid (assoc 15 parameters)))
+                      (unless (and source-cid
+                                   (equalp
+                                    (cdr source-cid)
+                                    (server-connection-remote-connection-id
+                                     server-connection)))
+                        (%packet-error
+                         "Client initial_source_connection_id does not match the Initial source connection ID")))
+                    parameters)
+                (quic-encoding-error (condition)
+                                     (let* ((connection
+                                             (server-connection-connection server-connection))
+                                            (engine (server-connection-engine server-connection))
+                                            (frame
+                                             (%connection-prepare-close
+                                              connection :transport-parameter-error
+                                              (quic-error-message condition))))
+                                       (when frame
+                                         (setf (quic-client-closed-p engine) t)
+                                         (%client-queue-frame
+                                          engine frame
+                                          (if (%client-key engine :1-rtt :write) :1-rtt :initial))
+                                         (client-flush engine)))
+                                     (return-from %server-complete-connection server-connection))))
              (connection (server-connection-connection server-connection))
              (local-idle-timeout (quic-connection-idle-timeout connection))
              (peer-idle-timeout (cdr (assoc 1 peer-parameters))))
@@ -602,12 +630,12 @@
               (quic-connection-idle-timeout connection)
               (if (and peer-idle-timeout (plusp peer-idle-timeout))
                   (min local-idle-timeout (/ peer-idle-timeout 1000))
-                  local-idle-timeout)
+                local-idle-timeout)
               (server-amplification-state-validated-p
                (server-connection-path server-connection))
               t))
       (connection-set-state (server-connection-connection server-connection)
-                           :established)
+                            :established)
       (setf (server-connection-handshake-complete-p server-connection) t)
       (unless (server-connection-accepted-p server-connection)
         (setf (server-connection-accepted-p server-connection) t

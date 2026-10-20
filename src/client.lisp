@@ -1323,7 +1323,7 @@
                      (declare (ignore boundary))
                      (let ((parameters (if (listp parameters)
                                            parameters
-                                           (decode-transport-parameters parameters))))
+                                           (decode-transport-parameters parameters :sender-role :server))))
                        (setf (quic-client-peer-transport-parameters client) parameters)
                        (let ((flow (quic-client-flow-control client)))
                          (when (zerop (flow-control-connection-sent flow))

@@ -1,7 +1,8 @@
 (in-package #:cl-quic-kit)
 
 (declaim (ftype function connection-close connection-retire-connection-id
-                        connection-write connection-poll))
+                        connection-write connection-poll
+                        %connection-prepare-close))
 
 (defparameter *quic-idle-timeout-default* 30)
 (defparameter *quic-active-connection-id-limit-default* 2)
@@ -10,8 +11,11 @@
 (defun %connection-error-code (code)
   (if (integerp code) code
       (cdr (assoc code '((:no-error . 0) (:internal-error . 1)
-                         (:protocol-violation . 10) (:frame-encoding-error . 7)
-                         (:connection-id-limit . 12) (:application-error . 16))))))
+                         (:frame-encoding-error . 7)
+                         (:transport-parameter-error . 8)
+                         (:protocol-violation . 10)
+                         (:connection-id-limit . 12)
+                         (:application-error . 16))))))
 
 (define-condition connection-closed (quic-error)
   ((error-code :initarg :error-code :reader connection-close-error-code)
@@ -291,25 +295,36 @@
          (subseq octets 0 end))))))
 
 (defun connection-close (connection error-code &optional reason &rest options)
-  (unless (or (eq (quic-connection-state connection) :closed)
-              (quic-connection-close-frame connection))
-    (let* ((kind (or (getf options :kind)
-                     (if (eq error-code :application-error) :application :transport)))
-           (wire-code (or (%connection-error-code error-code) 1)))
-      (setf (quic-connection-state connection) :closing
-          (quic-connection-closed-error connection) wire-code
-          (quic-connection-closed-reason connection) (%connection-reason-octets reason)
-          (quic-connection-close-kind connection) kind
-          (quic-connection-close-frame connection)
-          (make-frame (if (eq kind :application)
-                          :application-close :connection-close)
-                      :error-code wire-code :frame-type 0
-                      :reason (quic-connection-closed-reason connection)))
-      (connection-write connection (encode-frame (quic-connection-close-frame connection)))
-      (setf (quic-connection-draining-deadline connection)
-            (+ (funcall (quic-connection-now-fn connection))
-               (* 3 (quic-connection-idle-timeout connection))))))
+  (let ((frame (%connection-prepare-close
+                connection error-code reason (getf options :kind))))
+    (when frame
+      (connection-write connection (encode-frame frame))))
   connection)
+(defun %connection-prepare-close (connection error-code reason &optional kind)
+  (let ((frame nil))
+    (unless (or (eq (quic-connection-state connection) :closed)
+                (quic-connection-close-frame connection))
+      (let* ((kind (or kind
+                       (if (eq error-code :application-error)
+                           :application
+                         :transport)))
+             (wire-code (or (%connection-error-code error-code) 1))
+             (reason-octets (%connection-reason-octets reason)))
+        (setf (quic-connection-state connection) :closing
+              (quic-connection-closed-error connection) wire-code
+              (quic-connection-closed-reason connection) reason-octets
+              (quic-connection-close-kind connection) kind
+              frame
+              (make-frame (if (eq kind :application)
+                              :application-close
+                            :connection-close)
+                          :error-code wire-code :frame-type 0
+                          :reason reason-octets)
+              (quic-connection-close-frame connection) frame)
+        (setf (quic-connection-draining-deadline connection)
+              (+ (funcall (quic-connection-now-fn connection))
+                 (* 3 (quic-connection-idle-timeout connection))))))
+    frame))
 
 (defun connection-check-idle-timeout (connection &optional at)
   (let ((now (or at (funcall (quic-connection-now-fn connection)))))

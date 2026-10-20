@@ -944,6 +944,163 @@
             return accepted
           do (sleep 0.001)
           finally (error "Loopback TLS handshake did not complete"))))
+(defun server-test-invalid-client-transport-parameters (certificate-der)
+  (let ((preferred-address
+         (make-array 42 :element-type '(unsigned-byte 8) :initial-element 0))
+        (reset-token
+         (make-array 16 :element-type '(unsigned-byte 8) :initial-element #xaa))
+        (client-source-cid
+         (make-array 4 :element-type '(unsigned-byte 8)
+                     :initial-contents (list 1 2 3 4))))
+    (setf (aref preferred-address 24) 1)
+    (labels ((parameter (id value)
+                        (cl-quic-kit::%octets
+                         (cl-quic-kit:encode-varint id)
+                         (cl-quic-kit:encode-varint (length value))
+                         value))
+             (integer-parameter (id value)
+                                (parameter id (cl-quic-kit:encode-varint value)))
+             (run-case (description parameter-bytes)
+                       (let* ((socket
+                               (cl-quic-kit:make-udp-socket
+                                :local-host "127.0.0.1" :local-port 0))
+                              (server
+                               (cl-quic-kit:make-quic-server
+                                :udp-socket socket :max-connections 1
+                                :retry-policy :always
+                                :transport-parameters
+                                (list :initial-max-data 2097152)))
+                              (client nil)
+                              (server-connection nil))
+                         (unwind-protect
+                             (progn
+                               (setf client
+                                     (cl-quic-kit:make-quic-client
+                                      :server-host "127.0.0.1"
+                                      :server-port
+                                      (cl-quic-kit:udp-socket-local-port socket)
+                                      :hostname "localhost"
+                                      :local-connection-id client-source-cid
+                                      :transport-parameters parameter-bytes
+                                      :disable-hostname-verification-p t
+                                      :alpn (list "h3")
+                                      :tls-trust-anchors
+                                      (list
+                                       (cl-tls-kit.x509:parse-certificate-der
+                                        certificate-der))
+                                      :tls-verify-signature
+                                      #'crypto-kit:verify-signature
+                                      :tls-signature-algorithms #(1027)))
+                               (setf server-connection
+                                     (loop repeat 2000
+                                           do (cl-quic-kit:client-poll client)
+                                           (cl-quic-kit:quic-server-poll server)
+                                           (setf server-connection
+                                                 (loop for candidate
+                                                       being the hash-values
+                                                       of (cl-quic-kit::quic-server-connections
+                                                           server)
+                                                       return candidate))
+                                           when (and server-connection
+                                                     (= (cl-quic-kit::quic-connection-closed-error
+                                                         (cl-quic-kit::server-connection-connection
+                                                          server-connection))
+                                                        #x08))
+                                           return server-connection
+                                           do (sleep 0.001)))
+                               (check
+                                (and server-connection
+                                     (eq (cl-quic-kit:connection-state
+                                          (cl-quic-kit::server-connection-connection
+                                           server-connection))
+                                         :closing)
+                                     (eq (cl-quic-kit:connection-close-kind
+                                          (cl-quic-kit::server-connection-connection
+                                           server-connection))
+                                         :transport)
+                                     (= (cl-quic-kit::quic-connection-closed-error
+                                         (cl-quic-kit::server-connection-connection
+                                          server-connection))
+                                        #x08)
+                                     (not
+                                      (cl-quic-kit::server-connection-handshake-complete-p
+                                       server-connection))
+                                     (null
+                                      (cl-quic-kit::quic-server-accepted-connections
+                                       server)))
+                                (format nil
+                                        "~A produces a server TRANSPORT_PARAMETER_ERROR close"
+                                        description))
+                               (cl-quic-kit:client-poll client)
+                               (check
+                                (and (= (cl-quic-kit::quic-connection-closed-error
+                                         (cl-quic-kit:quic-client-connection client))
+                                        #x08)
+                                     (eq (cl-quic-kit:connection-state
+                                          (cl-quic-kit:quic-client-connection client))
+                                         :draining))
+                                (format nil
+                                        "~A delivers error 0x08 to the client"
+                                        description))
+                               (check
+                                (null
+                                 (cl-quic-kit:quic-server-accept-connection server))
+                                (format nil
+                                        "~A is never accepted by the server"
+                                        description)))
+                           (when client
+                             (cl-quic-kit:client-close client))
+                           (cl-quic-kit:quic-server-close server)))))
+      (dolist (case
+                  (list
+                   (list "duplicate parameter ID"
+                         (cl-quic-kit::%octets
+                          (integer-parameter 1 0)
+                          (integer-parameter 1 1)))
+                   (list "truncated parameter ID varint" #(#xc0))
+                   (list "truncated parameter length varint"
+                         (cl-quic-kit::%octets
+                          (cl-quic-kit:encode-varint 1) #(#xc0)))
+                   (list "truncated integer value varint"
+                         (parameter 1 #(#xc0)))
+                   (list "parameter length exceeds the remaining bytes"
+                         (cl-quic-kit::%octets
+                          (cl-quic-kit:encode-varint 1)
+                          (cl-quic-kit:encode-varint 2) #(0)))
+                   (list "max_udp_payload_size below 1200"
+                         (integer-parameter 3 1199))
+                   (list "ack_delay_exponent above 20"
+                         (integer-parameter 10 21))
+                   (list "active_connection_id_limit below 2"
+                         (integer-parameter 14 1))
+                   (list "initial_max_streams_bidi at 2^60"
+                         (integer-parameter 8 (ash 1 60)))
+                   (list "initial_max_streams_uni at 2^60"
+                         (integer-parameter 9 (ash 1 60)))
+                   (list "max_ack_delay at 2^14"
+                         (integer-parameter 11 (ash 1 14)))
+                   (list "client original_destination_connection_id"
+                         (parameter 0 #(1 2 3)))
+                   (list "client stateless_reset_token"
+                         (parameter 2 reset-token))
+                   (list "client preferred_address"
+                         (parameter 13 preferred-address))
+                   (list "client retry_source_connection_id"
+                         (parameter 16 #(9 8 7)))
+                   (list "missing initial_source_connection_id"
+                         (integer-parameter 1 1))
+                   (list "disable_active_migration has a non-empty value"
+                         (parameter 12 #(0)))
+                   (list "integer parameter value contains trailing bytes"
+                         (parameter 1 #(0 0)))
+                   (list "mismatched initial_source_connection_id"
+                         (parameter 15 #(9 8 7 6)))
+                   (list "initial_source_connection_id exceeds 20 bytes"
+                         (parameter 15
+                                    #(1 2 3 4 5 6 7 8
+                                        9 10 11 12 13 14 15 16
+                                        17 18 19 20 21)))))
+        (run-case (first case) (second case))))))
 (defun server-test-remove-temp-directory (directory)
   (dolist (name '("server.crt" "server.key" "server.der"))
     (let ((path (merge-pathnames name directory)))
@@ -1045,7 +1202,8 @@
                 "the server returns each completed connection once")
                (check
                 (= (cl-quic-kit::quic-connection-idle-timeout server-connection) 30)
-                "the server clamps the peer idle timeout to its local limit"))))
+                "the server clamps the peer idle timeout to its local limit")
+               (server-test-invalid-client-transport-parameters certificate-der))))
       (unwind-protect
            (when client
              (cl-quic-kit:client-close client))

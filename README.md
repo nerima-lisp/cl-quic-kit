@@ -10,8 +10,10 @@ The packet, TLS, and loss-recovery code draws on these specifications:
 
 The package provides QUIC varints, packet and frame codecs, stream and flow-control state, loss recovery and
 NewReno state, connection lifecycle management, and an explicit `cl-crypto-kit` backend boundary under `src/`.
-Configure the QUIC packet-protection hooks before sending protected traffic; `t/run.lisp` shows the adapter
-mapping.
+Before sending protected traffic, applications must call
+`cl-quic-kit.protection:configure-crypto-backend` with callbacks for `:hkdf-extract`, `:hkdf-expand`,
+`:aead-seal`, `:aead-open`, `:aes-ecb` or `:chacha20`, and `:constant-time-equal`. This setting is separate
+from TLS provider selection. `t/run.lisp` shows the test runner's adapter mapping.
 
 ## Client API
 
@@ -32,6 +34,7 @@ parsed certificate objects in `:tls-trust-anchors`; parse a DER root certificate
 The default signature verifier uses cl-crypto-kit's `verify-signature`. The first
 `(cl-quic-kit:client-poll client)` call starts the TLS handshake for a client created with these network arguments.
 The `:alpn` option takes a list of protocol names and defaults to `("h3")`; set it to `NIL` to omit ALPN.
+The optional `:idle-timeout` value uses seconds and defaults to 30; the client advertises it in milliseconds.
 Continue polling until
 `(cl-quic-kit:connection-state (cl-quic-kit:quic-client-connection client))` is `:established`;
 the client enters that state after it receives the server's `HANDSHAKE_DONE` frame.
@@ -93,7 +96,8 @@ The [test credential helper](t/server.lisp#L913) creates a temporary self-signed
 
 The listener defaults to IPv4 address `0.0.0.0` and UDP port `443`. Set `:local-address` to an IPv4
 address string and `:local-port` to an integer from 0 through 65535; port 0 binds an ephemeral port.
-To read the assigned port, create a socket and pass it to the listener:
+`:local-address` applies when the listener creates its socket. When supplying a socket, configure it with
+`:local-host` in `make-udp-socket`. To read the assigned port, create a socket and pass it to the listener:
 
 ```lisp
 (let* ((socket (cl-quic-kit:make-udp-socket
@@ -113,9 +117,9 @@ port.
 
 The server passes `:tls-server-options` to cl-tls-kit's public
 [`make-tls13-server-driver`](https://github.com/nerima-lisp/cl-tls-kit/blob/7ed1e3eb1edd891066c15951fe282f89dafef81b/docs/tls13-server-driver.md)
-constructor. The linked reference documents its public options and their values. The server defaults
-`:alpn-protocols` to `("h3")`, creates a cl-crypto-kit provider when `:provider` is omitted, and sets the
-driver's `:quic-transport-parameters` option from the encoded server parameters.
+constructor. The server defaults `:alpn-protocols` to `("h3")`, creates a cl-crypto-kit provider when
+`:provider` is omitted, and sets the driver's `:quic-transport-parameters` option from the encoded server
+parameters.
 
 The `crypto-kit:` package is provided by the `cl-crypto-kit` system. For a P-256 key, pass a 32-octet private
 scalar to
