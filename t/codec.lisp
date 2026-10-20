@@ -136,14 +136,20 @@
                   (cl-quic-kit:decode-packet-header bytes))))
              "Retry rejects nonzero unused bits")
 
-(let* ((encoded (cl-quic-kit:encode-version-negotiation
-                 #(1 2) #(3) '(1 #x6b3343cf)))
-       (decoded (cl-quic-kit:decode-version-negotiation encoded)))
+(let* ((dcid (make-array 24 :element-type '(unsigned-byte 8)
+                              :initial-element #x31))
+       (scid (make-array 24 :element-type '(unsigned-byte 8)
+                              :initial-element #x42))
+       (encoded (cl-quic-kit:encode-version-negotiation
+                 dcid scid '(1 #x6b3343cf)))
+       (decoded (progn
+                  (setf (aref encoded 0) (logior (aref encoded 0) #x40))
+                  (cl-quic-kit:decode-version-negotiation encoded))))
   (codec-check (and (= (getf decoded :version) 0)
-                    (equalp (getf decoded :destination-connection-id) #(1 2))
-                    (equalp (getf decoded :source-connection-id) #(3))
+                    (equalp (getf decoded :destination-connection-id) dcid)
+                    (equalp (getf decoded :source-connection-id) scid)
                     (equal (getf decoded :versions) '(1 #x6b3343cf)))
-               "Version Negotiation round trips")
+               "Version Negotiation accepts long connection IDs and ignores unused bits")
   (codec-check (codec-rejects-p
                 (lambda ()
                   (cl-quic-kit:decode-packet-header encoded)))

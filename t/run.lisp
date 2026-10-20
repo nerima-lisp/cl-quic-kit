@@ -17,7 +17,8 @@
 (dolist (file '("src/varint.lisp" "src/packet.lisp" "src/frame.lisp"
                 "src/flow-control.lisp" "src/stream.lisp" "src/state.lisp"
                 "src/udp.lisp" "src/protection.lisp" "src/recovery.lisp"
-                "src/client.lisp"))
+                "src/client.lisp"
+                "src/server.lisp"))
   (load (test-path file)))
 
 (when (and (find-package "CRYPTO-KIT")
@@ -815,9 +816,10 @@
          :retry-integrity-tag tag)))
       (check (cl-quic-kit:quic-client-closed-p mismatched)
              "Retry for another connection is rejected"))))
-(load (test-path "t/codec.lisp"))
+(load (test-path "t/server.lisp"))
 (load (test-path "t/state.lisp"))
 (load (test-path "t/recovery.lisp"))
 (load (test-path "t/stream-flow-control.lisp"))
 (load (test-path "t/client.lisp"))
+(load (test-path "t/codec.lisp"))
 (format t "~D tests passed.~%" *tests-run*)

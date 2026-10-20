@@ -82,14 +82,14 @@ SIZE is bounded to a valid UDP receive buffer size."
   (unless (and (integerp size) (plusp size) (<= size 65535))
     (error 'quic-error))
   (handler-case
-      (multiple-value-bind (data length address)
+      (multiple-value-bind (data length address port)
           (sb-bsd-sockets:socket-receive
            (udp-socket-socket socket)
            (make-array size :element-type '(unsigned-byte 8)) size
            :dontwait (not wait-p))
         (if (and (vectorp data) (integerp length) (<= 0 length))
             (values (if (= length (length data)) data (subseq data 0 length))
-                    length address)
+                    length (list address port))
             (values nil nil nil)))
     (sb-bsd-sockets:socket-error (condition)
       (if (and (not wait-p) (udp-socket-non-blocking-p socket))
