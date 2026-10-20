@@ -83,7 +83,7 @@
    #:quic-client-connection #:quic-client-udp-socket
    #:quic-client-closed-p
    #:quic-client-tls-boundary
-   #:quic-client-peer-transport-parameters #:client-accept-peer-stream #:quic-connection-closed-reason #:make-quic-server #:quic-server-poll #:quic-server-close))
+   #:quic-client-peer-transport-parameters #:client-accept-peer-stream #:quic-connection-closed-reason #:make-quic-server #:quic-server-poll #:quic-server-close #:quic-server-accept-connection #:quic-connection-alpn))
 
 (in-package #:cl-quic-kit)
 

@@ -447,9 +447,9 @@
               (%client-install-secret client level direction
                                        (funcall secret-reader state)))))))))
 
-(defun %client-transport-parameters (local-connection-id)
+(defun %client-transport-parameters (local-connection-id idle-timeout)
   (encode-transport-parameters
-   `((1 . 30) (3 . 65527) (4 . 1048576)
+   `((1 . ,(* idle-timeout 1000)) (3 . 65527) (4 . 1048576)
      (5 . 65536) (6 . 65536) (7 . 65536)
      (8 . 25) (9 . 25) (10 . 3) (11 . 25)
      (14 . 2) (15 . ,local-connection-id))))
@@ -1006,7 +1006,9 @@
                   :server-host server-host :server-port server-port
                   :hostname hostname :alpn alpn
                   :transport-parameters (or transport-parameters
-                                            (%client-transport-parameters local))
+                                            (%client-transport-parameters
+                                             local
+                                             (quic-connection-idle-timeout connection)))
                   :tls-key-exchange tls-key-exchange :tls-provider tls-provider
                   :tls-trust-anchors tls-trust-anchors
                   :tls-verify-signature tls-verify-signature

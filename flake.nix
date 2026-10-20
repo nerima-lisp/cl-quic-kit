@@ -2,8 +2,8 @@
   description = "Common Lisp QUIC toolkit";
 
   inputs.nixpkgs.url = "github:NixOS/nixpkgs/nixpkgs-unstable";
-  inputs.cl-crypto-kit.url = "github:nerima-lisp/cl-crypto-kit/takeokunn-crypto-integration";
-  inputs.cl-tls-kit.url = "github:nerima-lisp/cl-tls-kit/takeokunn-tls13-handshake";
+  inputs.cl-crypto-kit.url = "github:nerima-lisp/cl-crypto-kit/41ed7e90f736591aa1961bc6deb0741c73392a60";
+  inputs.cl-tls-kit.url = "github:nerima-lisp/cl-tls-kit/7ed1e3eb1edd891066c15951fe282f89dafef81b";
   inputs.cl-tls-kit.inputs.cl-crypto-kit.follows = "cl-crypto-kit";
 
   outputs = { self, nixpkgs, cl-crypto-kit, cl-tls-kit }:
@@ -184,7 +184,7 @@
           tls = cl-tls-kit.packages.${system}.default;
         in {
           default = pkgs.mkShell {
-            packages = [ pkgs.sbcl ];
+            packages = [ pkgs.sbcl pkgs.openssl ];
             CL_SOURCE_REGISTRY = "${tls}/share/common-lisp/source//:${crypto}/share/common-lisp/source//";
           };
         });

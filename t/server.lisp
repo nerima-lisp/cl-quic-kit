@@ -863,3 +863,334 @@
                      "a token with a mismatched client CID receives INVALID_TOKEN"))))
       (cl-quic-kit:client-close client)
       (cl-quic-kit:quic-server-close server))))
+(defun server-test-run-openssl (&rest arguments)
+  (multiple-value-bind (output errors exit-code)
+      (uiop:run-program (cons "openssl" arguments)
+                        :output :string :error-output :string
+                        :ignore-error-status t)
+    (declare (ignore output errors))
+    (unless (and (integerp exit-code) (zerop exit-code))
+      (error "OpenSSL could not create the TLS handshake test credential"))))
+(defun server-test-read-octets (path)
+  (with-open-file (stream path :direction :input
+                          :element-type '(unsigned-byte 8))
+    (let ((bytes (make-array (file-length stream)
+                             :element-type '(unsigned-byte 8))))
+      (unless (= (read-sequence bytes stream) (length bytes))
+        (error "OpenSSL returned a truncated TLS test key"))
+      bytes)))
+(defun server-test-make-temp-directory ()
+  (multiple-value-bind (output errors exit-code)
+      (uiop:run-program '("mktemp" "-d")
+                        :output :string :error-output :string
+                        :ignore-error-status t)
+    (declare (ignore errors))
+    (unless (and (integerp exit-code) (zerop exit-code))
+      (error "Could not create a temporary TLS test directory"))
+    (pathname
+     (format nil "~A/"
+             (string-right-trim
+              '(#\Newline #\Return #\Space #\Tab) output)))))
+(defun server-test-read-certificate-der (path)
+  (cl-tls-kit:pem-block-der
+   (first
+    (cl-tls-kit:pem-decode
+     (uiop:read-file-string path)))))
+(defun server-test-read-p256-private-key (path)
+  (let* ((node
+           (cl-tls-kit:der-decode
+            (server-test-read-octets path)))
+         (children (cl-tls-kit:der-node-children node))
+         (scalar-node (second children))
+         (scalar (and scalar-node
+                      (= (cl-tls-kit:der-node-tag scalar-node) 4)
+                      (cl-tls-kit:der-node-value scalar-node))))
+    (unless (and (= (cl-tls-kit:der-node-tag node) 16)
+                 scalar
+                 (= (length scalar) 32))
+      (error "OpenSSL returned an invalid P-256 test key"))
+    (crypto-kit:make-ec-private-key :p256 scalar)))
+(defun server-test-make-credential (directory)
+  (let* ((certificate-path
+           (namestring (merge-pathnames "server.crt" directory)))
+         (key-path
+           (namestring (merge-pathnames "server.key" directory)))
+         (der-path
+           (namestring (merge-pathnames "server.der" directory))))
+    (server-test-run-openssl
+     "req" "-x509" "-newkey" "ec" "-pkeyopt"
+     "ec_paramgen_curve:P-256" "-nodes" "-days" "2"
+     "-subj" "/CN=QUIC Test"
+     "-addext" "basicConstraints=critical,CA:TRUE"
+     "-addext" "keyUsage=critical,keyCertSign,digitalSignature"
+     "-addext" "extendedKeyUsage=serverAuth"
+     "-keyout" key-path "-out" certificate-path)
+    (server-test-run-openssl
+     "ec" "-in" key-path "-outform" "DER" "-out" der-path)
+    (values (server-test-read-certificate-der certificate-path)
+            (server-test-read-p256-private-key der-path))))
+(defun server-test-loopback-handshake (server client)
+  (let ((accepted nil))
+    (loop repeat 1000
+          do (cl-quic-kit:client-poll client)
+             (cl-quic-kit:quic-server-poll server)
+             (unless accepted
+               (setf accepted
+                     (cl-quic-kit:quic-server-accept-connection server)))
+          when (and accepted
+                    (eq (cl-quic-kit:connection-state
+                         (cl-quic-kit:quic-client-connection client))
+                        :established))
+            return accepted
+          do (sleep 0.001)
+          finally (error "Loopback TLS handshake did not complete"))))
+(defun server-test-remove-temp-directory (directory)
+  (dolist (name '("server.crt" "server.key" "server.der"))
+    (let ((path (merge-pathnames name directory)))
+      (when (probe-file path)
+        (delete-file path))))
+  (multiple-value-bind (output errors exit-code)
+      (uiop:run-program (list "rmdir" (namestring directory))
+                        :output :string :error-output :string
+                        :ignore-error-status t)
+    (declare (ignore output errors))
+    (unless (and (integerp exit-code) (zerop exit-code))
+      (error "Could not remove the temporary TLS test directory"))))
+(progn
+  (let* ((directory (server-test-make-temp-directory))
+         (socket nil)
+         (server nil)
+         (client nil))
+    (unwind-protect
+         (multiple-value-bind (certificate-der private-key)
+             (server-test-make-credential directory)
+           (setf socket
+                 (cl-quic-kit:make-udp-socket
+                  :local-host "127.0.0.1" :local-port 0))
+           (setf server
+                 (cl-quic-kit:make-quic-server
+                  :udp-socket socket
+                  :max-connections 1
+                  :retry-policy :always
+                  :transport-parameters (list :initial-max-data 2097152)
+                  :tls-server-options
+                  (list :certificate-chain (list certificate-der)
+                        :private-key private-key
+                        :alpn-protocols (list "h3"))))
+           (setf client
+                 (cl-quic-kit:make-quic-client
+                  :server-host "127.0.0.1"
+                  :server-port (cl-quic-kit:udp-socket-local-port socket)
+                  :idle-timeout 60
+                  :disable-hostname-verification-p t
+                  :alpn '("h3")
+                  :tls-trust-anchors
+                  (list
+                   (cl-tls-kit.x509:parse-certificate-der certificate-der))
+                  :tls-verify-signature #'crypto-kit:verify-signature
+                  :tls-signature-algorithms #(1027)))
+           (let ((server-connection
+                   (server-test-loopback-handshake server client)))
+             (check
+              (eq (cl-quic-kit:connection-state server-connection)
+                  :established)
+              "the server accepts a connection after its TLS handshake")
+             (check
+              (equal (cl-quic-kit:quic-connection-alpn server-connection)
+                     "h3")
+              "the server connection records the negotiated ALPN")
+             (check
+              (eq (cl-quic-kit:connection-state
+                   (cl-quic-kit:quic-client-connection client))
+                  :established)
+              "the client confirms the server handshake")
+             (progn
+               (check
+                (equal
+                 (cdr
+                  (assoc 4
+                         (cl-quic-kit:quic-client-peer-transport-parameters client)))
+                 2097152)
+                "the server forwards configured initial max data")
+               (check
+                (= (cdr
+                    (assoc 1
+                           (cl-quic-kit:quic-client-peer-transport-parameters client)))
+                   30000)
+                "the server advertises its idle timeout in milliseconds")
+               (check
+                (let* ((server-state
+                        (loop for entry being the hash-values
+                                of (cl-quic-kit::quic-server-connections server)
+                              when (eq (cl-quic-kit::server-connection-connection entry)
+                                       server-connection)
+                                return entry))
+                       (parameters
+                        (cl-quic-kit:decode-transport-parameters
+                         (cl-quic-kit::server-connection-peer-transport-parameters
+                          server-state))))
+                  (= (cdr (assoc 1 parameters)) 60000))
+                "the server observes the client idle timeout in milliseconds")
+               (check
+                (let ((parameters
+                       (cl-quic-kit:decode-transport-parameters
+                        (cl-quic-kit::%client-transport-parameters
+                         (make-array 8 :element-type '(unsigned-byte 8)
+                                     :initial-element 0)
+                         cl-quic-kit::*quic-idle-timeout-default*))))
+                  (= (cdr (assoc 1 parameters)) 30000))
+                "the client advertises its idle timeout in milliseconds")
+               (check
+                (null (cl-quic-kit:quic-server-accept-connection server))
+                "the server returns each completed connection once")
+               (check
+                (= (cl-quic-kit::quic-connection-idle-timeout server-connection) 30)
+                "the server clamps the peer idle timeout to its local limit"))))
+      (unwind-protect
+           (when client
+             (cl-quic-kit:client-close client))
+        (unwind-protect
+             (if server
+                 (cl-quic-kit:quic-server-close server)
+                 (when socket
+                   (cl-quic-kit:udp-close socket)))
+          (server-test-remove-temp-directory directory))))))
+
+(progn
+  (let* ((directory (server-test-make-temp-directory))
+         (socket nil)
+         (server nil)
+         (client nil))
+    (unwind-protect
+         (multiple-value-bind (certificate-der private-key)
+             (server-test-make-credential directory)
+           (setf socket
+                 (cl-quic-kit:make-udp-socket
+                  :local-host "127.0.0.1" :local-port 0))
+           (setf server
+                 (cl-quic-kit:make-quic-server
+                  :udp-socket socket
+                  :max-connections 1
+                  :retry-policy :always
+                  :tls-server-options
+                  (list :certificate-chain (list certificate-der)
+                        :private-key private-key
+                        :alpn-protocols (list "h3"))))
+           (setf client
+                 (let ((client-cid
+                       (make-array 8 :element-type '(unsigned-byte 8)
+                                   :initial-contents '(0 1 2 3 4 5 6 7))))
+                   (cl-quic-kit:make-quic-client
+                    :server-host "127.0.0.1"
+                    :server-port (cl-quic-kit:udp-socket-local-port socket)
+                    :local-connection-id client-cid
+                    :transport-parameters
+                    (cl-quic-kit:encode-transport-parameters
+                     (list (cons 1 1000) (cons 15 client-cid)))
+                    :disable-hostname-verification-p t
+                    :alpn '("h3")
+                    :tls-trust-anchors
+                    (list
+                     (cl-tls-kit.x509:parse-certificate-der certificate-der))
+                    :tls-verify-signature #'crypto-kit:verify-signature
+                    :tls-signature-algorithms #(1027))))
+           (let* ((server-connection
+                    (server-test-loopback-handshake server client))
+                  (server-state
+                    (loop for entry being the hash-values
+                            of (cl-quic-kit::quic-server-connections server)
+                          when (eq (cl-quic-kit::server-connection-connection entry)
+                                   server-connection)
+                            return entry))
+                  (valid-packet
+                    (cl-quic-kit::%client-build-packet
+                     client :application
+                     (list (cl-quic-kit:make-frame :ping))))
+                  (ignored-0-rtt-packet
+                    (cl-quic-kit:encode-packet-header
+                     (cl-quic-kit:make-packet-header
+                      :type :0-rtt
+                      :version cl-quic-kit:*quic-version-1*
+                      :destination-connection-id
+                      (cl-quic-kit::quic-client-remote-connection-id client)
+                      :source-connection-id
+                      (cl-quic-kit::quic-client-local-connection-id client)
+                      :packet-number 0 :packet-number-length 1
+                      :payload (cl-quic-kit:encode-frame
+                       (cl-quic-kit:make-frame
+                        :stream :stream-id 0 :offset 0 :data #(1 2 3) :fin t))))))
+             (cl-quic-kit:connection-touch server-connection 0)
+             (let ((invalid-packet (copy-seq valid-packet)))
+               (setf (aref invalid-packet (1- (length invalid-packet)))
+                     (logxor (aref invalid-packet
+                                   (1- (length invalid-packet)))
+                             1))
+               (let ((received-before
+                     (cl-quic-kit::server-amplification-state-received
+                      (cl-quic-kit::server-connection-path server-state))))
+                 (cl-quic-kit:udp-send
+                  (cl-quic-kit:quic-client-udp-socket client)
+                  invalid-packet)
+                 (check (not (cl-quic-kit:quic-server-poll server 0.5))
+                        "server polling completes for a packet with an invalid authentication tag")
+                 (check
+                  (> (cl-quic-kit::server-amplification-state-received
+                      (cl-quic-kit::server-connection-path server-state))
+                     received-before)
+                  "the invalid protected packet reached the server over UDP")))
+             (check
+              (= (cl-quic-kit::quic-connection-last-activity server-connection) 0)
+              "unauthenticated packets do not reset server idle timeout")
+             (cl-quic-kit:udp-send
+              (cl-quic-kit:quic-client-udp-socket client) valid-packet)
+             (cl-quic-kit:quic-server-poll server 2)
+             (check
+              (eq (cl-quic-kit:connection-state server-connection) :established)
+              "authenticated peer traffic resets server idle timeout")
+             (check
+              (= (cl-quic-kit::quic-connection-last-activity server-connection) 2)
+              "server activity uses the quic-server-poll clock")
+             (check
+              (= (cl-quic-kit::quic-connection-idle-timeout server-connection) 1)
+              "server applies the peer max idle timeout")
+             (cl-quic-kit:connection-touch server-connection 0)
+             (cl-quic-kit:udp-send
+              (cl-quic-kit:quic-client-udp-socket client)
+              ignored-0-rtt-packet)
+             (let* ((path (cl-quic-kit::server-connection-path server-state))
+                    (engine (cl-quic-kit::server-connection-engine server-state))
+                    (streams (cl-quic-kit::quic-client-streams engine))
+                    (received-before
+                      (cl-quic-kit::server-amplification-state-received path))
+                    (stream-count-before (hash-table-count streams))
+                    (stream-data-before
+                      (loop for stream being the hash-values of streams
+                            sum (cl-quic-kit:stream-readable-bytes stream))))
+               (cl-quic-kit:quic-server-poll server 2)
+               (check
+                (> (cl-quic-kit::server-amplification-state-received path)
+                   received-before)
+                "0-RTT UDP ingress increases the server path's received bytes")
+               (check
+                (= (hash-table-count streams) stream-count-before)
+                "ignored 0-RTT data does not create a stream")
+               (check
+                (= (loop for stream being the hash-values of streams
+                         sum (cl-quic-kit:stream-readable-bytes stream))
+                   stream-data-before)
+                "ignored 0-RTT data is not delivered to a stream"))
+             (check
+              (and (eq (cl-quic-kit:connection-state server-connection) :closing)
+                   (= (cl-quic-kit::quic-connection-last-activity
+                       server-connection)
+                      0))
+              "ignored 0-RTT does not reset server idle timeout")))
+      (unwind-protect
+           (when client
+             (cl-quic-kit:client-close client))
+        (unwind-protect
+             (if server
+                 (cl-quic-kit:quic-server-close server)
+                 (when socket
+                   (cl-quic-kit:udp-close socket)))
+          (server-test-remove-temp-directory directory))))))

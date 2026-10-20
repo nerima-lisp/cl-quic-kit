@@ -23,7 +23,8 @@
   local-cid-sequences remote-cid-sequences next-local-sequence
   remote-retire-prior-to active-connection-id-limit
   tls-input tls-output io-read io-write on-close
-  closed-error closed-reason close-kind close-frame draining-deadline)
+  closed-error closed-reason close-kind close-frame draining-deadline
+  (alpn nil :accessor %quic-connection-alpn))
 
 (defun connection-state (connection)
   (quic-connection-state connection))
@@ -332,10 +333,11 @@
     (funcall (quic-connection-io-write connection) connection (ensure-octets bytes)))
   bytes)
 
-(defun connection-receive-frame (connection frame)
+(defun connection-receive-frame (connection frame &key (touch-p t))
   (when (member (quic-connection-state connection) '(:draining :closed))
     (return-from connection-receive-frame connection))
-  (connection-touch connection)
+  (when touch-p
+    (connection-touch connection))
   (case (frame-type frame)
     (:connection-close
      (setf (quic-connection-close-kind connection) :transport)
@@ -404,3 +406,6 @@
 (defun connection-tls-poll (connection)
   (when (functionp (quic-connection-tls-output connection))
     (funcall (quic-connection-tls-output connection))))
+(defun quic-connection-alpn (connection)
+  "Return the negotiated ALPN protocol, or NIL before selection."
+  (%quic-connection-alpn connection))
