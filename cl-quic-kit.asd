@@ -16,7 +16,8 @@
                              (:file "udp")
                              (:file "protection")
                              (:file "recovery")
-                             (:file "client"))))
+                             (:file "client")
+                             (:file "server"))))
   :in-order-to ((test-op (test-op "cl-quic-kit/tests"))))
 
 (asdf:defsystem "cl-quic-kit/tests"
