@@ -55,31 +55,35 @@
   (check
    (let* ((server
             (cl-quic-kit::%make-quic-server
-             :retry-tokens (make-hash-table :test (function equalp))
-             :paths (make-hash-table :test (function equalp))))
-          (first-path nil)
-          (second-path nil))
+             :retry-tokens (make-hash-table :test #'equalp)
+             :paths (make-hash-table :test #'equalp)))
+          (first-cid
+            (make-array 1 :element-type '(unsigned-byte 8) :initial-element 1))
+          (second-cid
+            (make-array 1 :element-type '(unsigned-byte 8) :initial-element 2)))
      (let ((cl-quic-kit::*quic-server-path-cache-limit* 1))
-       (setf first-path
-             (cl-quic-kit::%server-path server :first #(1) 0 t)
-             second-path
-             (cl-quic-kit::%server-path server :second #(2) 0 t))
-       (and first-path
-            (null second-path)
-            (= (hash-table-count (cl-quic-kit::quic-server-paths server))
-               1))))
+       (let ((first-path
+               (cl-quic-kit::%server-path server :first first-cid 0 t))
+             (second-path
+               (cl-quic-kit::%server-path server :second second-cid 0 t)))
+         (and first-path
+              (null second-path)
+              (= (hash-table-count (cl-quic-kit::quic-server-paths server))
+                 1)))))
    "server path cache enforces its configured capacity")
   (check
    (let* ((server
             (cl-quic-kit::%make-quic-server
-             :retry-tokens (make-hash-table :test (function equalp))))
+             :retry-tokens (make-hash-table :test #'equalp)))
           (path (cl-quic-kit::%make-server-amplification-state
                  :received 1200))
           (header
             (cl-quic-kit:make-packet-header
              :type :initial :version cl-quic-kit:*quic-version-1*
-             :destination-connection-id #(1 2 3 4)
-             :source-connection-id #(5 6 7 8))))
+             :destination-connection-id
+             (make-array 4 :element-type '(unsigned-byte 8) :initial-element 1)
+             :source-connection-id
+             (make-array 4 :element-type '(unsigned-byte 8) :initial-element 2))))
      (setf (gethash #(9) (cl-quic-kit::quic-server-retry-tokens server))
            :occupied)
      (let ((cl-quic-kit::*quic-server-retry-cache-limit* 1))
@@ -100,9 +104,13 @@
           (live-record
             (cl-quic-kit::%make-server-retry-token :retain-until 100))
           (expired-path-key
-            (cl-quic-kit::%server-path-key :expired-address #(3)))
+            (cl-quic-kit::%server-path-key
+             :expired-address
+             (make-array 1 :element-type '(unsigned-byte 8) :initial-element 3)))
           (live-path-key
-            (cl-quic-kit::%server-path-key :live-address #(4))))
+            (cl-quic-kit::%server-path-key
+             :live-address
+             (make-array 1 :element-type '(unsigned-byte 8) :initial-element 4))))
      (unwind-protect
           (progn
             (setf (gethash expired-token
@@ -410,11 +418,19 @@
                               path)
                              expected))
                      "server counts malformed Initial bytes before dropping an undersized Initial"))
-          (progn
+          (let* ((path (loop for path being the hash-values of
+                               (cl-quic-kit::quic-server-paths server)
+                             return path))
+                  (received-before
+                    (cl-quic-kit::server-amplification-state-received path)))
             (cl-quic-kit:udp-send
              peer (server-test-initial-packet
                    #xfaceb00c destination-cid source-cid #() 1199))
-            (cl-quic-kit:quic-server-poll server)
+            (server-test-poll-until
+             server
+             (lambda ()
+               (> (cl-quic-kit::server-amplification-state-received path)
+                  received-before)))
             (multiple-value-bind (response length address)
                 (cl-quic-kit:udp-receive peer)
               (declare (ignore length address))
