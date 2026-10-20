@@ -27,12 +27,15 @@ arguments, its first `(cl-quic-kit:client-poll client)` call starts the TLS hand
   `(cl-quic-kit:client-close client)`, `client-accept-peer-stream` returns `NIL`; use
   `(cl-quic-kit:quic-client-closed-p client)` to distinguish that case from no available stream. Pass a
   returned stream to `(cl-quic-kit:client-read-stream client stream)` to consume available octets. The
-  second return value is true when the peer's FIN or reset has arrived and all buffered octets are consumed. Write
-  with `(cl-quic-kit:client-write-stream client stream octets :fin-p t)`, then call
-  `(cl-quic-kit:client-poll client)` to send queued frames. The predicate
-  `(cl-quic-kit:client-stream-write-pending-p client stream)` reports queued or unsent data.
-  `(cl-quic-kit:client-close-stream client stream)` removes the stream from the client without sending FIN.
-  It drops writes waiting for flow control; already queued frames remain queued.
+  second return value is true when the peer's FIN or reset has arrived and all buffered octets are consumed.
+  To send FIN, write the final octets with
+  `(cl-quic-kit:client-write-stream client stream octets :fin-p t)`. This marks
+  the last STREAM frame with FIN. Call `(cl-quic-kit:client-poll client)` to send
+  queued frames. The predicate
+  `(cl-quic-kit:client-stream-write-pending-p client stream)` reports queued or
+  unsent data. `(cl-quic-kit:client-close-stream client stream)` removes a stream
+  from the client and does not send FIN. It drops writes waiting for flow control;
+  already queued frames remain queued.
 - `cl-quic-kit:quic-connection-closed-reason (connection)` returns a reason recorded on the connection as
   octets. It is `NIL` if no connection reason was recorded, and `#()` if a recorded reason is empty. The
   client's `(cl-quic-kit:client-close client :reason "client shutdown")` sends the optional `:reason` but
