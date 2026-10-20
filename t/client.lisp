@@ -426,3 +426,101 @@
                     "UDP receives the datagram and peer address"))))
     (when client (cl-quic-kit:udp-close client))
     (cl-quic-kit:udp-close server)))
+
+(let ((checks 0))
+  (labels ((contract-check (condition description)
+             (incf checks)
+             (check condition description)))
+    (let ((client (cl-quic-kit:make-quic-client
+                   :connection (cl-quic-kit:make-quic-connection)
+                   :disable-hostname-verification-p t)))
+      (contract-check (null (cl-quic-kit:client-accept-peer-stream client))
+                      "peer stream accept returns NIL before receipt")
+      (cl-quic-kit:client-poll client)
+      (contract-check (null (cl-quic-kit:client-accept-peer-stream client))
+                      "peer stream accept remains NIL when polling finds no stream"))
+    (let* ((writes nil)
+           (client (cl-quic-kit:make-quic-client
+                    :connection
+                    (cl-quic-kit:make-quic-connection
+                     :io-write (lambda (connection bytes)
+                                 (declare (ignore connection))
+                                 (push bytes writes)))
+                    :disable-hostname-verification-p t))
+           (local-stream (cl-quic-kit:client-open-stream client nil))
+           (payload (cl-quic-kit:encode-varint 42))
+           (response (cl-quic-kit:encode-varint 43)))
+      (cl-quic-kit:client-receive-frame
+       client (cl-quic-kit:make-frame :stream :stream-id 1 :data payload :fin t))
+      (cl-quic-kit:client-receive-frame
+       client (cl-quic-kit:make-frame :stream :stream-id 5 :data payload :fin t))
+      (cl-quic-kit:client-poll client)
+      (let* ((first (cl-quic-kit:client-accept-peer-stream client))
+             (second (cl-quic-kit:client-accept-peer-stream client))
+             (ids (and first second
+                       (list (cl-quic-kit:stream-id first)
+                             (cl-quic-kit:stream-id second))))
+             (bidi (find 1 (list first second) :key #'cl-quic-kit:stream-id)))
+        (contract-check (and first second (not (eq first second)))
+                        "received peer streams remain available after client-poll")
+        (contract-check (and ids
+                             (member (first ids) (list 1 5))
+                             (member (second ids) (list 1 5))
+                             (/= (first ids) (second ids)))
+                        "peer stream accept returns each received peer ID")
+        (contract-check (and first second
+                             (not (eq first local-stream))
+                             (not (eq second local-stream))
+                             (not (cl-quic-kit:stream-local-p first))
+                             (not (cl-quic-kit:stream-local-p second)))
+                        "peer stream accept never returns a local stream")
+        (contract-check (null (cl-quic-kit:client-accept-peer-stream client))
+                        "each peer stream is returned exactly once")
+        (multiple-value-bind (received fin-p)
+            (cl-quic-kit:client-read-stream client bidi)
+          (contract-check (and (equalp received payload) fin-p)
+                          "peer stream read returns its data and FIN"))
+        (cl-quic-kit:client-write-stream client bidi response :fin-p t)
+        (cl-quic-kit:client-poll client)
+        (let ((frame-wire
+                (cl-quic-kit:encode-frame
+                 (cl-quic-kit:make-frame :stream
+                                         :stream-id (cl-quic-kit:stream-id bidi)
+                                         :offset 0 :data response
+                                         :fin t :len-present t))))
+          (contract-check
+           (find frame-wire writes
+                 :test (lambda (expected actual) (equalp expected actual)))
+           "peer stream write sends its data and FIN"))))
+    (let* ((client (cl-quic-kit:make-quic-client
+                    :connection (cl-quic-kit:make-quic-connection)
+                    :disable-hostname-verification-p t))
+           (stream (cl-quic-kit:client-open-stream client nil)))
+      (cl-quic-kit:client-receive-frame
+       client (cl-quic-kit:make-frame :max-data :maximum 0))
+      (cl-quic-kit:client-write-stream client stream
+                                      (cl-quic-kit:encode-varint 1))
+      (contract-check (cl-quic-kit:client-stream-write-pending-p client stream)
+                      "flow-controlled writes remain pending through the public API"))
+    (let* ((client (cl-quic-kit:make-quic-client
+                    :connection (cl-quic-kit:make-quic-connection)
+                    :disable-hostname-verification-p t))
+           (connection (cl-quic-kit:quic-client-connection client)))
+      (contract-check (null (cl-quic-kit:quic-connection-closed-reason connection))
+                      "connection close reason is NIL before it is recorded")
+      (cl-quic-kit:connection-close connection :no-error "local shutdown")
+      (contract-check
+       (equalp (cl-quic-kit:quic-connection-closed-reason connection)
+               #(108 111 99 97 108 32 115 104 117 116 100 111 119 110))
+       "local connection-close reason is recorded as octets"))
+    (let* ((client (cl-quic-kit:make-quic-client
+                    :connection (cl-quic-kit:make-quic-connection)
+                    :disable-hostname-verification-p t)))
+      (cl-quic-kit:client-receive-frame
+       client (cl-quic-kit:make-frame :stream :stream-id 1
+                                      :data (cl-quic-kit:encode-varint 7)
+                                      :fin t))
+      (cl-quic-kit:client-close client :reason "client shutdown")
+      (contract-check (null (cl-quic-kit:client-accept-peer-stream client))
+                      "closed clients return NIL for queued peer streams"))
+    (format t "client public API contract: ~D checks~%" checks)))
