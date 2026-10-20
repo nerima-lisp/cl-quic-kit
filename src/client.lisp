@@ -4,7 +4,8 @@
 
 (defstruct (quic-client (:constructor %make-quic-client))
   connection udp-socket tls-boundary tls-driver
-  streams next-bidi-stream next-uni-stream
+  streams
+  (accepted-peer-streams (make-hash-table)) next-bidi-stream next-uni-stream
   pending-frames pending-stream-writes crypto-send-offsets
   peer-transport-parameters closed-p started-p
   flow-control
@@ -1144,6 +1145,21 @@
        (max maximum (flow-control-connection-receive-limit
                      (quic-client-flow-control client)))))
     (values data fin)))
+
+(defun client-accept-peer-stream (client)
+  "Return one unaccepted peer-initiated stream, or NIL when none is available or CLIENT is closed."
+  (unless (quic-client-closed-p client)
+    (let ((accepted nil)
+          (accepted-ids (quic-client-accepted-peer-streams client)))
+      (maphash
+       (lambda (id stream)
+         (when (and (null accepted)
+                    (not (stream-local-p stream))
+                    (not (gethash id accepted-ids)))
+           (setf accepted stream
+                 (gethash id accepted-ids) t)))
+       (quic-client-streams client))
+      accepted)))
 
 (defun client-close-stream (client stream &key condition)
   (declare (ignore condition))
