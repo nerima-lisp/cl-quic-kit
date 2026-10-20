@@ -127,7 +127,7 @@
                            (cl-quic-kit::quic-server-paths server))
                   (cl-quic-kit::%make-server-amplification-state
                    :expires-at 100))
-            (cl-quic-kit:quic-server-poll server 2)
+            (cl-quic-kit:quic-server-poll server 1)
             (and (null (gethash expired-token
                                 (cl-quic-kit::quic-server-retry-tokens server)))
                  (eq live-record
