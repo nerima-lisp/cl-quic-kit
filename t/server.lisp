@@ -51,6 +51,86 @@
 (check (server-test-type-error-p
         (lambda () (cl-quic-kit:make-quic-server)))
        "server requires a positive max-connections value")
+(progn
+  (check
+   (let* ((server
+            (cl-quic-kit::%make-quic-server
+             :retry-tokens (make-hash-table :test (function equalp))
+             :paths (make-hash-table :test (function equalp))))
+          (first-path nil)
+          (second-path nil))
+     (let ((cl-quic-kit::*quic-server-path-cache-limit* 1))
+       (setf first-path
+             (cl-quic-kit::%server-path server :first #(1) 0 t)
+             second-path
+             (cl-quic-kit::%server-path server :second #(2) 0 t))
+       (and first-path
+            (null second-path)
+            (= (hash-table-count (cl-quic-kit::quic-server-paths server))
+               1))))
+   "server path cache enforces its configured capacity")
+  (check
+   (let* ((server
+            (cl-quic-kit::%make-quic-server
+             :retry-tokens (make-hash-table :test (function equalp))))
+          (path (cl-quic-kit::%make-server-amplification-state
+                 :received 1200))
+          (header
+            (cl-quic-kit:make-packet-header
+             :type :initial :version cl-quic-kit:*quic-version-1*
+             :destination-connection-id #(1 2 3 4)
+             :source-connection-id #(5 6 7 8))))
+     (setf (gethash #(9) (cl-quic-kit::quic-server-retry-tokens server))
+           :occupied)
+     (let ((cl-quic-kit::*quic-server-retry-cache-limit* 1))
+       (and (null (cl-quic-kit::%server-send-retry
+                   server header path :peer 0))
+            (= (hash-table-count
+                (cl-quic-kit::quic-server-retry-tokens server))
+               1))))
+   "server Retry token cache enforces its configured capacity")
+  (check
+   (let* ((server
+            (cl-quic-kit:make-quic-server
+             :local-address "127.0.0.1" :local-port 0 :max-connections 1))
+          (expired-token #(1))
+          (live-token #(2))
+          (expired-record
+            (cl-quic-kit::%make-server-retry-token :retain-until 1))
+          (live-record
+            (cl-quic-kit::%make-server-retry-token :retain-until 100))
+          (expired-path-key
+            (cl-quic-kit::%server-path-key :expired-address #(3)))
+          (live-path-key
+            (cl-quic-kit::%server-path-key :live-address #(4))))
+     (unwind-protect
+          (progn
+            (setf (gethash expired-token
+                           (cl-quic-kit::quic-server-retry-tokens server))
+                  expired-record
+                  (gethash live-token
+                           (cl-quic-kit::quic-server-retry-tokens server))
+                  live-record
+                  (gethash expired-path-key
+                           (cl-quic-kit::quic-server-paths server))
+                  (cl-quic-kit::%make-server-amplification-state
+                   :expires-at 1)
+                  (gethash live-path-key
+                           (cl-quic-kit::quic-server-paths server))
+                  (cl-quic-kit::%make-server-amplification-state
+                   :expires-at 100))
+            (cl-quic-kit:quic-server-poll server 2)
+            (and (null (gethash expired-token
+                                (cl-quic-kit::quic-server-retry-tokens server)))
+                 (eq live-record
+                     (gethash live-token
+                              (cl-quic-kit::quic-server-retry-tokens server)))
+                 (null (gethash expired-path-key
+                                (cl-quic-kit::quic-server-paths server)))
+                 (gethash live-path-key
+                          (cl-quic-kit::quic-server-paths server))))
+       (cl-quic-kit:quic-server-close server)))
+   "server poll prunes expired Retry and path cache entries while retaining live entries"))
 (check
  (let* ((server
           (cl-quic-kit::%make-quic-server
@@ -330,8 +410,19 @@
                               path)
                              expected))
                      "server counts malformed Initial bytes before dropping an undersized Initial"))
-          (cl-quic-kit:udp-send
-           peer (server-test-initial-packet #xfaceb00c destination-cid source-cid)))
+          (progn
+            (cl-quic-kit:udp-send
+             peer (server-test-initial-packet
+                   #xfaceb00c destination-cid source-cid #() 1199))
+            (cl-quic-kit:quic-server-poll server)
+            (multiple-value-bind (response length address)
+                (cl-quic-kit:udp-receive peer)
+              (declare (ignore length address))
+              (check (null response)
+                     "server drops an unknown-version 1199-byte Initial without Version Negotiation"))
+            (cl-quic-kit:udp-send
+             peer (server-test-initial-packet
+                   #xfaceb00c destination-cid source-cid))))
         (server-test-poll-until
          server
          (lambda ()
@@ -434,18 +525,14 @@
                       (server-test-poll-until
                        server
                        (lambda ()
-                         (loop for key being the hash-keys
+                         (loop
+                               for key being the hash-keys
                                  of (cl-quic-kit::quic-server-paths server)
-                               when (equalp (second key) wide-dcid)
-                                 thereis
-                                 (let ((path
-                                         (gethash
-                                          key
-                                          (cl-quic-kit::quic-server-paths server))))
-                                   (and path
-                                        (plusp
-                                         (cl-quic-kit::server-amplification-state-sent
-                                          path)))))))
+                               using (hash-value path)
+                               thereis
+                                 (and (equalp (second key) wide-dcid)
+                                      (plusp
+                                       (cl-quic-kit::server-amplification-state-sent path))))))
                       (multiple-value-bind (response length address)
                           (server-test-receive peer)
                         (declare (ignore length address))
