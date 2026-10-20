@@ -156,8 +156,8 @@ configuration file, replacing each placeholder path with its checkout directory:
 
 After configuring the registry, applications can load the system with `(asdf:load-system "cl-quic-kit")`.
 
-The Nix development shell and test command are defined for x86_64-linux. On that platform, run the suite
-from the repository root; the shell sets the
+The Nix development shell and test command are defined for x86_64-linux. Run the suite from the repository
+root; the shell sets the
 ASDF source registry for those dependencies and provides OpenSSL for the loopback TLS test, which creates
 temporary credentials:
 
