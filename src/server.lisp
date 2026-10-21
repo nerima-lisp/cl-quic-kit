@@ -683,7 +683,7 @@
                (funcall emit
                         (server-connection-tls-boundary server-connection)
                         protocol))
-             (setf (%quic-connection-alpn
+             (setf (quic-connection-alpn
                     (server-connection-connection server-connection))
                    (and protocol (copy-seq protocol)))))
           (:ticket-issued nil)

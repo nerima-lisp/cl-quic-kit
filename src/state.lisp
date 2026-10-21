@@ -28,7 +28,7 @@
   remote-retire-prior-to active-connection-id-limit
   tls-input tls-output io-read io-write on-close
   closed-error closed-reason close-kind close-frame draining-deadline
-  (alpn nil :accessor %quic-connection-alpn))
+  (alpn nil))
 
 (defun connection-state (connection)
   (quic-connection-state connection))
@@ -421,6 +421,3 @@
 (defun connection-tls-poll (connection)
   (when (functionp (quic-connection-tls-output connection))
     (funcall (quic-connection-tls-output connection))))
-(defun quic-connection-alpn (connection)
-  "Return the negotiated ALPN protocol, or NIL before selection."
-  (%quic-connection-alpn connection))
