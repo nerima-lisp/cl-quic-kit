@@ -235,9 +235,7 @@
          (server nil)
          (client nil))
     (unwind-protect
-         (multiple-value-bind (certificate-der private-key)
-             (server-test-make-credential directory)
-           (setf socket
+         (multiple-value-bind (server-tls-options client-tls-options) (server-test-tls-settings directory) (setf socket
                  (cl-quic-kit:make-udp-socket :local-host "127.0.0.1"
                                               :local-port 0))
            (setf server
@@ -245,21 +243,13 @@
                   :udp-socket socket
                   :max-connections 2
                   :tls-server-options
-                  (list :certificate-chain (list certificate-der)
-                        :private-key private-key
-                        :alpn-protocols (list "h3"))))
+                  (append server-tls-options (list :alpn-protocols (list "h3")))))
            (setf client
-                 (cl-quic-kit:make-quic-client
-                  :server-host "127.0.0.1"
+                 (apply (function cl-quic-kit:make-quic-client) :server-host "127.0.0.1"
                   :server-port (cl-quic-kit:udp-socket-local-port socket)
                   :hostname "localhost"
                   :now-fn (lambda () 0)
-                  :alpn (list "h3")
-                  :tls-trust-anchors
-                  (list (cl-tls-kit.x509:parse-certificate-der certificate-der))
-                  :tls-verify-signature
-                  (function crypto-kit:verify-signature)
-                  :tls-signature-algorithms #(1027)))
+                  :alpn (list "h3") client-tls-options))
            (progn
              (cl-quic-kit:client-poll client 0)
              (progn
@@ -656,20 +646,18 @@
          (client nil))
     (unwind-protect
          (progn
-           (multiple-value-bind (certificate-der private-key)
-               (server-test-make-credential directory)
-             (setf server
+           (multiple-value-bind (server-tls-options client-tls-options) (server-test-tls-settings directory) (setf server
                    (cl-quic-kit:make-quic-server
                     :udp-socket server-socket :max-connections 1
                     :retry-policy :never
                     :tls-server-options
-                    (list :certificate-chain (list certificate-der)
-                          :private-key private-key))))
-           (setf client
-                 (cl-quic-kit:make-quic-client
-                  :server-host "127.0.0.1"
-                  :server-port (cl-quic-kit:udp-socket-local-port server-socket)
-                  :hostname "localhost" :now-fn (lambda () 0)))
+                    server-tls-options)) (setf client
+                 (apply (function cl-quic-kit:make-quic-client)
+                        :server-host "127.0.0.1"
+                        :server-port (cl-quic-kit:udp-socket-local-port server-socket)
+                        :hostname "localhost"
+                        :now-fn (lambda () 0)
+                        client-tls-options)))
            (cl-quic-kit:client-poll client 0)
            (server-test-poll-until
             server
@@ -713,10 +701,9 @@
 
   (defun server-test-corrupted-retry-token ()
     (let* ((directory (server-test-make-temp-directory))
-           (credentials
-            (multiple-value-list (server-test-make-credential directory)))
-           (certificate-der (first credentials))
-           (private-key (second credentials))
+           (credentials (multiple-value-list (server-test-tls-settings directory)))
+           (server-tls-options (first credentials))
+           (client-tls-options (second credentials))
            (server-socket
             (cl-quic-kit:make-udp-socket :local-host "127.0.0.1" :local-port 0))
            (server nil)
@@ -728,14 +715,8 @@
                                                        :max-connections
                                                        2
                                                        :tls-server-options
-                                                       (list :certificate-chain
-                                                             (list
-                                                              certificate-der)
-                                                             :private-key
-                                                             private-key
-                                                             :alpn-protocols
-                                                             (list "h3"))))
-            (setf client (cl-quic-kit:make-quic-client :server-host
+                                                       (append server-tls-options (list :alpn-protocols (list "h3")))))
+            (setf client (apply (function cl-quic-kit:make-quic-client) :server-host
                                                        "127.0.0.1"
                                                        :server-port
                                                        (cl-quic-kit:udp-socket-local-port
@@ -746,17 +727,7 @@
                                                        (lambda ()
                                                          0)
                                                        :alpn
-                                                       (list "h3")
-                                                       :tls-trust-anchors
-                                                       (list
-                                                        (cl-tls-kit.x509:parse-certificate-der
-                                                         certificate-der))
-                                                       :tls-verify-signature
-                                                       (function
-                                                        crypto-kit:verify-signature)
-                                                       :tls-signature-algorithms
-                                                       ;; TLS SignatureScheme ecdsa_secp256r1_sha256 matches the generated P-256 key.
-                                                       #(#x0403)))
+                                                       (list "h3") client-tls-options))
             (multiple-value-bind (token record)
                 (server-test-issue-retry server client)
               (let ((corrupted-token (copy-seq token)))
@@ -1028,6 +999,17 @@
      "ec" "-in" key-path "-outform" "DER" "-out" der-path)
     (values (server-test-read-certificate-der certificate-path)
             (server-test-read-p256-private-key der-path))))
+(defun server-test-tls-settings (directory)
+  (multiple-value-bind (generated-certificate generated-private-key)
+      (server-test-make-credential directory)
+    (values
+     (list :certificate-chain (list generated-certificate)
+           :private-key generated-private-key)
+     (list :tls-trust-anchors
+           (list (cl-tls-kit.x509:parse-certificate-der generated-certificate))
+           :tls-verify-signature (function crypto-kit:verify-signature)
+           ;; The generated P-256 credential uses ecdsa_secp256r1_sha256.
+           :tls-signature-algorithms #(#x0403)))))
 (defun server-test-loopback-handshake (server client)
   (let ((accepted nil))
     (loop repeat 1000
@@ -1074,22 +1056,14 @@
                          (unwind-protect
                              (progn
                                (setf client
-                                     (cl-quic-kit:make-quic-client
-                                      :server-host "127.0.0.1"
+                                     (apply (function cl-quic-kit:make-quic-client) :server-host "127.0.0.1"
                                       :server-port
                                       (cl-quic-kit:udp-socket-local-port socket)
                                       :hostname "localhost"
                                       :local-connection-id client-source-cid
                                       :transport-parameters parameter-bytes
                                       :disable-hostname-verification-p t
-                                      :alpn (list "h3")
-                                      :tls-trust-anchors
-                                      (list
-                                       (cl-tls-kit.x509:parse-certificate-der
-                                        certificate-der))
-                                      :tls-verify-signature
-                                      #'crypto-kit:verify-signature
-                                      :tls-signature-algorithms #(1027)))
+                                      :alpn (list "h3") client-tls-options))
                                (setf server-connection
                                      (loop repeat 2000
                                            do (cl-quic-kit:client-poll client)
@@ -1222,9 +1196,7 @@
          (server nil)
          (client nil))
     (unwind-protect
-         (multiple-value-bind (certificate-der private-key)
-             (server-test-make-credential directory)
-           (setf socket
+         (multiple-value-bind (server-tls-options client-tls-options) (server-test-tls-settings directory) (setf socket
                  (cl-quic-kit:make-udp-socket
                   :local-host "127.0.0.1" :local-port 0))
            (setf server
@@ -1234,21 +1206,13 @@
                   :retry-policy :always
                   :transport-parameters (list :initial-max-data 2097152)
                   :tls-server-options
-                  (list :certificate-chain (list certificate-der)
-                        :private-key private-key
-                        :alpn-protocols (list "h3"))))
+                  (append server-tls-options (list :alpn-protocols (list "h3")))))
            (setf client
-                 (cl-quic-kit:make-quic-client
-                  :server-host "127.0.0.1"
+                 (apply (function cl-quic-kit:make-quic-client) :server-host "127.0.0.1"
                   :server-port (cl-quic-kit:udp-socket-local-port socket)
                   :idle-timeout 60
                   :disable-hostname-verification-p t
-                  :alpn '("h3")
-                  :tls-trust-anchors
-                  (list
-                   (cl-tls-kit.x509:parse-certificate-der certificate-der))
-                  :tls-verify-signature #'crypto-kit:verify-signature
-                  :tls-signature-algorithms #(1027)))
+                  :alpn '("h3") client-tls-options))
            (let ((server-connection
                    (server-test-loopback-handshake server client)))
              (check
@@ -1323,9 +1287,7 @@
          (server nil)
          (client nil))
     (unwind-protect
-         (multiple-value-bind (certificate-der private-key)
-             (server-test-make-credential directory)
-           (setf socket
+         (multiple-value-bind (server-tls-options client-tls-options) (server-test-tls-settings directory) (setf socket
                  (cl-quic-kit:make-udp-socket
                   :local-host "127.0.0.1" :local-port 0))
            (setf server
@@ -1334,27 +1296,19 @@
                   :max-connections 1
                   :retry-policy :always
                   :tls-server-options
-                  (list :certificate-chain (list certificate-der)
-                        :private-key private-key
-                        :alpn-protocols (list "h3"))))
+                  (append server-tls-options (list :alpn-protocols (list "h3")))))
            (setf client
                  (let ((client-cid
                        (make-array 8 :element-type '(unsigned-byte 8)
                                    :initial-contents '(0 1 2 3 4 5 6 7))))
-                   (cl-quic-kit:make-quic-client
-                    :server-host "127.0.0.1"
+                   (apply (function cl-quic-kit:make-quic-client) :server-host "127.0.0.1"
                     :server-port (cl-quic-kit:udp-socket-local-port socket)
                     :local-connection-id client-cid
                     :transport-parameters
                     (cl-quic-kit:encode-transport-parameters
                      (list (cons 1 1000) (cons 15 client-cid)))
                     :disable-hostname-verification-p t
-                    :alpn '("h3")
-                    :tls-trust-anchors
-                    (list
-                     (cl-tls-kit.x509:parse-certificate-der certificate-der))
-                    :tls-verify-signature #'crypto-kit:verify-signature
-                    :tls-signature-algorithms #(1027))))
+                    :alpn '("h3") client-tls-options)))
            (let* ((server-connection
                     (server-test-loopback-handshake server client))
                   (server-state
