@@ -711,47 +711,98 @@
         (server-test-remove-temp-directory directory)))))
 
 
-  (let* ((server-socket
-          (cl-quic-kit:make-udp-socket :local-host "127.0.0.1" :local-port 0))
-         (server (cl-quic-kit:make-quic-server
-                  :udp-socket server-socket :max-connections 2))
-         (client (cl-quic-kit:make-quic-client
-                  :server-host "127.0.0.1"
-                  :server-port (cl-quic-kit:udp-socket-local-port server-socket)
-                  :hostname "localhost" :now-fn (lambda () 0))))
-    (unwind-protect
-        (multiple-value-bind (token record)
-            (server-test-issue-retry server client)
-          (let ((corrupted-token (copy-seq token)))
-            (setf (aref corrupted-token 0)
-                  (logxor (aref corrupted-token 0) #xff))
-            (let ((header
-                   (server-test-invalid-token-response
-                    server client (cl-quic-kit::quic-client-udp-socket client)
-                    (server-test-initial-packet
-                     cl-quic-kit:*quic-version-1*
-                     (cl-quic-kit::server-retry-token-retry-source-connection-id
-                      record)
-                     (cl-quic-kit::server-retry-token-client-source-connection-id
-                      record)
-                     corrupted-token)
-                    record)))
-              (check (and header
-                          (eq (cl-quic-kit:packet-header-type header) :initial))
-                     "a corrupted token for an issued Retry SCID receives a protected Initial")
-              (check (and (eq (cl-quic-kit:connection-state
-                               (cl-quic-kit:quic-client-connection client))
-                              :draining)
-                          (= (cl-quic-kit::quic-connection-closed-error
-                              (cl-quic-kit:quic-client-connection client))
-                             #x0b))
-                     "a corrupted token for an issued Retry SCID receives INVALID_TOKEN")
-              (check (= (hash-table-count
-                         (cl-quic-kit::quic-server-retry-tokens server))
-                        1)
-                     "a corrupted token for an issued Retry SCID does not trigger a second Retry"))))
-      (cl-quic-kit:client-close client)
-      (cl-quic-kit:quic-server-close server)))
+  (defun server-test-corrupted-retry-token ()
+    (let* ((directory (server-test-make-temp-directory))
+           (credentials
+            (multiple-value-list (server-test-make-credential directory)))
+           (certificate-der (first credentials))
+           (private-key (second credentials))
+           (server-socket
+            (cl-quic-kit:make-udp-socket :local-host "127.0.0.1" :local-port 0))
+           (server nil)
+           (client nil))
+      (unwind-protect
+          (progn
+            (setf server (cl-quic-kit:make-quic-server :udp-socket
+                                                       server-socket
+                                                       :max-connections
+                                                       2
+                                                       :tls-server-options
+                                                       (list :certificate-chain
+                                                             (list
+                                                              certificate-der)
+                                                             :private-key
+                                                             private-key
+                                                             :alpn-protocols
+                                                             (list "h3"))))
+            (setf client (cl-quic-kit:make-quic-client :server-host
+                                                       "127.0.0.1"
+                                                       :server-port
+                                                       (cl-quic-kit:udp-socket-local-port
+                                                        server-socket)
+                                                       :hostname
+                                                       "localhost"
+                                                       :now-fn
+                                                       (lambda ()
+                                                         0)
+                                                       :alpn
+                                                       (list "h3")
+                                                       :tls-trust-anchors
+                                                       (list
+                                                        (cl-tls-kit.x509:parse-certificate-der
+                                                         certificate-der))
+                                                       :tls-verify-signature
+                                                       (function
+                                                        crypto-kit:verify-signature)
+                                                       :tls-signature-algorithms
+                                                       ;; TLS SignatureScheme ecdsa_secp256r1_sha256 matches the generated P-256 key.
+                                                       #(#x0403)))
+            (multiple-value-bind (token record)
+                (server-test-issue-retry server client)
+              (let ((corrupted-token (copy-seq token)))
+                (setf (aref corrupted-token 0) (logxor (aref corrupted-token 0)
+                                                       #xff))
+                (let ((header
+                       (server-test-invalid-token-response server
+                                                           client
+                                                           (cl-quic-kit::quic-client-udp-socket
+                                                            client)
+                                                           (server-test-initial-packet
+                                                            cl-quic-kit:*quic-version-1*
+                                                            (cl-quic-kit::server-retry-token-retry-source-connection-id
+                                                             record)
+                                                            (cl-quic-kit::server-retry-token-client-source-connection-id
+                                                             record)
+                                                            corrupted-token)
+                                                           record)))
+                  (check
+                   (and header
+                        (eq (cl-quic-kit:packet-header-type header) :initial))
+                   "a corrupted token for an issued Retry SCID receives an Initial packet")
+                  (check
+                   (and
+                    (eq
+                     (cl-quic-kit:connection-state
+                      (cl-quic-kit:quic-client-connection client))
+                     :draining)
+                    (=
+                     (cl-quic-kit::quic-connection-closed-error
+                      (cl-quic-kit:quic-client-connection client))
+                     #x0b))
+                   "a corrupted token for an issued Retry SCID receives INVALID_TOKEN")
+                  (check
+                   (=
+                    (hash-table-count
+                     (cl-quic-kit::quic-server-retry-tokens server))
+                    1)
+                   "a corrupted token for an issued Retry SCID does not trigger a second Retry")))))
+        (when client
+          (cl-quic-kit:client-close client))
+        (unwind-protect
+            (if server
+                (cl-quic-kit:quic-server-close server)
+                (cl-quic-kit:udp-close server-socket))
+          (server-test-remove-temp-directory directory)))))
 
   (let* ((server-socket
           (cl-quic-kit:make-udp-socket :local-host "127.0.0.1" :local-port 0))
@@ -1163,6 +1214,7 @@
       (unless (and (integerp exit-code) (zerop exit-code))
         (error "Could not remove the temporary TLS test directory"))))
   (server-test-retry-policy-never)
+  (server-test-corrupted-retry-token)
   (server-test-retry-token-validation))
 (progn
   (let* ((directory (server-test-make-temp-directory))
