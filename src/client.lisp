@@ -447,9 +447,9 @@
               (%client-install-secret client level direction
                                        (funcall secret-reader state)))))))))
 
-(defun %client-transport-parameters (local-connection-id)
+(defun %client-transport-parameters (local-connection-id idle-timeout)
   (encode-transport-parameters
-   `((1 . 30) (3 . 65527) (4 . 1048576)
+   `((1 . ,(* idle-timeout 1000)) (3 . 65527) (4 . 1048576)
      (5 . 65536) (6 . 65536) (7 . 65536)
      (8 . 25) (9 . 25) (10 . 3) (11 . 25)
      (14 . 2) (15 . ,local-connection-id))))
@@ -1006,7 +1006,9 @@
                   :server-host server-host :server-port server-port
                   :hostname hostname :alpn alpn
                   :transport-parameters (or transport-parameters
-                                            (%client-transport-parameters local))
+                                            (%client-transport-parameters
+                                             local
+                                             (quic-connection-idle-timeout connection)))
                   :tls-key-exchange tls-key-exchange :tls-provider tls-provider
                   :tls-trust-anchors tls-trust-anchors
                   :tls-verify-signature tls-verify-signature
@@ -1321,7 +1323,7 @@
                      (declare (ignore boundary))
                      (let ((parameters (if (listp parameters)
                                            parameters
-                                           (decode-transport-parameters parameters))))
+                                           (decode-transport-parameters parameters :sender-role :server))))
                        (setf (quic-client-peer-transport-parameters client) parameters)
                        (let ((flow (quic-client-flow-control client)))
                          (when (zerop (flow-control-connection-sent flow))
@@ -1396,18 +1398,47 @@
                          (%client-tls-level-call
                           level
                           (lambda (tls-level)
-                            (if (and (= type 1)
-                                     (%client-function
-                                      "CL-TLS-KIT"
-                                      "QUIC-TLS-BOUNDARY-SEND-WITH-TRANSPORT-PARAMETERS"))
-                                (funcall (%client-function
-                                          "CL-TLS-KIT"
-                                          "QUIC-TLS-BOUNDARY-SEND-WITH-TRANSPORT-PARAMETERS")
-                                         boundary tls-level type (subseq wire 4)
-                                         (quic-client-transport-parameters client))
-                                (funcall (%client-function "CL-TLS-KIT"
-                                                           "QUIC-TLS-BOUNDARY-SEND")
-                                         boundary tls-level type (subseq wire 4)))))
+                            (let* ((client-hello
+                                      (%client-driver-slot
+                                       driver
+                                       "TLS13-CLIENT-DRIVER-CLIENT-HELLO"))
+                                   (client-hello-extensions
+                                     (and client-hello
+                                          (cl-tls-kit:tls13-client-hello-extensions
+                                           client-hello)))
+                                   (transport-parameters-offered-p
+                                     (and client-hello-extensions
+                                          (find #x0039 client-hello-extensions
+                                                :key (function
+                                                      cl-tls-kit:tls-extension-type))))
+                                   (send-with-transport-parameters
+                                     (and (= type 1)
+                                          client-hello
+                                          (not transport-parameters-offered-p)
+                                          (%client-function
+                                           "CL-TLS-KIT"
+                                           "QUIC-TLS-BOUNDARY-SEND-WITH-TRANSPORT-PARAMETERS"))))
+                                (if send-with-transport-parameters
+                                    (progn
+                                      (funcall send-with-transport-parameters
+                                               boundary tls-level type
+                                               (subseq wire 4)
+                                               (quic-client-transport-parameters
+                                                client))
+                                      (setf
+                                       (cl-tls-kit:tls13-client-hello-extensions
+                                        client-hello)
+                                       (append
+                                        client-hello-extensions
+                                        (list
+                                         (cl-tls-kit:make-tls-extension
+                                          #x0039
+                                          (quic-client-transport-parameters
+                                           client))))))
+                                  (funcall (%client-function
+                                            "CL-TLS-KIT"
+                                            "QUIC-TLS-BOUNDARY-SEND")
+                                           boundary tls-level type (subseq wire 4))))))
                          (when (and (= type 1)
                                     (> (length (quic-client-pending-frames client)) before))
                            (setf (quic-client-client-hello-wire client)
