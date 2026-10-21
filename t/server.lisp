@@ -229,93 +229,119 @@
   (check (= send-count 1)
          "an insufficient amplification budget does not call the datagram sender"))
 
-(let* ((socket (cl-quic-kit:make-udp-socket :local-host "127.0.0.1"
-                                            :local-port 0))
-       (server (cl-quic-kit:make-quic-server :udp-socket socket
-                                             :max-connections 2))
-       (client (cl-quic-kit:make-quic-client
-                :server-host "127.0.0.1"
-                :server-port (cl-quic-kit:udp-socket-local-port socket)
-                :hostname "localhost"
-                :now-fn (lambda () 0))))
-  (unwind-protect
-       (progn
-         (cl-quic-kit:client-poll client 0)
-         (progn
-           (server-test-poll-until
-            server
-            (lambda ()
-              (plusp
-               (hash-table-count
-                (cl-quic-kit::quic-server-retry-tokens server)))))
-           (server-test-client-receive client))
-         (check (not (cl-quic-kit:quic-client-closed-p client))
-                "client accepts the server Retry integrity tag")
-         (multiple-value-bind (token record)
-             (server-test-token-entry server)
-           (check (and token record
-                     (not (equalp
-                           (cl-quic-kit::server-retry-token-retry-source-connection-id
-                            record)
-                           (cl-quic-kit::server-retry-token-original-destination-connection-id
-                            record))))
-                  "server retains a Retry token whose Retry source CID differs from its Initial destination CID")
-           (check (eq (cl-quic-kit::%server-token-status
-                       server token
-                       (cl-quic-kit::server-retry-token-address record)
-                       (cl-quic-kit::server-retry-token-retry-source-connection-id record)
-                       (cl-quic-kit::server-retry-token-client-source-connection-id record)
-                       (1- (cl-quic-kit::server-retry-token-expires-at record)))
-                      :valid)
-                  "a fresh Retry token validates for its source address and connection IDs")
-           (check (eq (cl-quic-kit::%server-token-status
-                       server #(0 1 2)
-                       (cl-quic-kit::server-retry-token-address record)
-                       #(0 1 2)
-                       (cl-quic-kit::server-retry-token-client-source-connection-id record)
-                       0)
-                      :unknown)
-                  "an unrecognized token has no cached Retry record")
-           (check (eq (cl-quic-kit::%server-token-status
-                       server token :different-address
-                       (cl-quic-kit::server-retry-token-retry-source-connection-id record)
-                       (cl-quic-kit::server-retry-token-client-source-connection-id record)
-                       (1- (cl-quic-kit::server-retry-token-expires-at record)))
-                      :address-mismatch)
-                  "Retry tokens are bound to the source address")
-           (check (eq (cl-quic-kit::%server-token-status
-                       server token
-                       (cl-quic-kit::server-retry-token-address record)
-                       #(0 1 2)
-                       (cl-quic-kit::server-retry-token-client-source-connection-id record)
-                       0)
-                      :connection-id-mismatch)
-                  "Retry tokens are bound to the Retry source connection ID")
-           (cl-quic-kit:client-poll client 0)
-           (server-test-poll-until
-            server
-            (lambda ()
-              (cl-quic-kit::server-retry-token-used-p record)))
-           (check (cl-quic-kit::server-retry-token-used-p record)
-                  "client API returns the Retry token in its next Initial")
-           (check (eq (cl-quic-kit::%server-token-status
-                       server token
-                       (cl-quic-kit::server-retry-token-address record)
-                       (cl-quic-kit::server-retry-token-retry-source-connection-id record)
-                       (cl-quic-kit::server-retry-token-client-source-connection-id record)
-                       (1- (cl-quic-kit::server-retry-token-expires-at record)))
-                      :valid)
-                  "a Retry token remains valid when repeated for the same address and connection IDs")
-           (check (eq (cl-quic-kit::%server-token-status
-                       server token
-                       (cl-quic-kit::server-retry-token-address record)
-                       (cl-quic-kit::server-retry-token-retry-source-connection-id record)
-                       (cl-quic-kit::server-retry-token-client-source-connection-id record)
-                       (cl-quic-kit::server-retry-token-expires-at record))
-                      :expired)
-                  "Retry tokens expire at their finite lifetime")))
-    (cl-quic-kit:client-close client)
-    (cl-quic-kit:quic-server-close server)))
+(defun server-test-retry-token-validation ()
+  (let* ((directory (server-test-make-temp-directory))
+         (socket nil)
+         (server nil)
+         (client nil))
+    (unwind-protect
+         (multiple-value-bind (certificate-der private-key)
+             (server-test-make-credential directory)
+           (setf socket
+                 (cl-quic-kit:make-udp-socket :local-host "127.0.0.1"
+                                              :local-port 0))
+           (setf server
+                 (cl-quic-kit:make-quic-server
+                  :udp-socket socket
+                  :max-connections 2
+                  :tls-server-options
+                  (list :certificate-chain (list certificate-der)
+                        :private-key private-key
+                        :alpn-protocols (list "h3"))))
+           (setf client
+                 (cl-quic-kit:make-quic-client
+                  :server-host "127.0.0.1"
+                  :server-port (cl-quic-kit:udp-socket-local-port socket)
+                  :hostname "localhost"
+                  :now-fn (lambda () 0)
+                  :alpn (list "h3")
+                  :tls-trust-anchors
+                  (list (cl-tls-kit.x509:parse-certificate-der certificate-der))
+                  :tls-verify-signature
+                  (function crypto-kit:verify-signature)
+                  :tls-signature-algorithms #(1027)))
+           (progn
+             (cl-quic-kit:client-poll client 0)
+             (progn
+               (server-test-poll-until
+                server
+                (lambda ()
+                  (plusp
+                   (hash-table-count
+                    (cl-quic-kit::quic-server-retry-tokens server)))))
+               (server-test-client-receive client))
+             (check (not (cl-quic-kit:quic-client-closed-p client))
+                    "client accepts the server Retry integrity tag")
+             (multiple-value-bind (token record)
+                 (server-test-token-entry server)
+               (check (and token record
+                           (not (equalp
+                                 (cl-quic-kit::server-retry-token-retry-source-connection-id
+                                  record)
+                                 (cl-quic-kit::server-retry-token-original-destination-connection-id
+                                  record))))
+                      "server retains a Retry token whose Retry source CID differs from its Initial destination CID")
+               (check (eq (cl-quic-kit::%server-token-status
+                           server token
+                           (cl-quic-kit::server-retry-token-address record)
+                           (cl-quic-kit::server-retry-token-retry-source-connection-id record)
+                           (cl-quic-kit::server-retry-token-client-source-connection-id record)
+                           (1- (cl-quic-kit::server-retry-token-expires-at record)))
+                          :valid)
+                      "a fresh Retry token validates for its source address and connection IDs")
+               (check (eq (cl-quic-kit::%server-token-status
+                           server #(0 1 2)
+                           (cl-quic-kit::server-retry-token-address record)
+                           #(0 1 2)
+                           (cl-quic-kit::server-retry-token-client-source-connection-id record)
+                           0)
+                          :unknown)
+                      "an unrecognized token has no cached Retry record")
+               (check (eq (cl-quic-kit::%server-token-status
+                           server token :different-address
+                           (cl-quic-kit::server-retry-token-retry-source-connection-id record)
+                           (cl-quic-kit::server-retry-token-client-source-connection-id record)
+                           (1- (cl-quic-kit::server-retry-token-expires-at record)))
+                          :address-mismatch)
+                      "Retry tokens are bound to the source address")
+               (check (eq (cl-quic-kit::%server-token-status
+                           server token
+                           (cl-quic-kit::server-retry-token-address record)
+                           #(0 1 2)
+                           (cl-quic-kit::server-retry-token-client-source-connection-id record)
+                           0)
+                          :connection-id-mismatch)
+                      "Retry tokens are bound to the Retry source connection ID")
+               (cl-quic-kit:client-poll client 0)
+               (server-test-poll-until
+                server
+                (lambda ()
+                  (cl-quic-kit::server-retry-token-used-p record)))
+               (check (cl-quic-kit::server-retry-token-used-p record)
+                      "client API returns the Retry token in its next Initial")
+               (check (eq (cl-quic-kit::%server-token-status
+                           server token
+                           (cl-quic-kit::server-retry-token-address record)
+                           (cl-quic-kit::server-retry-token-retry-source-connection-id record)
+                           (cl-quic-kit::server-retry-token-client-source-connection-id record)
+                           (1- (cl-quic-kit::server-retry-token-expires-at record)))
+                          :valid)
+                      "a Retry token remains valid when repeated for the same address and connection IDs")
+               (check (eq (cl-quic-kit::%server-token-status
+                           server token
+                           (cl-quic-kit::server-retry-token-address record)
+                           (cl-quic-kit::server-retry-token-retry-source-connection-id record)
+                           (cl-quic-kit::server-retry-token-client-source-connection-id record)
+                           (cl-quic-kit::server-retry-token-expires-at record))
+                          :expired)
+                      "Retry tokens expire at their finite lifetime"))))
+      (when client
+        (cl-quic-kit:client-close client))
+      (if server
+          (cl-quic-kit:quic-server-close server)
+          (when socket
+            (cl-quic-kit:udp-close socket)))
+      (server-test-remove-temp-directory directory))))
 
 (let* ((socket (cl-quic-kit:make-udp-socket :local-host "127.0.0.1"
                                             :local-port 0))
@@ -1101,18 +1127,20 @@
                                         9 10 11 12 13 14 15 16
                                         17 18 19 20 21)))))
         (run-case (first case) (second case))))))
-(defun server-test-remove-temp-directory (directory)
-  (dolist (name '("server.crt" "server.key" "server.der"))
-    (let ((path (merge-pathnames name directory)))
-      (when (probe-file path)
-        (delete-file path))))
-  (multiple-value-bind (output errors exit-code)
-      (uiop:run-program (list "rmdir" (namestring directory))
-                        :output :string :error-output :string
-                        :ignore-error-status t)
-    (declare (ignore output errors))
-    (unless (and (integerp exit-code) (zerop exit-code))
-      (error "Could not remove the temporary TLS test directory"))))
+(progn
+  (defun server-test-remove-temp-directory (directory)
+    (dolist (name (quote ("server.crt" "server.key" "server.der")))
+      (let ((path (merge-pathnames name directory)))
+        (when (probe-file path)
+          (delete-file path))))
+    (multiple-value-bind (output errors exit-code)
+        (uiop:run-program (list "rmdir" (namestring directory))
+                          :output :string :error-output :string
+                          :ignore-error-status t)
+      (declare (ignore output errors))
+      (unless (and (integerp exit-code) (zerop exit-code))
+        (error "Could not remove the temporary TLS test directory"))))
+  (server-test-retry-token-validation))
 (progn
   (let* ((directory (server-test-make-temp-directory))
          (socket nil)
