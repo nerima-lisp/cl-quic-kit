@@ -782,56 +782,72 @@
               (cl-quic-kit:udp-close server-socket))
           (server-test-remove-temp-directory directory)))))
 
-  (let* ((server-socket
-          (cl-quic-kit:make-udp-socket :local-host "127.0.0.1" :local-port 0))
-         (server (cl-quic-kit:make-quic-server
-                  :udp-socket server-socket :max-connections 2))
-         (client (cl-quic-kit:make-quic-client
-                  :server-host "127.0.0.1"
-                  :server-port (cl-quic-kit:udp-socket-local-port server-socket)
-                  :hostname "localhost" :now-fn (lambda () 0))))
-    (unwind-protect
-        (multiple-value-bind (token record)
-            (server-test-issue-retry server client)
-          (cl-quic-kit:client-poll client 0)
-          (server-test-poll-until
-           server
-           (lambda ()
-             (cl-quic-kit::server-retry-token-used-p record)))
-          (let* ((path
-                  (cl-quic-kit::%server-path
-                   server
-                   (cl-quic-kit::server-retry-token-address record)
-                   (cl-quic-kit::server-retry-token-original-destination-connection-id
-                    record)
-                   0))
-                 (received-before
-                  (cl-quic-kit::server-amplification-state-received path))
-                 (duplicate
-                  (server-test-initial-packet
-                   cl-quic-kit:*quic-version-1*
-                   (cl-quic-kit::server-retry-token-retry-source-connection-id
-                    record)
-                   (cl-quic-kit::server-retry-token-client-source-connection-id
-                    record)
-                   token)))
-            (cl-quic-kit:udp-send
-             (cl-quic-kit::quic-client-udp-socket client) duplicate)
-            (server-test-poll-until
-             server
-             (lambda ()
-               (>= (cl-quic-kit::server-amplification-state-received path)
-                   (+ received-before (length duplicate)))))
-            (multiple-value-bind (response length address)
-                (cl-quic-kit:udp-receive
-                 (cl-quic-kit::quic-client-udp-socket client))
-              (declare (ignore length address))
-              (check (null response)
-                     "a repeated same-tuple Retry token Initial receives no close or second Retry")
-              (check (not (cl-quic-kit:quic-client-closed-p client))
-                     "a repeated same-tuple Retry token remains acceptable"))))
-      (cl-quic-kit:client-close client)
-      (cl-quic-kit:quic-server-close server)))
+  (defun server-test-retry-same-tuple-duplicate ()
+    (let* ((directory (server-test-make-temp-directory))
+           (server-socket
+            (cl-quic-kit:make-udp-socket :local-host "127.0.0.1" :local-port 0))
+           (server nil)
+           (client nil))
+      (unwind-protect
+          (multiple-value-bind (server-tls-options client-tls-options) (server-test-tls-settings directory) (setf server
+                                                                                                                  (cl-quic-kit:make-quic-server
+                                                                                                                   :udp-socket server-socket
+                                                                                                                   :max-connections 2
+                                                                                                                   :tls-server-options
+                                                                                                                   (append server-tls-options (list :alpn-protocols (list "h3")))))
+            (setf client
+                  (apply (function cl-quic-kit:make-quic-client) :server-host "127.0.0.1"
+                         :server-port (cl-quic-kit:udp-socket-local-port server-socket)
+                         :hostname "localhost"
+                         :now-fn (lambda () 0)
+                         :alpn (list "h3") client-tls-options))
+            (multiple-value-bind (token record)
+                (server-test-issue-retry server client)
+              (cl-quic-kit:client-poll client 0)
+              (server-test-poll-until
+               server
+               (lambda ()
+                 (cl-quic-kit::server-retry-token-used-p record)))
+              (let* ((path
+                      (cl-quic-kit::%server-path
+                       server
+                       (cl-quic-kit::server-retry-token-address record)
+                       (cl-quic-kit::server-retry-token-original-destination-connection-id
+                        record)
+                       0))
+                     (received-before
+                      (cl-quic-kit::server-amplification-state-received path))
+                     (duplicate
+                      (server-test-initial-packet
+                       cl-quic-kit:*quic-version-1*
+                       (cl-quic-kit::server-retry-token-retry-source-connection-id
+                        record)
+                       (cl-quic-kit::server-retry-token-client-source-connection-id
+                        record)
+                       token)))
+                (cl-quic-kit:udp-send
+                 (cl-quic-kit::quic-client-udp-socket client) duplicate)
+                (server-test-poll-until
+                 server
+                 (lambda ()
+                   (>= (cl-quic-kit::server-amplification-state-received path)
+                       (+ received-before (length duplicate)))))
+                (multiple-value-bind (response length address)
+                    (cl-quic-kit:udp-receive
+                     (cl-quic-kit::quic-client-udp-socket client))
+                  (declare (ignore length address))
+                  (check (null response)
+                         "a repeated same-tuple Retry token Initial receives no close or second Retry")
+                  (check (not (cl-quic-kit:quic-client-closed-p client))
+                         "a repeated same-tuple Retry token remains acceptable"))))
+            (when client
+              (cl-quic-kit:client-close client))
+            (unwind-protect
+                (if server
+                    (cl-quic-kit:quic-server-close server)
+                  (cl-quic-kit:udp-close server-socket))
+              (server-test-remove-temp-directory directory)))))
+    )
   (let* ((server-socket
           (cl-quic-kit:make-udp-socket :local-host "127.0.0.1" :local-port 0))
          (server (cl-quic-kit:make-quic-server
@@ -1032,7 +1048,7 @@
             return accepted
           do (sleep 0.001)
           finally (error "Loopback TLS handshake did not complete"))))
-(defun server-test-invalid-client-transport-parameters (certificate-der)
+(defun server-test-invalid-client-transport-parameters (server-tls-options client-tls-options)
   (let ((preferred-address
          (make-array 42 :element-type '(unsigned-byte 8) :initial-element 0))
         (reset-token
@@ -1053,11 +1069,17 @@
                                (cl-quic-kit:make-udp-socket
                                 :local-host "127.0.0.1" :local-port 0))
                               (server
-                               (cl-quic-kit:make-quic-server
-                                :udp-socket socket :max-connections 1
-                                :retry-policy :always
-                                :transport-parameters
-                                (list :initial-max-data 2097152)))
+                               (cl-quic-kit:make-quic-server :udp-socket
+                                                     socket
+                                                     :max-connections
+                                                     1
+                                                     :retry-policy
+                                                     :always
+                                                     :transport-parameters
+                                                     (list :initial-max-data
+                                                           2097152)
+                                                     :tls-server-options
+                                                     (append server-tls-options (list :alpn-protocols (list "h3")))))
                               (client nil)
                               (server-connection nil))
                          (unwind-protect
@@ -1196,7 +1218,7 @@
         (error "Could not remove the temporary TLS test directory"))))
   (server-test-retry-policy-never)
   (server-test-corrupted-retry-token)
-  (server-test-retry-token-validation))
+  (progn (server-test-retry-token-validation) (server-test-retry-same-tuple-duplicate)))
 (progn
   (let* ((directory (server-test-make-temp-directory))
          (socket nil)
@@ -1279,7 +1301,7 @@
               (check
                (= (cl-quic-kit::quic-connection-idle-timeout server-connection) 30)
                "the server clamps the peer idle timeout to its local limit")
-              (server-test-invalid-client-transport-parameters certificate-der))))
+              (server-test-invalid-client-transport-parameters server-tls-options client-tls-options))))
       (unwind-protect
           (when client
             (cl-quic-kit:client-close client))
