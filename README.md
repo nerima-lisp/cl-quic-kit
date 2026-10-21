@@ -17,8 +17,6 @@ from TLS provider selection. `t/run.lisp` shows the test runner's adapter mappin
 
 ## Client API
 
-Create a network client with:
-
 ```lisp
 (cl-quic-kit:make-quic-client
  :server-host host
@@ -116,10 +114,11 @@ The server takes ownership of the supplied socket. Give clients a reachable serv
 port.
 
 The server passes `:tls-server-options` to cl-tls-kit's public
-[`make-tls13-server-driver`](https://github.com/nerima-lisp/cl-tls-kit/blob/7ed1e3eb1edd891066c15951fe282f89dafef81b/docs/tls13-server-driver.md)
+[`make-tls13-server-driver`](https://github.com/nerima-lisp/cl-tls-kit/blob/d6cf61a9ac2c/docs/tls13-server-driver.md)
 constructor. The server defaults `:alpn-protocols` to `("h3")`, creates a cl-crypto-kit provider when
 `:provider` is omitted, and sets the driver's `:quic-transport-parameters` option from the encoded server
-parameters.
+parameters. The server buffers peer QUIC transport parameters as opaque bytes and decodes and validates them
+only after cl-tls-kit verifies the client's Finished and emits `:handshake-complete`.
 
 The `crypto-kit:` package is provided by the `cl-crypto-kit` system. For a P-256 key, pass a 32-octet private
 scalar to
