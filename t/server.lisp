@@ -235,102 +235,104 @@
          (server nil)
          (client nil))
     (unwind-protect
-         (multiple-value-bind (server-tls-options client-tls-options) (server-test-tls-settings directory) (setf socket
-                 (cl-quic-kit:make-udp-socket :local-host "127.0.0.1"
-                                              :local-port 0))
-           (setf server
-                 (cl-quic-kit:make-quic-server
-                  :udp-socket socket
-                  :max-connections 2
-                  :tls-server-options
-                  (append server-tls-options (list :alpn-protocols (list "h3")))))
-           (setf client
-                 (apply (function cl-quic-kit:make-quic-client) :server-host "127.0.0.1"
-                  :server-port (cl-quic-kit:udp-socket-local-port socket)
-                  :hostname "localhost"
-                  :now-fn (lambda () 0)
-                  :alpn (list "h3") client-tls-options))
-           (progn
-             (cl-quic-kit:client-poll client 0)
-             (progn
-               (server-test-poll-until
-                server
-                (lambda ()
-                  (plusp
-                   (hash-table-count
-                    (cl-quic-kit::quic-server-retry-tokens server)))))
-               (server-test-client-receive client))
-             (check (not (cl-quic-kit:quic-client-closed-p client))
-                    "client accepts the server Retry integrity tag")
-             (multiple-value-bind (token record)
-                 (server-test-token-entry server)
-               (check (and token record
-                           (not (equalp
-                                 (cl-quic-kit::server-retry-token-retry-source-connection-id
-                                  record)
-                                 (cl-quic-kit::server-retry-token-original-destination-connection-id
-                                  record))))
-                      "server retains a Retry token whose Retry source CID differs from its Initial destination CID")
-               (check (eq (cl-quic-kit::%server-token-status
-                           server token
-                           (cl-quic-kit::server-retry-token-address record)
-                           (cl-quic-kit::server-retry-token-retry-source-connection-id record)
-                           (cl-quic-kit::server-retry-token-client-source-connection-id record)
-                           (1- (cl-quic-kit::server-retry-token-expires-at record)))
-                          :valid)
-                      "a fresh Retry token validates for its source address and connection IDs")
-               (check (eq (cl-quic-kit::%server-token-status
-                           server #(0 1 2)
-                           (cl-quic-kit::server-retry-token-address record)
-                           #(0 1 2)
-                           (cl-quic-kit::server-retry-token-client-source-connection-id record)
-                           0)
-                          :unknown)
-                      "an unrecognized token has no cached Retry record")
-               (check (eq (cl-quic-kit::%server-token-status
-                           server token :different-address
-                           (cl-quic-kit::server-retry-token-retry-source-connection-id record)
-                           (cl-quic-kit::server-retry-token-client-source-connection-id record)
-                           (1- (cl-quic-kit::server-retry-token-expires-at record)))
-                          :address-mismatch)
-                      "Retry tokens are bound to the source address")
-               (check (eq (cl-quic-kit::%server-token-status
-                           server token
-                           (cl-quic-kit::server-retry-token-address record)
-                           #(0 1 2)
-                           (cl-quic-kit::server-retry-token-client-source-connection-id record)
-                           0)
-                          :connection-id-mismatch)
-                      "Retry tokens are bound to the Retry source connection ID")
-               (cl-quic-kit:client-poll client 0)
-               (server-test-poll-until
-                server
-                (lambda ()
-                  (cl-quic-kit::server-retry-token-used-p record)))
-               (check (cl-quic-kit::server-retry-token-used-p record)
-                      "client API returns the Retry token in its next Initial")
-               (check (eq (cl-quic-kit::%server-token-status
-                           server token
-                           (cl-quic-kit::server-retry-token-address record)
-                           (cl-quic-kit::server-retry-token-retry-source-connection-id record)
-                           (cl-quic-kit::server-retry-token-client-source-connection-id record)
-                           (1- (cl-quic-kit::server-retry-token-expires-at record)))
-                          :valid)
-                      "a Retry token remains valid when repeated for the same address and connection IDs")
-               (check (eq (cl-quic-kit::%server-token-status
-                           server token
-                           (cl-quic-kit::server-retry-token-address record)
-                           (cl-quic-kit::server-retry-token-retry-source-connection-id record)
-                           (cl-quic-kit::server-retry-token-client-source-connection-id record)
-                           (cl-quic-kit::server-retry-token-expires-at record))
-                          :expired)
-                      "Retry tokens expire at their finite lifetime"))))
+        (multiple-value-bind (server-tls-options client-tls-options)
+            (server-test-tls-settings directory)
+          (setf socket
+                (cl-quic-kit:make-udp-socket :local-host "127.0.0.1"
+                                             :local-port 0))
+          (setf server
+                (cl-quic-kit:make-quic-server
+                 :udp-socket socket
+                 :max-connections 2
+                 :tls-server-options
+                 (append server-tls-options (list :alpn-protocols (list "h3")))))
+          (setf client
+                (apply (function cl-quic-kit:make-quic-client) :server-host "127.0.0.1"
+                       :server-port (cl-quic-kit:udp-socket-local-port socket)
+                       :hostname "localhost"
+                       :now-fn (lambda () 0)
+                       :alpn (list "h3") client-tls-options))
+          (progn
+            (cl-quic-kit:client-poll client 0)
+            (progn
+              (server-test-poll-until
+               server
+               (lambda ()
+                 (plusp
+                  (hash-table-count
+                   (cl-quic-kit::quic-server-retry-tokens server)))))
+              (server-test-client-receive client))
+            (check (not (cl-quic-kit:quic-client-closed-p client))
+                   "client accepts the server Retry integrity tag")
+            (multiple-value-bind (token record)
+                (server-test-token-entry server)
+              (check (and token record
+                          (not (equalp
+                                (cl-quic-kit::server-retry-token-retry-source-connection-id
+                                 record)
+                                (cl-quic-kit::server-retry-token-original-destination-connection-id
+                                 record))))
+                     "server retains a Retry token whose Retry source CID differs from its Initial destination CID")
+              (check (eq (cl-quic-kit::%server-token-status
+                          server token
+                          (cl-quic-kit::server-retry-token-address record)
+                          (cl-quic-kit::server-retry-token-retry-source-connection-id record)
+                          (cl-quic-kit::server-retry-token-client-source-connection-id record)
+                          (1- (cl-quic-kit::server-retry-token-expires-at record)))
+                         :valid)
+                     "a fresh Retry token validates for its source address and connection IDs")
+              (check (eq (cl-quic-kit::%server-token-status
+                          server #(0 1 2)
+                          (cl-quic-kit::server-retry-token-address record)
+                          #(0 1 2)
+                          (cl-quic-kit::server-retry-token-client-source-connection-id record)
+                          0)
+                         :unknown)
+                     "an unrecognized token has no cached Retry record")
+              (check (eq (cl-quic-kit::%server-token-status
+                          server token :different-address
+                          (cl-quic-kit::server-retry-token-retry-source-connection-id record)
+                          (cl-quic-kit::server-retry-token-client-source-connection-id record)
+                          (1- (cl-quic-kit::server-retry-token-expires-at record)))
+                         :address-mismatch)
+                     "Retry tokens are bound to the source address")
+              (check (eq (cl-quic-kit::%server-token-status
+                          server token
+                          (cl-quic-kit::server-retry-token-address record)
+                          #(0 1 2)
+                          (cl-quic-kit::server-retry-token-client-source-connection-id record)
+                          0)
+                         :connection-id-mismatch)
+                     "Retry tokens are bound to the Retry source connection ID")
+              (cl-quic-kit:client-poll client 0)
+              (server-test-poll-until
+               server
+               (lambda ()
+                 (cl-quic-kit::server-retry-token-used-p record)))
+              (check (cl-quic-kit::server-retry-token-used-p record)
+                     "client API returns the Retry token in its next Initial")
+              (check (eq (cl-quic-kit::%server-token-status
+                          server token
+                          (cl-quic-kit::server-retry-token-address record)
+                          (cl-quic-kit::server-retry-token-retry-source-connection-id record)
+                          (cl-quic-kit::server-retry-token-client-source-connection-id record)
+                          (1- (cl-quic-kit::server-retry-token-expires-at record)))
+                         :valid)
+                     "a Retry token remains valid when repeated for the same address and connection IDs")
+              (check (eq (cl-quic-kit::%server-token-status
+                          server token
+                          (cl-quic-kit::server-retry-token-address record)
+                          (cl-quic-kit::server-retry-token-retry-source-connection-id record)
+                          (cl-quic-kit::server-retry-token-client-source-connection-id record)
+                          (cl-quic-kit::server-retry-token-expires-at record))
+                         :expired)
+                     "Retry tokens expire at their finite lifetime"))))
       (when client
         (cl-quic-kit:client-close client))
       (if server
           (cl-quic-kit:quic-server-close server)
-          (when socket
-            (cl-quic-kit:udp-close socket)))
+        (when socket
+          (cl-quic-kit:udp-close socket)))
       (server-test-remove-temp-directory directory))))
 
 (let* ((socket (cl-quic-kit:make-udp-socket :local-host "127.0.0.1"
@@ -639,64 +641,67 @@
       (cl-quic-kit:client-receive-datagram client response)))
 
   (defun server-test-retry-policy-never ()
-  (let* ((directory (server-test-make-temp-directory))
-         (server-socket
-           (cl-quic-kit:make-udp-socket :local-host "127.0.0.1" :local-port 0))
-         (server nil)
-         (client nil))
-    (unwind-protect
-         (progn
-           (multiple-value-bind (server-tls-options client-tls-options) (server-test-tls-settings directory) (setf server
-                   (cl-quic-kit:make-quic-server
-                    :udp-socket server-socket :max-connections 1
-                    :retry-policy :never
-                    :tls-server-options
-                    server-tls-options)) (setf client
-                 (apply (function cl-quic-kit:make-quic-client)
-                        :server-host "127.0.0.1"
-                        :server-port (cl-quic-kit:udp-socket-local-port server-socket)
-                        :hostname "localhost"
-                        :now-fn (lambda () 0)
-                        client-tls-options)))
-           (cl-quic-kit:client-poll client 0)
-           (server-test-poll-until
-            server
-            (lambda ()
-              (loop for path being the hash-values
-                      of (cl-quic-kit::quic-server-paths server)
-                    thereis
-                      (>=
-                       (cl-quic-kit::server-amplification-state-received path)
-                       1200))))
-           (check
-            (loop for path being the hash-values
-                    of (cl-quic-kit::quic-server-paths server)
-                  thereis
-                    (>=
-                     (cl-quic-kit::server-amplification-state-received path)
-                     1200))
-            "client Initial reaches the listener at the 1200-byte minimum")
-           (multiple-value-bind (response length address)
-               (cl-quic-kit:udp-receive
-                (cl-quic-kit::quic-client-udp-socket client))
-             (declare (ignore length address))
-             (check
-              (or (null response)
-                  (not (eq (cl-quic-kit:packet-header-type
-                            (cl-quic-kit:decode-packet-header response))
-                           :retry)))
-              "retry-policy never does not send Retry for a valid 1200-byte Initial"))
-           (check
-            (zerop (hash-table-count
-                    (cl-quic-kit::quic-server-retry-tokens server)))
-            "retry-policy never records no Retry token"))
-      (when client
-        (cl-quic-kit:client-close client))
+    (let* ((directory (server-test-make-temp-directory))
+           (server-socket
+            (cl-quic-kit:make-udp-socket :local-host "127.0.0.1" :local-port 0))
+           (server nil)
+           (client nil))
       (unwind-protect
-           (if server
-               (cl-quic-kit:quic-server-close server)
-               (cl-quic-kit:udp-close server-socket))
-        (server-test-remove-temp-directory directory)))))
+          (progn
+            (multiple-value-bind (server-tls-options client-tls-options)
+                (server-test-tls-settings directory)
+              (setf server
+                    (cl-quic-kit:make-quic-server
+                     :udp-socket server-socket :max-connections 1
+                     :retry-policy :never
+                     :tls-server-options
+                     server-tls-options))
+              (setf client
+                    (apply (function cl-quic-kit:make-quic-client)
+                           :server-host "127.0.0.1"
+                           :server-port (cl-quic-kit:udp-socket-local-port server-socket)
+                           :hostname "localhost"
+                           :now-fn (lambda () 0)
+                           client-tls-options)))
+            (cl-quic-kit:client-poll client 0)
+            (server-test-poll-until
+             server
+             (lambda ()
+               (loop for path being the hash-values
+                     of (cl-quic-kit::quic-server-paths server)
+                     thereis
+                     (>=
+                      (cl-quic-kit::server-amplification-state-received path)
+                      1200))))
+            (check
+             (loop for path being the hash-values
+                   of (cl-quic-kit::quic-server-paths server)
+                   thereis
+                   (>=
+                    (cl-quic-kit::server-amplification-state-received path)
+                    1200))
+             "client Initial reaches the listener at the 1200-byte minimum")
+            (multiple-value-bind (response length address)
+                (cl-quic-kit:udp-receive
+                 (cl-quic-kit::quic-client-udp-socket client))
+              (declare (ignore length address))
+              (check
+               (or (null response)
+                   (not (eq (cl-quic-kit:packet-header-type
+                             (cl-quic-kit:decode-packet-header response))
+                            :retry)))
+               "retry-policy never does not send Retry for a valid 1200-byte Initial"))
+            (check
+             (zerop (hash-table-count
+                     (cl-quic-kit::quic-server-retry-tokens server)))
+             "retry-policy never records no Retry token"))
+        (when client
+          (cl-quic-kit:client-close client))
+        (unwind-protect
+            (if server
+                (cl-quic-kit:quic-server-close server)
+              (cl-quic-kit:udp-close server-socket))
+          (server-test-remove-temp-directory directory)))))
 
 
   (defun server-test-corrupted-retry-token ()
@@ -715,19 +720,21 @@
                                                        :max-connections
                                                        2
                                                        :tls-server-options
-                                                       (append server-tls-options (list :alpn-protocols (list "h3")))))
+                                                       (append server-tls-options
+                                                               (list :alpn-protocols
+                                                                     (list "h3")))))
             (setf client (apply (function cl-quic-kit:make-quic-client) :server-host
-                                                       "127.0.0.1"
-                                                       :server-port
-                                                       (cl-quic-kit:udp-socket-local-port
-                                                        server-socket)
-                                                       :hostname
-                                                       "localhost"
-                                                       :now-fn
-                                                       (lambda ()
-                                                         0)
-                                                       :alpn
-                                                       (list "h3") client-tls-options))
+                                "127.0.0.1"
+                                :server-port
+                                (cl-quic-kit:udp-socket-local-port
+                                 server-socket)
+                                :hostname
+                                "localhost"
+                                :now-fn
+                                (lambda ()
+                                  0)
+                                :alpn
+                                (list "h3") client-tls-options))
             (multiple-value-bind (token record)
                 (server-test-issue-retry server client)
               (let ((corrupted-token (copy-seq token)))
@@ -772,7 +779,7 @@
         (unwind-protect
             (if server
                 (cl-quic-kit:quic-server-close server)
-                (cl-quic-kit:udp-close server-socket))
+              (cl-quic-kit:udp-close server-socket))
           (server-test-remove-temp-directory directory)))))
 
   (let* ((server-socket
@@ -792,22 +799,22 @@
            (lambda ()
              (cl-quic-kit::server-retry-token-used-p record)))
           (let* ((path
-                   (cl-quic-kit::%server-path
-                    server
-                    (cl-quic-kit::server-retry-token-address record)
-                    (cl-quic-kit::server-retry-token-original-destination-connection-id
-                     record)
-                    0))
+                  (cl-quic-kit::%server-path
+                   server
+                   (cl-quic-kit::server-retry-token-address record)
+                   (cl-quic-kit::server-retry-token-original-destination-connection-id
+                    record)
+                   0))
                  (received-before
-                   (cl-quic-kit::server-amplification-state-received path))
+                  (cl-quic-kit::server-amplification-state-received path))
                  (duplicate
-                   (server-test-initial-packet
-                    cl-quic-kit:*quic-version-1*
-                    (cl-quic-kit::server-retry-token-retry-source-connection-id
-                     record)
-                    (cl-quic-kit::server-retry-token-client-source-connection-id
-                     record)
-                    token)))
+                  (server-test-initial-packet
+                   cl-quic-kit:*quic-version-1*
+                   (cl-quic-kit::server-retry-token-retry-source-connection-id
+                    record)
+                   (cl-quic-kit::server-retry-token-client-source-connection-id
+                    record)
+                   token)))
             (cl-quic-kit:udp-send
              (cl-quic-kit::quic-client-udp-socket client) duplicate)
             (server-test-poll-until
@@ -1196,89 +1203,91 @@
          (server nil)
          (client nil))
     (unwind-protect
-         (multiple-value-bind (server-tls-options client-tls-options) (server-test-tls-settings directory) (setf socket
-                 (cl-quic-kit:make-udp-socket
-                  :local-host "127.0.0.1" :local-port 0))
-           (setf server
-                 (cl-quic-kit:make-quic-server
-                  :udp-socket socket
-                  :max-connections 1
-                  :retry-policy :always
-                  :transport-parameters (list :initial-max-data 2097152)
-                  :tls-server-options
-                  (append server-tls-options (list :alpn-protocols (list "h3")))))
-           (setf client
-                 (apply (function cl-quic-kit:make-quic-client) :server-host "127.0.0.1"
-                  :server-port (cl-quic-kit:udp-socket-local-port socket)
-                  :idle-timeout 60
-                  :disable-hostname-verification-p t
-                  :alpn '("h3") client-tls-options))
-           (let ((server-connection
-                   (server-test-loopback-handshake server client)))
-             (check
-              (eq (cl-quic-kit:connection-state server-connection)
-                  :established)
-              "the server accepts a connection after its TLS handshake")
-             (check
-              (equal (cl-quic-kit:quic-connection-alpn server-connection)
-                     "h3")
-              "the server connection records the negotiated ALPN")
-             (check
-              (eq (cl-quic-kit:connection-state
-                   (cl-quic-kit:quic-client-connection client))
-                  :established)
-              "the client confirms the server handshake")
-             (progn
-               (check
-                (equal
-                 (cdr
-                  (assoc 4
-                         (cl-quic-kit:quic-client-peer-transport-parameters client)))
-                 2097152)
-                "the server forwards configured initial max data")
-               (check
-                (= (cdr
-                    (assoc 1
-                           (cl-quic-kit:quic-client-peer-transport-parameters client)))
-                   30000)
-                "the server advertises its idle timeout in milliseconds")
-               (check
-                (let* ((server-state
-                        (loop for entry being the hash-values
-                                of (cl-quic-kit::quic-server-connections server)
-                              when (eq (cl-quic-kit::server-connection-connection entry)
-                                       server-connection)
-                                return entry))
-                       (parameters
-                        (cl-quic-kit:decode-transport-parameters
-                         (cl-quic-kit::server-connection-peer-transport-parameters
-                          server-state))))
-                  (= (cdr (assoc 1 parameters)) 60000))
-                "the server observes the client idle timeout in milliseconds")
-               (check
-                (let ((parameters
+        (multiple-value-bind (server-tls-options client-tls-options)
+            (server-test-tls-settings directory)
+          (setf socket
+                (cl-quic-kit:make-udp-socket
+                 :local-host "127.0.0.1" :local-port 0))
+          (setf server
+                (cl-quic-kit:make-quic-server
+                 :udp-socket socket
+                 :max-connections 1
+                 :retry-policy :always
+                 :transport-parameters (list :initial-max-data 2097152)
+                 :tls-server-options
+                 (append server-tls-options (list :alpn-protocols (list "h3")))))
+          (setf client
+                (apply (function cl-quic-kit:make-quic-client) :server-host "127.0.0.1"
+                       :server-port (cl-quic-kit:udp-socket-local-port socket)
+                       :idle-timeout 60
+                       :disable-hostname-verification-p t
+                       :alpn '("h3") client-tls-options))
+          (let ((server-connection
+                 (server-test-loopback-handshake server client)))
+            (check
+             (eq (cl-quic-kit:connection-state server-connection)
+                 :established)
+             "the server accepts a connection after its TLS handshake")
+            (check
+             (equal (cl-quic-kit:quic-connection-alpn server-connection)
+                    "h3")
+             "the server connection records the negotiated ALPN")
+            (check
+             (eq (cl-quic-kit:connection-state
+                  (cl-quic-kit:quic-client-connection client))
+                 :established)
+             "the client confirms the server handshake")
+            (progn
+              (check
+               (equal
+                (cdr
+                 (assoc 4
+                        (cl-quic-kit:quic-client-peer-transport-parameters client)))
+                2097152)
+               "the server forwards configured initial max data")
+              (check
+               (= (cdr
+                   (assoc 1
+                          (cl-quic-kit:quic-client-peer-transport-parameters client)))
+                  30000)
+               "the server advertises its idle timeout in milliseconds")
+              (check
+               (let* ((server-state
+                       (loop for entry being the hash-values
+                             of (cl-quic-kit::quic-server-connections server)
+                             when (eq (cl-quic-kit::server-connection-connection entry)
+                                      server-connection)
+                             return entry))
+                      (parameters
                        (cl-quic-kit:decode-transport-parameters
-                        (cl-quic-kit::%client-transport-parameters
-                         (make-array 8 :element-type '(unsigned-byte 8)
-                                     :initial-element 0)
-                         cl-quic-kit::*quic-idle-timeout-default*))))
-                  (= (cdr (assoc 1 parameters)) 30000))
-                "the client advertises its idle timeout in milliseconds")
-               (check
-                (null (cl-quic-kit:quic-server-accept-connection server))
-                "the server returns each completed connection once")
-               (check
-                (= (cl-quic-kit::quic-connection-idle-timeout server-connection) 30)
-                "the server clamps the peer idle timeout to its local limit")
-               (server-test-invalid-client-transport-parameters certificate-der))))
+                        (cl-quic-kit::server-connection-peer-transport-parameters
+                         server-state))))
+                 (= (cdr (assoc 1 parameters)) 60000))
+               "the server observes the client idle timeout in milliseconds")
+              (check
+               (let ((parameters
+                      (cl-quic-kit:decode-transport-parameters
+                       (cl-quic-kit::%client-transport-parameters
+                        (make-array 8 :element-type '(unsigned-byte 8)
+                                    :initial-element 0)
+                        cl-quic-kit::*quic-idle-timeout-default*))))
+                 (= (cdr (assoc 1 parameters)) 30000))
+               "the client advertises its idle timeout in milliseconds")
+              (check
+               (null (cl-quic-kit:quic-server-accept-connection server))
+               "the server returns each completed connection once")
+              (check
+               (= (cl-quic-kit::quic-connection-idle-timeout server-connection) 30)
+               "the server clamps the peer idle timeout to its local limit")
+              (server-test-invalid-client-transport-parameters certificate-der))))
       (unwind-protect
-           (when client
-             (cl-quic-kit:client-close client))
+          (when client
+            (cl-quic-kit:client-close client))
         (unwind-protect
-             (if server
-                 (cl-quic-kit:quic-server-close server)
-                 (when socket
-                   (cl-quic-kit:udp-close socket)))
+            (if server
+                (cl-quic-kit:quic-server-close server)
+              (when socket
+                (cl-quic-kit:udp-close socket)))
           (server-test-remove-temp-directory directory))))))
 
 (progn
@@ -1287,125 +1296,127 @@
          (server nil)
          (client nil))
     (unwind-protect
-         (multiple-value-bind (server-tls-options client-tls-options) (server-test-tls-settings directory) (setf socket
-                 (cl-quic-kit:make-udp-socket
-                  :local-host "127.0.0.1" :local-port 0))
-           (setf server
-                 (cl-quic-kit:make-quic-server
-                  :udp-socket socket
-                  :max-connections 1
-                  :retry-policy :always
-                  :tls-server-options
-                  (append server-tls-options (list :alpn-protocols (list "h3")))))
-           (setf client
-                 (let ((client-cid
+        (multiple-value-bind (server-tls-options client-tls-options)
+            (server-test-tls-settings directory)
+          (setf socket
+                (cl-quic-kit:make-udp-socket
+                 :local-host "127.0.0.1" :local-port 0))
+          (setf server
+                (cl-quic-kit:make-quic-server
+                 :udp-socket socket
+                 :max-connections 1
+                 :retry-policy :always
+                 :tls-server-options
+                 (append server-tls-options (list :alpn-protocols (list "h3")))))
+          (setf client
+                (let ((client-cid
                        (make-array 8 :element-type '(unsigned-byte 8)
                                    :initial-contents '(0 1 2 3 4 5 6 7))))
-                   (apply (function cl-quic-kit:make-quic-client) :server-host "127.0.0.1"
-                    :server-port (cl-quic-kit:udp-socket-local-port socket)
-                    :local-connection-id client-cid
-                    :transport-parameters
-                    (cl-quic-kit:encode-transport-parameters
-                     (list (cons 1 1000) (cons 15 client-cid)))
-                    :disable-hostname-verification-p t
-                    :alpn '("h3") client-tls-options)))
-           (let* ((server-connection
-                    (server-test-loopback-handshake server client))
-                  (server-state
-                    (loop for entry being the hash-values
-                            of (cl-quic-kit::quic-server-connections server)
-                          when (eq (cl-quic-kit::server-connection-connection entry)
-                                   server-connection)
-                            return entry))
-                  (valid-packet
-                    (cl-quic-kit::%client-build-packet
-                     client :application
-                     (list (cl-quic-kit:make-frame :ping))))
-                  (ignored-0-rtt-packet
-                    (cl-quic-kit:encode-packet-header
-                     (cl-quic-kit:make-packet-header
-                      :type :0-rtt
-                      :version cl-quic-kit:*quic-version-1*
-                      :destination-connection-id
-                      (cl-quic-kit::quic-client-remote-connection-id client)
-                      :source-connection-id
-                      (cl-quic-kit::quic-client-local-connection-id client)
-                      :packet-number 0 :packet-number-length 1
-                      :payload (cl-quic-kit:encode-frame
-                       (cl-quic-kit:make-frame
-                        :stream :stream-id 0 :offset 0 :data #(1 2 3) :fin t))))))
-             (cl-quic-kit:connection-touch server-connection 0)
-             (let ((invalid-packet (copy-seq valid-packet)))
-               (setf (aref invalid-packet (1- (length invalid-packet)))
-                     (logxor (aref invalid-packet
-                                   (1- (length invalid-packet)))
-                             1))
-               (let ((received-before
+                  (apply (function cl-quic-kit:make-quic-client) :server-host "127.0.0.1"
+                         :server-port (cl-quic-kit:udp-socket-local-port socket)
+                         :local-connection-id client-cid
+                         :transport-parameters
+                         (cl-quic-kit:encode-transport-parameters
+                          (list (cons 1 1000) (cons 15 client-cid)))
+                         :disable-hostname-verification-p t
+                         :alpn '("h3") client-tls-options)))
+          (let* ((server-connection
+                  (server-test-loopback-handshake server client))
+                 (server-state
+                  (loop for entry being the hash-values
+                        of (cl-quic-kit::quic-server-connections server)
+                        when (eq (cl-quic-kit::server-connection-connection entry)
+                                 server-connection)
+                        return entry))
+                 (valid-packet
+                  (cl-quic-kit::%client-build-packet
+                   client :application
+                   (list (cl-quic-kit:make-frame :ping))))
+                 (ignored-0-rtt-packet
+                  (cl-quic-kit:encode-packet-header
+                   (cl-quic-kit:make-packet-header
+                    :type :0-rtt
+                    :version cl-quic-kit:*quic-version-1*
+                    :destination-connection-id
+                    (cl-quic-kit::quic-client-remote-connection-id client)
+                    :source-connection-id
+                    (cl-quic-kit::quic-client-local-connection-id client)
+                    :packet-number 0 :packet-number-length 1
+                    :payload (cl-quic-kit:encode-frame
+                              (cl-quic-kit:make-frame
+                               :stream :stream-id 0 :offset 0 :data #(1 2 3) :fin t))))))
+            (cl-quic-kit:connection-touch server-connection 0)
+            (let ((invalid-packet (copy-seq valid-packet)))
+              (setf (aref invalid-packet (1- (length invalid-packet)))
+                    (logxor (aref invalid-packet
+                                  (1- (length invalid-packet)))
+                            1))
+              (let ((received-before
                      (cl-quic-kit::server-amplification-state-received
                       (cl-quic-kit::server-connection-path server-state))))
-                 (cl-quic-kit:udp-send
-                  (cl-quic-kit:quic-client-udp-socket client)
-                  invalid-packet)
-                 (check (not (cl-quic-kit:quic-server-poll server 0.5))
-                        "server polling completes for a packet with an invalid authentication tag")
-                 (check
-                  (> (cl-quic-kit::server-amplification-state-received
-                      (cl-quic-kit::server-connection-path server-state))
-                     received-before)
-                  "the invalid protected packet reached the server over UDP")))
-             (check
-              (= (cl-quic-kit::quic-connection-last-activity server-connection) 0)
-              "unauthenticated packets do not reset server idle timeout")
-             (cl-quic-kit:udp-send
-              (cl-quic-kit:quic-client-udp-socket client) valid-packet)
-             (cl-quic-kit:quic-server-poll server 2)
-             (check
-              (eq (cl-quic-kit:connection-state server-connection) :established)
-              "authenticated peer traffic resets server idle timeout")
-             (check
-              (= (cl-quic-kit::quic-connection-last-activity server-connection) 2)
-              "server activity uses the quic-server-poll clock")
-             (check
-              (= (cl-quic-kit::quic-connection-idle-timeout server-connection) 1)
-              "server applies the peer max idle timeout")
-             (cl-quic-kit:connection-touch server-connection 0)
-             (cl-quic-kit:udp-send
-              (cl-quic-kit:quic-client-udp-socket client)
-              ignored-0-rtt-packet)
-             (let* ((path (cl-quic-kit::server-connection-path server-state))
-                    (engine (cl-quic-kit::server-connection-engine server-state))
-                    (streams (cl-quic-kit::quic-client-streams engine))
-                    (received-before
-                      (cl-quic-kit::server-amplification-state-received path))
-                    (stream-count-before (hash-table-count streams))
-                    (stream-data-before
-                      (loop for stream being the hash-values of streams
-                            sum (cl-quic-kit:stream-readable-bytes stream))))
-               (cl-quic-kit:quic-server-poll server 2)
-               (check
-                (> (cl-quic-kit::server-amplification-state-received path)
-                   received-before)
-                "0-RTT UDP ingress increases the server path's received bytes")
-               (check
-                (= (hash-table-count streams) stream-count-before)
-                "ignored 0-RTT data does not create a stream")
-               (check
-                (= (loop for stream being the hash-values of streams
-                         sum (cl-quic-kit:stream-readable-bytes stream))
-                   stream-data-before)
-                "ignored 0-RTT data is not delivered to a stream"))
-             (check
-              (and (eq (cl-quic-kit:connection-state server-connection) :closing)
-                   (= (cl-quic-kit::quic-connection-last-activity
-                       server-connection)
-                      0))
-              "ignored 0-RTT does not reset server idle timeout")))
+                (cl-quic-kit:udp-send
+                 (cl-quic-kit:quic-client-udp-socket client)
+                 invalid-packet)
+                (check (not (cl-quic-kit:quic-server-poll server 0.5))
+                       "server polling completes for a packet with an invalid authentication tag")
+                (check
+                 (> (cl-quic-kit::server-amplification-state-received
+                     (cl-quic-kit::server-connection-path server-state))
+                    received-before)
+                 "the invalid protected packet reached the server over UDP")))
+            (check
+             (= (cl-quic-kit::quic-connection-last-activity server-connection) 0)
+             "unauthenticated packets do not reset server idle timeout")
+            (cl-quic-kit:udp-send
+             (cl-quic-kit:quic-client-udp-socket client) valid-packet)
+            (cl-quic-kit:quic-server-poll server 2)
+            (check
+             (eq (cl-quic-kit:connection-state server-connection) :established)
+             "authenticated peer traffic resets server idle timeout")
+            (check
+             (= (cl-quic-kit::quic-connection-last-activity server-connection) 2)
+             "server activity uses the quic-server-poll clock")
+            (check
+             (= (cl-quic-kit::quic-connection-idle-timeout server-connection) 1)
+             "server applies the peer max idle timeout")
+            (cl-quic-kit:connection-touch server-connection 0)
+            (cl-quic-kit:udp-send
+             (cl-quic-kit:quic-client-udp-socket client)
+             ignored-0-rtt-packet)
+            (let* ((path (cl-quic-kit::server-connection-path server-state))
+                   (engine (cl-quic-kit::server-connection-engine server-state))
+                   (streams (cl-quic-kit::quic-client-streams engine))
+                   (received-before
+                    (cl-quic-kit::server-amplification-state-received path))
+                   (stream-count-before (hash-table-count streams))
+                   (stream-data-before
+                    (loop for stream being the hash-values of streams
+                          sum (cl-quic-kit:stream-readable-bytes stream))))
+              (cl-quic-kit:quic-server-poll server 2)
+              (check
+               (> (cl-quic-kit::server-amplification-state-received path)
+                  received-before)
+               "0-RTT UDP ingress increases the server path's received bytes")
+              (check
+               (= (hash-table-count streams) stream-count-before)
+               "ignored 0-RTT data does not create a stream")
+              (check
+               (= (loop for stream being the hash-values of streams
+                        sum (cl-quic-kit:stream-readable-bytes stream))
+                  stream-data-before)
+               "ignored 0-RTT data is not delivered to a stream"))
+            (check
+             (and (eq (cl-quic-kit:connection-state server-connection) :closing)
+                  (= (cl-quic-kit::quic-connection-last-activity
+                      server-connection)
+                     0))
+             "ignored 0-RTT does not reset server idle timeout")))
       (unwind-protect
-           (when client
-             (cl-quic-kit:client-close client))
+          (when client
+            (cl-quic-kit:client-close client))
         (unwind-protect
-             (if server
-                 (cl-quic-kit:quic-server-close server)
-                 (when socket
-                   (cl-quic-kit:udp-close socket)))
+            (if server
+                (cl-quic-kit:quic-server-close server)
+              (when socket
+                (cl-quic-kit:udp-close socket)))
           (server-test-remove-temp-directory directory))))))
