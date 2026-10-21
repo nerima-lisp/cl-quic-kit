@@ -6,7 +6,10 @@
 (defparameter *quic-server-path-cache-limit* 4096)
 
 (defstruct (quic-server (:constructor %make-quic-server))
-  udp-socket max-connections retry-policy retry-tokens paths transport-parameters
+  udp-socket max-connections retry-policy retry-tokens
+  (retired-retry-cids (make-hash-table :test #'equalp))
+  (retired-local-cids (make-hash-table :test #'equalp))
+  paths transport-parameters
   tls-server-options connections accepted-connections closed-p)
 
 (defstruct (server-amplification-state
@@ -57,6 +60,8 @@
                        :max-connections max-connections
                        :retry-policy retry-policy
                        :retry-tokens (make-hash-table :test #'equalp)
+                       :retired-retry-cids (make-hash-table :test #'equalp)
+                       :retired-local-cids (make-hash-table :test #'equalp)
                        :paths (make-hash-table :test #'equalp)
                        :transport-parameters
                        (%server-normalize-transport-parameters transport-parameters)
@@ -101,13 +106,88 @@
         (octets-copy original-destination-connection-id)))
 
 (defun %server-path-for-key (server key now create-p)
-  (or (gethash key (quic-server-paths server))
-      (when (and create-p
-                 (< (hash-table-count (quic-server-paths server))
-                    *quic-server-path-cache-limit*))
-        (setf (gethash key (quic-server-paths server))
-              (%make-server-amplification-state
-               :expires-at (+ now *quic-server-retry-token-retention*))))))
+  (labels ((oldest-evictable-path-key ()
+             (let ((oldest-key nil)
+                   (oldest-expiry nil)
+                   (active-paths (make-hash-table :test #'eq))
+                   (used-token-paths (make-hash-table :test #'equalp)))
+               (let ((connections (quic-server-connections server)))
+                 (when connections
+                   (maphash
+                    (lambda (cid connection)
+                      (declare (ignore cid))
+                      (setf (gethash (server-connection-path connection)
+                                     active-paths)
+                            t))
+                    connections)))
+               (let ((tokens (quic-server-retry-tokens server)))
+                 (when tokens
+                   (maphash
+                    (lambda (token record)
+                      (declare (ignore token))
+                      (when (and (server-retry-token-p record)
+                                 (server-retry-token-used-p record))
+                        (setf (gethash
+                               (%server-path-key
+                                (server-retry-token-address record)
+                                (server-retry-token-original-destination-connection-id
+                                 record))
+                               used-token-paths)
+                              t)))
+                    tokens)))
+               (maphash
+                (lambda (path-key path)
+                  (let ((expires-at
+                          (or (server-amplification-state-expires-at path) 0)))
+                    (when (and
+                           (not (server-amplification-state-validated-p path))
+                           (not (gethash path active-paths))
+                           (not (gethash path-key used-token-paths))
+                           (or (null oldest-expiry)
+                               (< expires-at oldest-expiry)))
+                      (setf oldest-key path-key
+                            oldest-expiry expires-at))))
+                (quic-server-paths server))
+               oldest-key))
+           (evict-oldest-path ()
+             (let ((path-key (oldest-evictable-path-key)))
+               (when path-key
+                 (remhash path-key (quic-server-paths server))
+                 (let ((tokens-to-remove nil))
+                   (progn
+                   (maphash
+                    (lambda (token record)
+                      (when (and
+                             (server-retry-token-p record)
+                             (equalp
+                              path-key
+                              (%server-path-key
+                               (server-retry-token-address record)
+                               (server-retry-token-original-destination-connection-id
+                                record))))
+                        (push token tokens-to-remove)))
+                    (quic-server-retry-tokens server))
+                   (dolist (token tokens-to-remove)
+                     (let ((record (gethash token (quic-server-retry-tokens server))))
+                       (when record
+                         (%server-retire-cid
+                          (quic-server-retired-retry-cids server)
+                          (server-retry-token-retry-source-connection-id record)
+                          (server-retry-token-retain-until record)
+                          *quic-server-retry-cache-limit*))
+                       (remhash token (quic-server-retry-tokens server)))))
+                 t)))))
+    (or (gethash key (quic-server-paths server))
+        (when create-p
+          (loop while (>= (hash-table-count (quic-server-paths server))
+                          *quic-server-path-cache-limit*)
+                do (unless (evict-oldest-path)
+                     (return)))
+          (when (< (hash-table-count (quic-server-paths server))
+                   *quic-server-path-cache-limit*)
+            (setf (gethash key (quic-server-paths server))
+                  (%make-server-amplification-state
+                   :expires-at (+ now *quic-server-retry-token-retention*))))))))
 
 (defun %server-path (server address original-destination-connection-id now
                      &optional create-p)
@@ -137,7 +217,16 @@
                  (push key expired-paths)))
              (quic-server-paths server))
     (dolist (key expired-paths)
-      (remhash key (quic-server-paths server)))))
+      (remhash key (quic-server-paths server)))
+    (dolist (table (list (quic-server-retired-retry-cids server)
+                         (quic-server-retired-local-cids server)))
+      (let ((expired-cids nil))
+        (maphash (lambda (cid expires-at)
+                   (when (<= expires-at now)
+                     (push cid expired-cids)))
+                 table)
+        (dolist (cid expired-cids)
+          (remhash cid table))))))
 
 (defun %server-send-permitted-p (path byte-count)
   (and path
@@ -154,24 +243,54 @@
   (incf (server-amplification-state-sent path) (length bytes))
   t)
 
+(progn
+(defun %server-retire-cid (table cid expires-at limit)
+  (setf (gethash (octets-copy cid) table) expires-at)
+  (loop while (> (hash-table-count table) limit) do
+    (let ((oldest-cid nil)
+          (oldest-expiry nil))
+      (maphash (lambda (candidate expiry)
+                 (when (or (null oldest-expiry) (< expiry oldest-expiry))
+                   (setf oldest-cid candidate
+                         oldest-expiry expiry)))
+               table)
+      (when oldest-cid
+        (remhash oldest-cid table)))))
+(defun %server-retired-cid-active-p (table cid now)
+  (let ((expires-at (gethash cid table)))
+    (and expires-at (> expires-at now))))
 (defun %server-new-token (server)
   (loop repeat 4
         for candidate = (%server-random-octets 32)
         unless (gethash candidate (quic-server-retry-tokens server))
           do (return candidate)
-        finally (error 'randomness-unavailable :operation :retry-token)))
+        finally (error 'randomness-unavailable :operation :retry-token))))
 
 (defun %server-new-retry-source-connection-id (server forbidden-cid)
   (loop repeat 4
         for candidate = (%server-random-octets 8)
-        unless (or (equalp candidate forbidden-cid)
-                   (loop for record being the hash-values
-                           of (quic-server-retry-tokens server)
-                         thereis (equalp
-                                 candidate
-                                 (server-retry-token-retry-source-connection-id
-                                  record))))
-          do (return candidate)
+        unless (or
+                (equalp candidate forbidden-cid)
+                (gethash candidate (quic-server-retired-retry-cids server))
+                (gethash candidate (quic-server-retired-local-cids server))
+                (nth-value 1
+                           (gethash candidate
+                                    (quic-server-connections server)))
+                (loop for active being the hash-values
+                      of (quic-server-connections server)
+                      thereis
+                      (equalp
+                       candidate
+                       (server-connection-original-destination-connection-id
+                        active)))
+                (loop for record being the hash-values
+                      of (quic-server-retry-tokens server)
+                      thereis
+                      (equalp
+                       candidate
+                       (server-retry-token-retry-source-connection-id
+                        record))))
+        do (return candidate)
         finally (error 'randomness-unavailable
                        :operation :retry-source-connection-id)))
 
@@ -196,31 +315,67 @@
       :retry-integrity-tag tag))))
 
 (defun %server-send-retry (server header path address now)
-  (when (or (>= (hash-table-count (quic-server-retry-tokens server))
-             *quic-server-retry-cache-limit*)
-            (not path))
+  (unless path
     (return-from %server-send-retry nil))
-  (let* ((token (%server-new-token server))
-         (retry-source-cid (%server-new-retry-source-connection-id
-           server
-           (packet-header-destination-connection-id header)))
-         (original-dcid
-           (packet-header-destination-connection-id header))
-         (packet (%server-retry-packet
-                  header retry-source-cid token original-dcid))
-         (record (%make-server-retry-token
-                  :address (%server-copy-address address)
-                  :original-destination-connection-id (octets-copy original-dcid)
-                  :retry-source-connection-id retry-source-cid
-                  :client-source-connection-id
-                  (octets-copy (packet-header-source-connection-id header))
-                  :expires-at (+ now *quic-server-retry-token-lifetime*)
-                  :retain-until (+ now *quic-server-retry-token-retention*))))
-    (when (%server-emit server path address packet)
-      (setf (gethash token (quic-server-retry-tokens server)) record)
-      (setf (server-amplification-state-expires-at path)
-            (server-retry-token-retain-until record))
-      t)))
+  (labels ((oldest-unused-retry-token (excluded)
+             (let ((oldest-token nil)
+                   (oldest-retain-until nil))
+               (maphash
+                (lambda (token record)
+                  (when (and
+                         (server-retry-token-p record)
+                         (not (server-retry-token-used-p record))
+                         (not (member token excluded :test #'equalp)))
+                    (let ((retain-until
+                            (or (server-retry-token-retain-until record) 0)))
+                      (when (or (null oldest-retain-until)
+                                (< retain-until oldest-retain-until))
+                        (setf oldest-token token
+                              oldest-retain-until retain-until)))))
+                (quic-server-retry-tokens server))
+               oldest-token)))
+    (let* ((token-count
+             (hash-table-count (quic-server-retry-tokens server)))
+           (tokens-needed
+             (max 0 (- (1+ token-count) *quic-server-retry-cache-limit*)))
+           (tokens-to-evict nil))
+      (dotimes (index tokens-needed)
+        (declare (ignore index))
+        (let ((token (oldest-unused-retry-token tokens-to-evict)))
+          (unless token
+            (return-from %server-send-retry nil))
+          (push token tokens-to-evict)))
+      (let* ((token (%server-new-token server))
+             (retry-source-cid
+               (%server-new-retry-source-connection-id
+                server (packet-header-destination-connection-id header)))
+             (original-dcid
+               (packet-header-destination-connection-id header))
+             (packet (%server-retry-packet
+                      header retry-source-cid token original-dcid))
+             (record (%make-server-retry-token
+                      :address (%server-copy-address address)
+                      :original-destination-connection-id (octets-copy original-dcid)
+                      :retry-source-connection-id retry-source-cid
+                      :client-source-connection-id
+                      (octets-copy (packet-header-source-connection-id header))
+                      :expires-at (+ now *quic-server-retry-token-lifetime*)
+                      :retain-until (+ now *quic-server-retry-token-retention*))))
+        (when (%server-emit server path address packet)
+          (dolist (old-token tokens-to-evict)
+            (let ((old-record (gethash old-token
+                                       (quic-server-retry-tokens server))))
+              (when old-record
+                (%server-retire-cid
+                 (quic-server-retired-retry-cids server)
+                 (server-retry-token-retry-source-connection-id old-record)
+                 (server-retry-token-retain-until old-record)
+                 *quic-server-retry-cache-limit*))
+              (remhash old-token (quic-server-retry-tokens server))))
+          (setf (gethash token (quic-server-retry-tokens server)) record)
+          (setf (server-amplification-state-expires-at path)
+                (server-retry-token-retain-until record))
+          t)))))
 
 (defun %server-version-negotiation-packet (destination-cid source-cid)
   (let ((packet (encode-version-negotiation
@@ -249,6 +404,10 @@
                              candidate))
                         return candidate))))
       (cond
+        ((and (null record)
+              (%server-retired-cid-active-p
+               (quic-server-retired-retry-cids server) destination-cid now))
+         (values :invalid-token nil))
         ((null record) (values :unknown nil))
         ((not token-found-p) (values :invalid-token record))
         ((>= now (server-retry-token-expires-at record))
@@ -341,61 +500,77 @@
 (defun %server-handle-datagram (server bytes address byte-count now)
   (handler-case
       (labels ((route-existing ()
-                 (let* ((layout (%client-layout
-                                 bytes :short-header-dcid-length 8))
-                        (server-connection
-                          (gethash (getf layout :dcid)
-                                   (quic-server-connections server))))
-                   (when (and server-connection
-                              (member (getf layout :type)
-                                      '(:0-rtt :handshake :short))
-                              (equalp address
-                                      (server-connection-address
-                                       server-connection)))
-                     (%server-note-received
-                      (server-connection-path server-connection)
-                      byte-count now)
-                     (%server-process-protected-datagram server-connection bytes now)))))
+                               (let* ((layout (%client-layout
+                                               bytes :short-header-dcid-length 8))
+                                      (server-connection
+                                       (gethash (getf layout :dcid)
+                                                (quic-server-connections server))))
+                                 (when (and server-connection
+                                            (member (getf layout :type)
+                                                    '(:0-rtt :handshake :short))
+                                            (equalp address
+                                                    (server-connection-address
+                                                     server-connection)))
+                                   (%server-note-received
+                                    (server-connection-path server-connection)
+                                    byte-count now)
+                                   (%server-process-protected-datagram
+                                    server-connection bytes now)))))
         (multiple-value-bind (first version destination-cid source-cid)
             (%server-long-header-fields bytes)
           (cond
-            ((null first)
-             (route-existing))
-            ((zerop version)
-             nil)
-            ((/= version *quic-version-1*)
-             (let ((path (%server-path
-                          server address destination-cid now t)))
-               (%server-note-received path byte-count now)
-               (when (>= byte-count 1200)
-                 (%server-send-version-negotiation
-                  server destination-cid source-cid path address))))
-            ((zerop (ldb (byte 2 4) first))
-             (let* ((record
-                      (loop for candidate being the hash-values
-                              of (quic-server-retry-tokens server)
-                            when (equalp
-                                  destination-cid
-                                  (server-retry-token-retry-source-connection-id
-                                   candidate))
-                              return candidate))
-                    (original-dcid
-                      (if record
-                          (server-retry-token-original-destination-connection-id
-                           record)
-                          destination-cid))
-                    (path (%server-path
-                           server address original-dcid now t)))
-               (%server-note-received path byte-count now)
-               (when (>= byte-count 1200)
-                 (multiple-value-bind (header end)
-                     (decode-packet-header bytes)
-                   (declare (ignore end))
-                   (when (eq (packet-header-type header) :initial)
-                     (%server-handle-initial
-                      server header path address now bytes))))))
-            (t
-             (route-existing)))))
+           ((null first)
+            (route-existing))
+           ((zerop version)
+            nil)
+           ((/= version *quic-version-1*)
+            (when (>= byte-count 1200)
+              (%server-send-version-negotiation
+               server destination-cid source-cid
+               (%make-server-amplification-state :received byte-count)
+               address)))
+           ((zerop (ldb (byte 2 4) first))
+            (when (>= byte-count 1200)
+              (multiple-value-bind (header end)
+                  (decode-packet-header bytes)
+                (declare (ignore end))
+                (when (eq (packet-header-type header) :initial)
+                  (let ((existing
+                         (%server-find-initial-connection
+                          server destination-cid source-cid)))
+                    (unless (or (and existing
+                                     (server-connection-handshake-complete-p
+                                      existing))
+                                (%server-retired-cid-active-p
+                                 (quic-server-retired-local-cids server)
+                                 destination-cid now))
+                      (let* ((record
+                              (loop for candidate being the hash-values
+                                    of (quic-server-retry-tokens server)
+                                    when (equalp
+                                          destination-cid
+                                          (server-retry-token-retry-source-connection-id
+                                           candidate))
+                                    return candidate))
+                             (original-dcid
+                              (cond
+                               (existing
+                                (server-connection-original-destination-connection-id existing))
+                               (record
+                                (server-retry-token-original-destination-connection-id record))
+                               (t destination-cid)))
+                             (path (or
+                                    (and existing
+                                         (equalp address
+                                                 (server-connection-address existing))
+                                         (server-connection-path existing))
+                                    (%server-path
+                                     server address original-dcid now t))))
+                        (%server-note-received path byte-count now)
+                        (%server-handle-initial
+                         server header path address now bytes))))))))
+           (t
+            (route-existing)))))
     (quic-encoding-error () nil)
     (invalid-connection-id () nil)))
 
@@ -427,6 +602,8 @@
     (clrhash (quic-server-connections server))
     (setf (quic-server-accepted-connections server) nil)
     (clrhash (quic-server-retry-tokens server))
+    (clrhash (quic-server-retired-retry-cids server))
+    (clrhash (quic-server-retired-local-cids server))
     (clrhash (quic-server-paths server))
     (udp-close (quic-server-udp-socket server)))
   t)
@@ -441,6 +618,8 @@
   (loop repeat 4
         for candidate = (%server-random-octets 8 :connection-id)
         unless (or (equalp candidate forbidden-cid)
+                   (gethash candidate (quic-server-retired-local-cids server))
+                   (gethash candidate (quic-server-retired-retry-cids server))
                    (nth-value 1
                               (gethash candidate
                                        (quic-server-connections server)))
@@ -667,9 +846,10 @@
                         suite))
              (setf (server-connection-cipher-suite server-connection) suite)))
           (:send
-           (%server-queue-crypto server-connection
-                                 (getf event :level)
-                                 (getf event :wire)))
+           (unless (eq (getf event :content-type) :alert)
+             (%server-queue-crypto server-connection
+                                   (getf event :level)
+                                   (getf event :wire))))
           (:secret
            (%server-install-secret server-connection
                                    (getf event :level)
@@ -683,12 +863,43 @@
                (funcall emit
                         (server-connection-tls-boundary server-connection)
                         protocol))
-             (setf (quic-connection-alpn
-                    (server-connection-connection server-connection))
+             (setf (quic-connection-alpn (server-connection-connection server-connection))
                    (and protocol (copy-seq protocol)))))
           (:ticket-issued nil)
           (:alert
-           (error 'quic-error :message "TLS server driver returned an alert"))
+           (let* ((alert (getf event :description))
+                  (connection
+                    (server-connection-connection server-connection))
+                  (engine (server-connection-engine server-connection))
+                  (frame (%connection-prepare-close
+                          connection (+ #x0100 alert) "TLS fatal alert")))
+             (setf (quic-client-closed-p engine) t)
+             (when frame
+               (%client-queue-frame
+                engine frame
+                (if (%client-key engine :1-rtt :write) :1-rtt :initial))
+               (client-flush engine))
+             (%server-retire-cid
+              (quic-server-retired-local-cids
+               (server-connection-server server-connection))
+              (server-connection-local-connection-id server-connection)
+              (+ (or (server-connection-now server-connection)
+                     (%quic-real-time))
+                 *quic-server-retry-token-retention*)
+              *quic-server-path-cache-limit*)
+             (%server-retire-cid
+              (quic-server-retired-local-cids
+               (server-connection-server server-connection))
+              (server-connection-original-destination-connection-id
+               server-connection)
+              (+ (or (server-connection-now server-connection)
+                     (%quic-real-time))
+                 *quic-server-retry-token-retention*)
+              *quic-server-path-cache-limit*)
+             (remhash (server-connection-local-connection-id server-connection)
+                      (quic-server-connections
+                       (server-connection-server server-connection)))
+             (return-from %server-handle-tls-events server-connection)))
           (:handshake-complete
            (%server-complete-connection server-connection))
           (otherwise
@@ -806,18 +1017,27 @@
               return server-connection)))
 (defun %server-start-or-feed-initial
     (server header path address record bytes now)
-  (let ((server-connection
-          (or (%server-find-initial-connection
-               server
-               (packet-header-destination-connection-id header)
-               (packet-header-source-connection-id header))
-              (when (< (hash-table-count (quic-server-connections server))
-                       (quic-server-max-connections server))
-                (%server-create-connection server header path address record now)))))
+  (let* ((existing
+           (%server-find-initial-connection
+            server
+            (packet-header-destination-connection-id header)
+            (packet-header-source-connection-id header)))
+         (server-connection
+           (when (or (null existing)
+                     (equalp address
+                             (server-connection-address existing)))
+             (or existing
+                 (when (< (hash-table-count (quic-server-connections server))
+                          (quic-server-max-connections server))
+                   (%server-create-connection
+                    server header path address record now))))))
     (when server-connection
       (%server-process-protected-datagram server-connection bytes now)))
   server)
 (defun %server-process-protected-datagram (server-connection bytes now)
+  (when (and (server-connection-handshake-complete-p server-connection)
+             (eq (getf (%client-layout bytes) :type) :initial))
+    (return-from %server-process-protected-datagram server-connection))
   (setf (server-connection-now server-connection) now)
   (let ((engine (server-connection-engine server-connection))
         (at 0))
@@ -858,8 +1078,8 @@
                      (%client-handle-ack engine level frame))
                     ((:connection-close :application-close)
                      (connection-receive-frame
-                      (server-connection-connection server-connection) frame
-                      :touch-p nil))))
+                      (server-connection-connection server-connection)
+                      frame :touch-p nil))))
                 (connection-touch
                  (server-connection-connection server-connection) now)))))
         (setf at (+ at (getf layout :end)))
