@@ -648,46 +648,68 @@
              "the protected Retry-token error response stays within three times its input size")
       (cl-quic-kit:client-receive-datagram client response)))
 
-  (let* ((server-socket
-          (cl-quic-kit:make-udp-socket :local-host "127.0.0.1" :local-port 0))
-         (server (cl-quic-kit:make-quic-server
-                  :udp-socket server-socket :max-connections 1
-                  :retry-policy :never))
-         (client (cl-quic-kit:make-quic-client
+  (defun server-test-retry-policy-never ()
+  (let* ((directory (server-test-make-temp-directory))
+         (server-socket
+           (cl-quic-kit:make-udp-socket :local-host "127.0.0.1" :local-port 0))
+         (server nil)
+         (client nil))
+    (unwind-protect
+         (progn
+           (multiple-value-bind (certificate-der private-key)
+               (server-test-make-credential directory)
+             (setf server
+                   (cl-quic-kit:make-quic-server
+                    :udp-socket server-socket :max-connections 1
+                    :retry-policy :never
+                    :tls-server-options
+                    (list :certificate-chain (list certificate-der)
+                          :private-key private-key))))
+           (setf client
+                 (cl-quic-kit:make-quic-client
                   :server-host "127.0.0.1"
                   :server-port (cl-quic-kit:udp-socket-local-port server-socket)
-                  :hostname "localhost" :now-fn (lambda () 0))))
-    (unwind-protect
-        (progn
-          (cl-quic-kit:client-poll client 0)
-          (server-test-poll-until
-           server
-           (lambda ()
-             (loop for path being the hash-values
-                     of (cl-quic-kit::quic-server-paths server)
-                   thereis
-                     (>=
-                      (cl-quic-kit::server-amplification-state-received path)
-                      1200))))
-          (check (loop for path being the hash-values
-                       of (cl-quic-kit::quic-server-paths server)
-                       thereis (>=
-                                (cl-quic-kit::server-amplification-state-received
-                                 path)
-                                1200))
-                 "client Initial reaches the listener at the 1200-byte minimum")
-          (multiple-value-bind (response length address)
-              (cl-quic-kit:udp-receive
-               (cl-quic-kit::quic-client-udp-socket client))
-            (declare (ignore length address))
-            (check (null response)
-                   "retry-policy never sends no Retry for a valid 1200-byte Initial"))
-          (check (zerop
-                  (hash-table-count
-                   (cl-quic-kit::quic-server-retry-tokens server)))
-                 "retry-policy never records no Retry token"))
-      (cl-quic-kit:client-close client)
-      (cl-quic-kit:quic-server-close server)))
+                  :hostname "localhost" :now-fn (lambda () 0)))
+           (cl-quic-kit:client-poll client 0)
+           (server-test-poll-until
+            server
+            (lambda ()
+              (loop for path being the hash-values
+                      of (cl-quic-kit::quic-server-paths server)
+                    thereis
+                      (>=
+                       (cl-quic-kit::server-amplification-state-received path)
+                       1200))))
+           (check
+            (loop for path being the hash-values
+                    of (cl-quic-kit::quic-server-paths server)
+                  thereis
+                    (>=
+                     (cl-quic-kit::server-amplification-state-received path)
+                     1200))
+            "client Initial reaches the listener at the 1200-byte minimum")
+           (multiple-value-bind (response length address)
+               (cl-quic-kit:udp-receive
+                (cl-quic-kit::quic-client-udp-socket client))
+             (declare (ignore length address))
+             (check
+              (or (null response)
+                  (not (eq (cl-quic-kit:packet-header-type
+                            (cl-quic-kit:decode-packet-header response))
+                           :retry)))
+              "retry-policy never does not send Retry for a valid 1200-byte Initial"))
+           (check
+            (zerop (hash-table-count
+                    (cl-quic-kit::quic-server-retry-tokens server)))
+            "retry-policy never records no Retry token"))
+      (when client
+        (cl-quic-kit:client-close client))
+      (unwind-protect
+           (if server
+               (cl-quic-kit:quic-server-close server)
+               (cl-quic-kit:udp-close server-socket))
+        (server-test-remove-temp-directory directory)))))
+
 
   (let* ((server-socket
           (cl-quic-kit:make-udp-socket :local-host "127.0.0.1" :local-port 0))
@@ -1140,6 +1162,7 @@
       (declare (ignore output errors))
       (unless (and (integerp exit-code) (zerop exit-code))
         (error "Could not remove the temporary TLS test directory"))))
+  (server-test-retry-policy-never)
   (server-test-retry-token-validation))
 (progn
   (let* ((directory (server-test-make-temp-directory))
