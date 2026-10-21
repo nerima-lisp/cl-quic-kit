@@ -77,17 +77,17 @@
         "nixpkgs": "nixpkgs_2"
       },
       "locked": {
-        "lastModified": 1792506824,
-        "narHash": "sha256-dFJbjJpfOa4uII6LPWavg6j/7Vj3i0wqKkVzFZz1dlQ=",
+        "lastModified": 1792528342,
+        "narHash": "sha256-8bT8rMmrySYlM1eI6FuFUFMmbpopv6RS9vc2DD56WeU=",
         "owner": "nerima-lisp",
         "repo": "cl-tls-kit",
-        "rev": "7ed1e3eb1edd891066c15951fe282f89dafef81b",
+        "rev": "d6cf61a9ac2c0af16c7a29db3de1075962ba08f9",
         "type": "github"
       },
       "original": {
         "owner": "nerima-lisp",
         "repo": "cl-tls-kit",
-        "rev": "7ed1e3eb1edd891066c15951fe282f89dafef81b",
+        "rev": "d6cf61a9ac2c0af16c7a29db3de1075962ba08f9",
         "type": "github"
       }
     },

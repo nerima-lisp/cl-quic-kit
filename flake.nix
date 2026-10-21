@@ -3,7 +3,7 @@
 
   inputs.nixpkgs.url = "github:NixOS/nixpkgs/nixpkgs-unstable";
   inputs.cl-crypto-kit.url = "github:nerima-lisp/cl-crypto-kit/41ed7e90f736591aa1961bc6deb0741c73392a60";
-  inputs.cl-tls-kit.url = "github:nerima-lisp/cl-tls-kit/7ed1e3eb1edd891066c15951fe282f89dafef81b";
+  inputs.cl-tls-kit.url = "github:nerima-lisp/cl-tls-kit/d6cf61a9ac2c0af16c7a29db3de1075962ba08f9";
   inputs.cl-tls-kit.inputs.cl-crypto-kit.follows = "cl-crypto-kit";
 
   outputs = { self, nixpkgs, cl-crypto-kit, cl-tls-kit }:
@@ -18,8 +18,18 @@
           tls = cl-tls-kit.packages.${system}.default;
         in {
         bootstrap = pkgs.runCommand "cl-quic-kit-bootstrap-tests" {
-          nativeBuildInputs = [ pkgs.sbcl pkgs.caddy pkgs.openssl pkgs.stdenv.cc ];
-          CL_SOURCE_REGISTRY = "${tls}/share/common-lisp/source//:${crypto}/share/common-lisp/source//";
+          nativeBuildInputs = [
+            pkgs.sbcl
+            pkgs.caddy
+            pkgs.openssl
+            pkgs.stdenv.cc
+            pkgs.sbclPackages.alexandria
+            pkgs.sbclPackages.bordeaux-threads
+            pkgs.sbclPackages.global-vars
+            pkgs.sbclPackages.trivial-features
+            pkgs.sbclPackages.trivial-garbage
+          ];
+          CL_SOURCE_REGISTRY = "${tls}/share/common-lisp/source//:${crypto}/share/common-lisp/source//:${pkgs.sbclPackages.alexandria}/:${pkgs.sbclPackages.global-vars}/:${pkgs.sbclPackages.trivial-features}/:${pkgs.sbclPackages.trivial-garbage}/:${pkgs.sbclPackages.bordeaux-threads}/";
           src = ./.;
         } ''
           cd "$src"
@@ -184,8 +194,16 @@
           tls = cl-tls-kit.packages.${system}.default;
         in {
           default = pkgs.mkShell {
-            packages = [ pkgs.sbcl pkgs.openssl ];
-            CL_SOURCE_REGISTRY = "${tls}/share/common-lisp/source//:${crypto}/share/common-lisp/source//";
+            packages = [
+              pkgs.sbcl
+              pkgs.openssl
+              pkgs.sbclPackages.alexandria
+              pkgs.sbclPackages.bordeaux-threads
+              pkgs.sbclPackages.global-vars
+              pkgs.sbclPackages.trivial-features
+              pkgs.sbclPackages.trivial-garbage
+            ];
+            CL_SOURCE_REGISTRY = "${tls}/share/common-lisp/source//:${crypto}/share/common-lisp/source//:${pkgs.sbclPackages.alexandria}/:${pkgs.sbclPackages.global-vars}/:${pkgs.sbclPackages.trivial-features}/:${pkgs.sbclPackages.trivial-garbage}/:${pkgs.sbclPackages.bordeaux-threads}/";
           };
         });
     };
