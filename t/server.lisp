@@ -2288,7 +2288,10 @@
                         (not (cl-quic-kit::server-connection-close-response-attempted-p
                               server-connection)))
                    "closing flood does not add responses to an amplification-blocked close queue")
-                  (setf (cl-quic-kit::server-amplification-state-received path) 1600))
+                  (setf (cl-quic-kit::server-amplification-state-received path)
+                        (ceiling (+ (cl-quic-kit::server-amplification-state-sent path)
+                                    (length pending))
+                                 3)))
                 (cl-quic-kit:quic-server-poll server 2)
                 (let ((response (server-test-receive peer t)))
                   (progn
