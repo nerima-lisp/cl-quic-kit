@@ -1154,21 +1154,18 @@
                       (server-connection nil))
                  (unwind-protect
                      (progn
-                       (setf client (apply (function cl-quic-kit:make-quic-client) :server-host
-                                                                  "127.0.0.1"
-                                                                  :server-port
-                                                                  (cl-quic-kit:udp-socket-local-port
-                                                                   socket)
-                                                                  :hostname
-                                                                  "localhost"
-                                                                  :local-connection-id
-                                                                  client-source-cid
-                                                                  :transport-parameters
-                                                                  parameter-bytes
-                                                                  :disable-hostname-verification-p
-                                                                  t
-                                                                  :alpn
-                                                                  (list "h3") client-tls-options))
+                       (progn
+                         (setf client
+                               (apply (function cl-quic-kit:make-quic-client)
+                                       :server-host "127.0.0.1"
+                                       :server-port (cl-quic-kit:udp-socket-local-port socket)
+                                       :hostname "localhost"
+                                       :local-connection-id client-source-cid
+                                       :disable-hostname-verification-p t
+                                       :alpn (list "h3")
+                                       client-tls-options))
+                         (setf (cl-quic-kit::quic-client-transport-parameters client)
+                               parameter-bytes))
                        (setf server-connection (loop repeat 2000
                                                      do (cl-quic-kit:client-poll
                                                          client) (cl-quic-kit:quic-server-poll
