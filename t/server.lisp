@@ -2195,21 +2195,37 @@
                        1600)
                  (cl-quic-kit:quic-server-poll server 2)
                  (let ((response (server-test-receive peer t)))
-                   (check
-                    (and response
-                         (= (length response) (length pending))
-                         (= (cl-quic-kit::server-amplification-state-sent path)
-                            (+ 3600 (length pending)))
-                         (<= (cl-quic-kit::server-amplification-state-sent path)
-                             (* 3 (cl-quic-kit::server-amplification-state-received
-                                   path)))
-                         (null
-                          (cl-quic-kit::server-connection-pending-datagrams
-                           server-connection))
-                         (null (gethash connection-id
-                                        (cl-quic-kit::quic-server-connections
-                                         server))))
-                    "TLS alert close retries once budget allows and stays within the amplification limit")))
+                   (progn
+                     (check
+                      (and response
+                           (= (length response) (length pending))
+                           (= (cl-quic-kit::server-amplification-state-sent path)
+                              (+ 3600 (length pending)))
+                           (<= (cl-quic-kit::server-amplification-state-sent path)
+                               (* 3 (cl-quic-kit::server-amplification-state-received path)))
+                           (null
+                            (cl-quic-kit::server-connection-pending-datagrams
+                             server-connection))
+                           (eq (gethash connection-id
+                                        (cl-quic-kit::quic-server-connections server))
+                                server-connection)
+                           (eq (cl-quic-kit:connection-state
+                                (cl-quic-kit::server-connection-connection server-connection))
+                                :closing))
+                      "TLS alert close retries within the amplification limit and remains routed while draining")
+                     (let ((deadline
+                            (cl-quic-kit:connection-draining-deadline
+                             (cl-quic-kit::server-connection-connection server-connection))))
+                       (cl-quic-kit:quic-server-poll server deadline)
+                       (check
+                        (and (eq (cl-quic-kit:connection-state
+                                  (cl-quic-kit::server-connection-connection server-connection))
+                                 :closed)
+                             (null (gethash connection-id
+                                            (cl-quic-kit::quic-server-connections server)))
+                             (zerop (hash-table-count
+                                     (cl-quic-kit::quic-server-connections server))))
+                        "TLS alert close removes routes after its draining deadline")))))
                (let* ((expired-id #(31 32 33 34 35 36 37 38))
                       (expired-path
                         (cl-quic-kit::%make-server-amplification-state

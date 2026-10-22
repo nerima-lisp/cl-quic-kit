@@ -1139,10 +1139,7 @@
             (if (eq (connection-state connection) :closed)
                 (setf (server-connection-pending-datagrams server-connection) nil)
                 (%server-flush-pending-datagrams server-connection))))
-      (when (or (eq (connection-state connection) :closed)
-                (and (eq (connection-state connection) :closing)
-                     (null
-                      (server-connection-pending-datagrams server-connection))))
+      (when (eq (connection-state connection) :closed)
         (%server-remove-connection-routes server-connection))))
   server)
 (defun quic-server-accept-connection (server)
