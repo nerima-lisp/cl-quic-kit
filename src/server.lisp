@@ -317,15 +317,15 @@
 (defun %server-send-retry (server header path address now)
   (unless path
     (return-from %server-send-retry nil))
-  (labels ((oldest-unused-retry-token (excluded)
+  (labels ((oldest-retry-token (excluded used-p)
              (let ((oldest-token nil)
                    (oldest-retain-until nil))
                (maphash
                 (lambda (token record)
                   (when (and
                          (server-retry-token-p record)
-                         (not (server-retry-token-used-p record))
-                         (not (member token excluded :test #'equalp)))
+                         (eql used-p (server-retry-token-used-p record))
+                         (not (member token excluded :test (function equalp))))
                     (let ((retain-until
                             (or (server-retry-token-retain-until record) 0)))
                       (when (or (null oldest-retain-until)
@@ -341,10 +341,31 @@
            (tokens-to-evict nil))
       (dotimes (index tokens-needed)
         (declare (ignore index))
-        (let ((token (oldest-unused-retry-token tokens-to-evict)))
+        (let ((token (or (oldest-retry-token tokens-to-evict nil)
+                         (oldest-retry-token tokens-to-evict t))))
           (unless token
             (return-from %server-send-retry nil))
           (push token tokens-to-evict)))
+      (let* ((retired-cids (quic-server-retired-retry-cids server))
+             (active-retired-count
+               (loop for expires-at being the hash-values of retired-cids
+                     count (> expires-at now)))
+             (new-retirement-count
+               (count-if
+                (lambda (old-token)
+                  (let ((old-record
+                          (gethash old-token (quic-server-retry-tokens server))))
+                    (and old-record
+                         (not
+                          (%server-retired-cid-active-p
+                           retired-cids
+                           (server-retry-token-retry-source-connection-id
+                            old-record)
+                           now))))
+                tokens-to-evict)))
+        (when (> (+ active-retired-count new-retirement-count)
+                 *quic-server-retry-cache-limit*)
+          (return-from %server-send-retry nil)))
       (let* ((token (%server-new-token server))
              (retry-source-cid
                (%server-new-retry-source-connection-id
@@ -375,7 +396,8 @@
           (setf (gethash token (quic-server-retry-tokens server)) record)
           (setf (server-amplification-state-expires-at path)
                 (server-retry-token-retain-until record))
-          t)))))
+          t))))))
+
 
 (defun %server-version-negotiation-packet (destination-cid source-cid)
   (let ((packet (encode-version-negotiation
@@ -587,6 +609,16 @@
     (return-from quic-server-poll t))
   (let ((now (or at (%quic-real-time))))
     (%server-prune-expired-state server now)
+    (dolist (server-connection (%server-routed-connections server))
+      (let* ((connection (server-connection-connection server-connection))
+             (deadline (connection-draining-deadline connection)))
+        (when (and deadline
+                   (member (connection-state connection) (list :closing :draining))
+                   (>= now deadline))
+          (connection-poll connection now)
+          (when (eq (connection-state connection) :closed)
+            (setf (server-connection-pending-datagrams server-connection) nil)
+            (%server-remove-connection-routes server-connection)))))
     (loop
       (multiple-value-bind (bytes byte-count address)
           (udp-receive (quic-server-udp-socket server))
