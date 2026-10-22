@@ -9,7 +9,7 @@ The packet, TLS, and loss-recovery code draws on these specifications:
 - [RFC 9002: QUIC Loss Detection and Congestion Control](https://www.rfc-editor.org/rfc/rfc9002)
 
 The package provides QUIC varints, packet and frame codecs, stream and flow-control state, loss recovery and
-NewReno state, connection lifecycle management, and an explicit `cl-crypto-kit` backend boundary under `src/`.
+NewReno state, connection lifecycle management, and an explicit `cl-crypto-kit` backend boundary.
 Configure the QUIC packet-protection backend before constructing a client or processing Initial packets
 with a server. The client derives Initial secrets during construction; the server derives them when it
 handles an Initial packet. Call `cl-quic-kit.protection:configure-crypto-backend` with callbacks for
@@ -170,9 +170,12 @@ an octet vector and optional `:fin-p t`; data beyond current flow-control credit
 credit arrives. For server connections, `cl-quic-kit:quic-server-poll` packetizes queued control frames and
 stream data with available credit, then sends pending datagrams. For client connections, use
 `cl-quic-kit:client-poll`; polling alone is sufficient after writes.
-`cl-quic-kit:quic-connection-flush` optionally attempts packetization before the next poll; it does not send
-datagrams, so most applications can omit it. Frames blocked by congestion control remain queued. A locally
-opened unidirectional stream is send-only, while a peer-initiated unidirectional stream is receive-only. Reading from a send-only stream or
+`cl-quic-kit:quic-connection-flush` attempts to packetize queued writes and send resulting datagrams
+immediately. Data beyond current flow-control credit remains in the write queue; congestion control can leave
+frames queued, and a server's amplification limit can defer datagrams. Polling retries packetization and
+sending. Call flush between polls when an immediate send attempt is needed; otherwise, polling is sufficient.
+A locally opened unidirectional stream is
+send-only, while a peer-initiated unidirectional stream is receive-only. Reading from a send-only stream or
 writing to a receive-only stream signals `cl-quic-kit:stream-id-error`.
 
 `:max-connections` counts handshaking and established connections. Closing and draining connections remain in
