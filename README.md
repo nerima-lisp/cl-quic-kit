@@ -148,11 +148,13 @@ established, closing, draining, or closed.
 
 `cl-quic-kit:quic-connection-open-stream` opens a local bidirectional stream by default. Pass
 `:type :unidirectional` for a unidirectional stream. `quic-connection-read-stream` returns buffered octets,
-empty when none are available. Its second value is true when peer FIN or reset has arrived and all buffered
-octets have been consumed. `quic-connection-write-stream` accepts an octet vector and optional `:fin-p t`;
-data beyond current flow-control credit remains queued. A write queues data for the next `quic-server-poll`,
-which packetizes it and sends pending datagrams. `quic-connection-flush` packetizes queued data and control
-frames immediately; call `quic-server-poll` to send the resulting datagrams. A locally opened unidirectional
+empty when none are available. Its second value is true after peer FIN arrives and all data through FIN has
+been read, or after peer reset, which discards unread buffered octets. `quic-connection-write-stream` accepts
+an octet vector and optional `:fin-p t`; data beyond current flow-control credit remains queued until more
+credit arrives. `quic-server-poll` drives packetization and sends pending datagrams.
+`quic-connection-flush` attempts to packetize queued control frames and stream data with available
+flow-control credit; frames blocked by congestion control remain queued. Call `quic-server-poll` to send
+any resulting datagrams. A locally opened unidirectional
 stream is send-only, while a peer-initiated unidirectional stream is receive-only. Reading from a send-only
 stream or writing to a receive-only stream signals `cl-quic-kit:stream-id-error`. A generic unidirectional stream
 carries application data exactly as written.
