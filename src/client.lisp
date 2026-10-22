@@ -26,6 +26,8 @@
 
 (declaim (ftype function client-tls-feed client-receive-datagram
                         client-flush %client-find-or-create-peer-stream
+                        %client-write-stream-available
+                        %client-process-received-frame
                         %client-protocol-close
                         %client-prepare-next-application-read-key
                         %client-ack-includes-packet-p))
@@ -246,21 +248,47 @@
 
 (defun %client-stream-type (stream-type)
   (case stream-type
-    (:control 0) (:qpack-encoder 2) (:qpack-decoder 3) (otherwise nil)))
+    ((nil :bidirectional) nil)
+    (:unidirectional 0)
+    (:control 0)
+    (:qpack-encoder 2)
+    (:qpack-decoder 3)
+    (otherwise nil)))
 
 (defun %client-transport-parameter (parameters id default)
   (let ((value (cdr (assoc id parameters))))
     (if (integerp value) value default)))
+(defun %client-local-transport-parameters (client)
+  (let ((parameters (quic-client-transport-parameters client)))
+    (if (listp parameters)
+        parameters
+        (decode-transport-parameters
+         parameters
+         :sender-role
+         (quic-connection-role (quic-client-connection client))))))
 
 (defun %client-stream-send-limit (client id)
-  (let ((parameters (quic-client-peer-transport-parameters client)))
-    (if (eq (stream-id-direction id) :bidirectional)
-        (%client-transport-parameter parameters 6 *quic-max-offset*)
-        (%client-transport-parameter parameters 7 *quic-max-offset*))))
+  (let* ((role (quic-connection-role (quic-client-connection client)))
+         (parameters (quic-client-peer-transport-parameters client)))
+    (if (eq (stream-id-direction id) :unidirectional)
+        (%client-transport-parameter parameters 7 *quic-max-offset*)
+        (%client-transport-parameter
+         parameters
+         (if (eq (stream-id-initiator id) role) 6 5)
+         *quic-max-offset*))))
 
 (defun %client-stream-receive-limit (client id)
-  (declare (ignore client))
-  (if (eq (stream-id-direction id) :bidirectional) 65536 65536))
+  (let* ((direction (stream-id-direction id))
+         (parameters (%client-local-transport-parameters client))
+         (parameter-id
+           (if (eq direction :unidirectional)
+               7
+               (if (eq (stream-id-initiator id)
+                       (quic-connection-role
+                        (quic-client-connection client)))
+                   5
+                   6))))
+    (%client-transport-parameter parameters parameter-id 0)))
 
 (defun %client-check-deadline (client timeout deadline)
   (let ((now (funcall (quic-client-clock client))))
@@ -287,6 +315,25 @@
           (:bidirectional (setf (flow-control-state-max-streams-bidi flow) maximum))
           (:unidirectional (setf (flow-control-state-max-streams-uni flow) maximum)))
         (flow-control-update-max-streams flow direction maximum))))
+(defun %client-set-peer-transport-parameters (client parameters)
+  (setf (quic-client-peer-transport-parameters client) parameters)
+  (let ((flow (quic-client-flow-control client)))
+    (when (zerop (flow-control-connection-sent flow))
+      (setf (flow-control-state-connection-max-data flow)
+            (%client-transport-parameter parameters 4 0)))
+    (when (zerop (flow-control-stream-count flow :bidirectional))
+      (setf (flow-control-state-max-streams-bidi flow)
+            (%client-transport-parameter parameters 8 0)))
+    (when (zerop (flow-control-stream-count flow :unidirectional))
+      (setf (flow-control-state-max-streams-uni flow)
+            (%client-transport-parameter parameters 9 0))))
+  (maphash
+   (lambda (id stream)
+     (stream-set-max-send-offset stream (%client-stream-send-limit client id))
+     (stream-set-max-receive-offset stream
+                                    (%client-stream-receive-limit client id)))
+   (quic-client-streams client))
+  parameters)
 
 (defun %client-driver-suite-cipher (driver)
   (case (and driver (%client-driver-slot driver "TLS13-CLIENT-DRIVER-SUITE"))
@@ -878,11 +925,30 @@
      :ack-eliciting-p (%client-ack-eliciting-p frames)))
   (let ((flush-p nil))
     (dolist (frame frames)
-      (case (frame-type frame)
+      (when (%client-process-received-frame client level frame)
+        (setf flush-p t)))
+    (when flush-p
+      (client-flush client))))
+(defun %client-process-received-frame
+    (client level frame &key crypto-handler (touch-p t))
+  (let ((flush-p nil))
+    (unless
+        (case level
+          ((:initial :handshake)
+           (member (frame-type frame)
+                   '(:ack :ack-ecn :connection-close :crypto :padding :ping)))
+          (:0-rtt
+           (not (member (frame-type frame)
+                        '(:ack :ack-ecn :crypto :handshake-done :new-token
+                          :path-response :retire-connection-id))))
+          ((:1-rtt :application) t)
+          (otherwise nil))
+      (error 'quic-frame-space-error
+             :message "Frame is not permitted in this packet number space"))
+    (case (frame-type frame)
       ((:ack :ack-ecn)
        (multiple-value-bind (acked lost) (%client-handle-ack client level frame)
-         (when (or acked lost)
-           (setf flush-p t))))
+         (setf flush-p (or acked lost))))
       (:max-data
        (setf flush-p t)
        (%client-apply-max-data client (frame-field frame :maximum 0)))
@@ -894,56 +960,62 @@
                                   (frame-field frame :maximum 0)))
       (:max-stream-data
        (setf flush-p t)
-       (let ((stream (gethash (frame-field frame :stream-id)
-                              (quic-client-streams client))))
+       (let* ((id (frame-field frame :stream-id))
+              (stream (gethash id (quic-client-streams client))))
          (unless stream
-           (error 'quic-encoding-error :message "MAX_STREAM_DATA for unknown stream"))
+           (error 'stream-id-error :stream-id id))
+         (unless (or (eq (stream-direction stream) :bidirectional)
+                     (stream-local-p stream))
+           (error 'stream-id-error :stream-id id))
          (if (and (null (quic-client-peer-transport-parameters client))
                   (zerop (stream-send-offset stream)))
-             (setf (stream-send-max-offset stream) (frame-field frame :maximum 0))
-             (stream-set-max-send-offset stream (frame-field frame :maximum 0)))))
+             (setf (stream-send-max-offset stream)
+                   (frame-field frame :maximum 0))
+           (stream-set-max-send-offset stream
+                                       (frame-field frame :maximum 0)))))
       (:reset-stream
-       (let ((stream (gethash (frame-field frame :stream-id)
-                              (quic-client-streams client))))
-         (unless stream
-           (error 'quic-encoding-error :message "RESET_STREAM for unknown stream"))
+       (let ((stream (%client-find-or-create-peer-stream
+                      client (frame-field frame :stream-id))))
          (stream-reset-receive
           stream (frame-field frame :application-protocol-error-code 0)
           (frame-field frame :final-size 0))))
       (:stop-sending
-       (let ((stream (gethash (frame-field frame :stream-id)
-                              (quic-client-streams client))))
+       (let* ((id (frame-field frame :stream-id))
+              (stream (gethash id (quic-client-streams client))))
          (unless stream
-           (error 'quic-encoding-error :message "STOP_SENDING for unknown stream"))
+           (error 'stream-id-error :stream-id id))
          (stream-stop-sending-receive
           stream (frame-field frame :application-protocol-error-code 0))
          (loop for event = (stream-next-event stream)
                while event
                when (eq (getf event :type) :reset-stream)
-                 do (%client-queue-frame
-                     client (make-frame :reset-stream
-                                        :stream-id (stream-id stream)
-                                        :application-protocol-error-code
-                                        (getf event :error-code 0)
-                                        :final-size (getf event :final-size 0))
-                     :1-rtt))))
+               do (%client-queue-frame
+                   client (make-frame :reset-stream
+                                      :stream-id (stream-id stream)
+                                      :application-protocol-error-code
+                                      (getf event :error-code 0)
+                                      :final-size (getf event :final-size 0))
+                   :1-rtt)
+               (setf flush-p t))))
       (:stream
        (let ((stream (%client-find-or-create-peer-stream
                       client (frame-field frame :stream-id))))
          (stream-receive-data stream (frame-field frame :offset 0)
                               (frame-field frame :data #())
                               :fin (frame-field frame :fin nil))))
-      (:crypto (client-tls-feed client level (frame-field frame :offset 0)
-                                (frame-field frame :data #())))
+      (:crypto
+       (if crypto-handler
+           (funcall crypto-handler client level frame)
+         (client-tls-feed client level (frame-field frame :offset 0)
+                          (frame-field frame :data #()))))
       ((:connection-close :application-close)
-       (connection-receive-frame (quic-client-connection client) frame))
+       (connection-receive-frame (quic-client-connection client) frame
+                                 :touch-p touch-p))
       (:handshake-done
        (unless (quic-client-closed-p client)
          (setf (quic-client-application-handshake-confirmed-p client) t)
-         (connection-set-state (quic-client-connection client) :established)))
-      (otherwise nil)))
-    (when flush-p
-      (client-flush client))))
+         (connection-set-state (quic-client-connection client) :established))))
+    flush-p))
 
 (defun make-quic-client (&key connection udp-socket tls-boundary tls-driver
                               local-connection-id destination-connection-id
@@ -971,11 +1043,23 @@
                           :role :client :local-connection-id local :now-fn clock
                           :idle-timeout (or idle-timeout *quic-idle-timeout-default*)
                           :io-write write :on-close on-close)))
+         (local-transport-parameters
+           (or transport-parameters
+               (%client-transport-parameters
+                local (quic-connection-idle-timeout connection))))
+         (decoded-local-transport-parameters
+           (if (listp local-transport-parameters)
+               local-transport-parameters
+               (decode-transport-parameters
+                local-transport-parameters
+                :sender-role (quic-connection-role connection))))
+         (role (quic-connection-role connection))
          (client (%make-quic-client
                   :connection connection :udp-socket udp :tls-boundary tls-boundary
                   :tls-driver tls-driver :streams (make-hash-table :test #'eql)
-                  :next-bidi-stream 0 :next-uni-stream 2 :pending-frames nil
-                  :pending-stream-writes nil
+                  :next-bidi-stream (if (eq role :server) 1 0)
+                  :next-uni-stream (if (eq role :server) 3 2)
+                  :pending-frames nil :pending-stream-writes nil
                   :application-read-key-phase 0
                   :application-read-old-key nil
                   :application-read-next-key nil
@@ -993,7 +1077,9 @@
                   :flow-control
                   (make-flow-control-state
                    :max-data *quic-max-offset*
-                   :max-receive-data 1048576
+                   :max-receive-data
+                   (%client-transport-parameter
+                    decoded-local-transport-parameters 4 0)
                    :max-streams-bidi *quic-max-streams*
                    :max-streams-uni *quic-max-streams*)
                   :initial-destination-connection-id destination
@@ -1005,14 +1091,12 @@
                   :local-connection-id local
                   :server-host server-host :server-port server-port
                   :hostname hostname :alpn alpn
-                  :transport-parameters (or transport-parameters
-                                            (%client-transport-parameters
-                                             local
-                                             (quic-connection-idle-timeout connection)))
+                  :transport-parameters local-transport-parameters
                   :tls-key-exchange tls-key-exchange :tls-provider tls-provider
                   :tls-trust-anchors tls-trust-anchors
                   :tls-verify-signature tls-verify-signature
                   :tls-signature-algorithms tls-signature-algorithms)))
+    (setf (quic-connection-stream-engine connection) client)
     (let ((initial (cl-quic-kit.protection:derive-initial-secrets destination)))
       (%client-set-key client :initial :write (getf initial :client))
       (%client-set-key client :initial :read (getf initial :server)))
@@ -1024,9 +1108,10 @@
   (when (quic-client-closed-p client)
     (error 'connection-closed :error-code 0 :reason #()))
   (let* ((uni-type (%client-stream-type stream-type))
-         (direction (if uni-type :unidirectional :bidirectional)))
+         (direction (if uni-type :unidirectional :bidirectional))
+         (flow (quic-client-flow-control client)))
     (handler-case
-        (flow-control-open-stream (quic-client-flow-control client) direction)
+        (flow-control-open-stream flow direction)
       (flow-control-limit-error (condition)
         (%client-queue-frame
          client (make-frame (if uni-type :streams-blocked-uni
@@ -1034,25 +1119,21 @@
                             :maximum (flow-control-error-limit condition))
          :1-rtt)
         (error condition)))
-  (let* ((uni-type (%client-stream-type stream-type))
-         (id (if uni-type
-                 (prog1 (quic-client-next-uni-stream client)
-                   (incf (quic-client-next-uni-stream client) 4))
-                 (prog1 (quic-client-next-bidi-stream client)
-                   (incf (quic-client-next-bidi-stream client) 4))))
-         (stream (make-stream id :local-initiator :client
-                              :flow-control (quic-client-flow-control client)
-                              :max-send-data (%client-stream-send-limit client id)
-                              :max-receive-data (%client-stream-receive-limit client id))))
-    (setf (gethash id (quic-client-streams client)) stream)
-    (when uni-type
-      (incf (stream-send-offset stream) (length (encode-varint uni-type)))
-      (%client-queue-frame client
-                           (make-frame :stream :stream-id id :offset 0
-                                       :data (encode-varint uni-type)
-                                       :fin nil :len-present t)
-                           :1-rtt))
-    stream)))
+    (let* ((role (quic-connection-role (quic-client-connection client)))
+           (id (if uni-type
+                   (prog1 (quic-client-next-uni-stream client)
+                     (incf (quic-client-next-uni-stream client) 4))
+                   (prog1 (quic-client-next-bidi-stream client)
+                     (incf (quic-client-next-bidi-stream client) 4))))
+           (stream (make-stream id :local-initiator role
+                                :flow-control flow
+                                :max-send-data (%client-stream-send-limit client id)
+                                :max-receive-data (%client-stream-receive-limit client id))))
+      (setf (gethash id (quic-client-streams client)) stream)
+      (when (and uni-type (not (eq stream-type :unidirectional)))
+        (%client-write-stream-available
+         client stream (encode-varint uni-type) nil))
+      stream)))
 
 (defun %client-stream-send-credit (client stream)
   (min (- (stream-send-max-offset stream) (stream-send-offset stream))
@@ -1137,31 +1218,45 @@
 (defun client-read-stream (client stream &key timeout deadline)
   (%client-check-deadline client timeout deadline)
   (multiple-value-bind (data fin) (stream-read stream)
-    (let ((maximum (+ (stream-read-offset stream) 65536)))
-      (stream-set-max-receive-offset stream maximum)
-      (%client-queue-frame
-       client (make-frame :max-stream-data :stream-id (stream-id stream)
-                          :maximum maximum) :1-rtt)
-      (flow-control-update-max-receive-data
-       (quic-client-flow-control client)
-       (max maximum (flow-control-connection-receive-limit
-                     (quic-client-flow-control client)))))
-    (values data fin)))
+    (let* ((flow (quic-client-flow-control client))
+           (stream-maximum
+             (min *quic-max-offset* (+ (stream-read-offset stream) 65536)))
+           (connection-maximum
+             (min *quic-max-offset*
+                  (+ (flow-control-connection-receive-limit flow)
+                     (length data)))))
+      (when (> stream-maximum (stream-receive-max-offset stream))
+        (stream-set-max-receive-offset stream stream-maximum)
+        (%client-queue-frame
+         client (make-frame :max-stream-data :stream-id (stream-id stream)
+                            :maximum stream-maximum) :1-rtt))
+      (when (> connection-maximum
+               (flow-control-connection-receive-limit flow))
+        (flow-control-update-max-receive-data flow connection-maximum)
+        (%client-queue-frame
+         client (make-frame :max-data :maximum connection-maximum) :1-rtt))
+      (values data fin))))
 
-(defun client-accept-peer-stream (client)
-  "Return one unaccepted peer-initiated stream, or NIL when none is available or CLIENT is closed."
+(defun client-accept-peer-stream (client &key (type :any))
+  (unless (member type '(:any :bidirectional :unidirectional))
+    (error 'type-error :datum type
+           :expected-type '(member :any :bidirectional :unidirectional)))
   (unless (quic-client-closed-p client)
-    (let ((accepted nil)
+    (let ((streams nil)
           (accepted-ids (quic-client-accepted-peer-streams client)))
       (maphash
        (lambda (id stream)
-         (when (and (null accepted)
-                    (not (stream-local-p stream))
-                    (not (gethash id accepted-ids)))
-           (setf accepted stream
-                 (gethash id accepted-ids) t)))
+         (declare (ignore id))
+         (when (and (not (stream-local-p stream))
+                    (not (gethash (stream-id stream) accepted-ids))
+                    (or (eq type :any)
+                        (eq type (stream-direction stream))))
+           (push stream streams)))
        (quic-client-streams client))
-      accepted)))
+      (let ((stream (first (sort streams #'< :key #'stream-id))))
+        (when stream
+          (setf (gethash (stream-id stream) accepted-ids) t))
+        stream))))
 
 (defun client-close-stream (client stream &key condition)
   (declare (ignore condition))
@@ -1203,11 +1298,26 @@
 
 (defun %client-find-or-create-peer-stream (client id)
   (or (gethash id (quic-client-streams client))
-      (setf (gethash id (quic-client-streams client))
-            (make-stream id :local-initiator :client
-                         :flow-control (quic-client-flow-control client)
-                         :max-receive-data (%client-stream-receive-limit client id)
-                         :max-send-data (%client-stream-send-limit client id)))))
+      (let* ((connection (quic-client-connection client))
+             (role (quic-connection-role connection))
+             (initiator (stream-id-initiator id))
+             (direction (stream-id-direction id))
+             (parameters (%client-local-transport-parameters client))
+             (limit (%client-transport-parameter
+                     parameters
+                     (if (eq direction :bidirectional) 8 9)
+                     0))
+             (stream-number (1+ (floor id 4))))
+        (when (eq initiator role)
+          (error 'stream-id-error :stream-id id))
+        (when (> stream-number limit)
+          (error 'stream-limit-error :limit limit :attempted stream-number
+                 :message "Peer opened a stream beyond the advertised stream limit"))
+        (setf (gethash id (quic-client-streams client))
+              (make-stream id :local-initiator role
+                           :flow-control (quic-client-flow-control client)
+                           :max-receive-data (%client-stream-receive-limit client id)
+                           :max-send-data (%client-stream-send-limit client id))))))
 
 (defun client-receive-frame (client frame)
   (%client-receive-frames client :initial 0 (list frame))
@@ -1283,10 +1393,10 @@
         last-header)
     (quic-error (condition)
       (%client-protocol-close
-       client 7
+       client (if (typep condition 'quic-frame-space-error) 10 7)
        (if (typep condition 'quic-crypto-error)
            (quic-crypto-error-message condition)
-           (quic-error-message condition))) nil)
+         (quic-error-message condition))) nil)
     (error (condition)
       (%client-protocol-close client 7 (princ-to-string condition)) nil)))
 
@@ -1320,28 +1430,12 @@
                      (declare (ignore boundary level direction secret)))
                    :on-transport-parameters
                    (lambda (boundary parameters)
-                     (declare (ignore boundary))
-                     (let ((parameters (if (listp parameters)
-                                           parameters
-                                           (decode-transport-parameters parameters :sender-role :server))))
-                       (setf (quic-client-peer-transport-parameters client) parameters)
-                       (let ((flow (quic-client-flow-control client)))
-                         (when (zerop (flow-control-connection-sent flow))
-                           (setf (flow-control-state-connection-max-data flow)
-                                 (%client-transport-parameter parameters 4 0)))
-                         (when (zerop (flow-control-stream-count flow :bidirectional))
-                           (setf (flow-control-state-max-streams-bidi flow)
-                                 (%client-transport-parameter parameters 8 0)))
-                         (when (zerop (flow-control-stream-count flow :unidirectional))
-                           (setf (flow-control-state-max-streams-uni flow)
-                                 (%client-transport-parameter parameters 9 0))))
-                       (maphash
-                        (lambda (id stream)
-                          (stream-set-max-send-offset
-                           stream (%client-stream-send-limit client id))
-                          (stream-set-max-receive-offset
-                           stream (%client-stream-receive-limit client id)))
-                        (quic-client-streams client)))))))
+  (declare (ignore boundary))
+  (%client-set-peer-transport-parameters
+   client
+   (if (listp parameters)
+       parameters
+       (decode-transport-parameters parameters :sender-role :server)))))))
     (quic-client-tls-boundary client))
 
 (defun %client-driver-key-exchange (client)

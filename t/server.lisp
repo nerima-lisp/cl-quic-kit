@@ -3045,4 +3045,201 @@
                   "server stops processing coalesced packets after peer close")))
           (cl-quic-kit:quic-server-close server))))
     (server-test-peer-close-stops-coalesced-packet-processing)
-    (server-test-terminal-connection-releases-capacity)))
+    (server-test-terminal-connection-releases-capacity)
+    (progn
+  (defun server-test-stream-public-api ()
+    (let* ((directory (server-test-make-temp-directory))
+           (socket nil)
+           (server nil)
+           (client nil))
+      (unwind-protect
+          (multiple-value-bind (server-tls-options client-tls-options)
+              (server-test-tls-settings directory)
+            (setf socket
+                  (cl-quic-kit:make-udp-socket
+                   :local-host "127.0.0.1" :local-port 0))
+            (setf server
+                  (cl-quic-kit:make-quic-server
+                   :udp-socket socket
+                   :max-connections 1
+                   :retry-policy :always
+                   :transport-parameters
+                   (list :initial-max-data 4
+                         :initial-max-stream-data-bidi-local 65536
+                         :initial-max-stream-data-bidi-remote 2
+                         :initial-max-stream-data-uni 4
+                         :initial-max-streams-bidi 10
+                         :initial-max-streams-uni 10)
+                   :tls-server-options
+                   (append server-tls-options
+                           (list :alpn-protocols (list "h3")))))
+            (setf client
+                  (apply (function cl-quic-kit:make-quic-client)
+                         :server-host "127.0.0.1"
+                         :server-port (cl-quic-kit:udp-socket-local-port socket)
+                         :idle-timeout 60
+                         :hostname "localhost"
+                         :alpn (list "h3")
+                         client-tls-options))
+            (let* ((server-connection
+                    (server-test-loopback-handshake server client))
+                   (client-stream (cl-quic-kit:client-open-stream client nil))
+                   (payload
+                    (make-array 6 :element-type '(unsigned-byte 8)
+                                :initial-contents (list 11 12 13 14 15 16)))
+                   (server-stream nil))
+              (check
+               (eq (cl-quic-kit:connection-state server-connection) :established)
+               "stream API uses the accepted server connection")
+              (check
+               (null (cl-quic-kit:quic-connection-accept-stream server-connection))
+               "server stream accept is empty before peer data arrives")
+              (check
+               (server-test-type-error-p
+                (lambda ()
+                  (cl-quic-kit:quic-connection-accept-stream
+                   server-connection :type :invalid)))
+               "server stream accept rejects an invalid direction")
+              (cl-quic-kit:client-write-stream client client-stream payload :fin-p t)
+              (check
+               (cl-quic-kit:client-stream-write-pending-p client client-stream)
+               "client write remains queued past the server flow-control limit")
+              (cl-quic-kit:client-poll client)
+              (cl-quic-kit:quic-server-poll server)
+              (check
+               (null (cl-quic-kit:quic-connection-accept-stream
+                      server-connection :type :unidirectional))
+               "server stream accept filters by direction")
+              (setf server-stream
+                    (cl-quic-kit:quic-connection-accept-stream
+                     server-connection :type :bidirectional))
+              (check
+               (and server-stream
+                    (not (cl-quic-kit:stream-local-p server-stream)))
+               "server stream accept returns the peer stream")
+              (check
+               (null (cl-quic-kit:quic-connection-accept-stream server-connection))
+               "server stream accept returns each peer stream only once")
+              (multiple-value-bind (first-data first-fin)
+                  (cl-quic-kit:quic-connection-read-stream
+                   server-connection server-stream)
+                (check
+                 (and (equalp first-data (subseq payload 0 2))
+                      (not first-fin))
+                 "server stream read respects the initial stream and connection credit"))
+              (cl-quic-kit:quic-connection-flush server-connection)
+              (cl-quic-kit:quic-server-poll server)
+              (cl-quic-kit:client-poll client)
+              (check
+               (not (cl-quic-kit:client-stream-write-pending-p client client-stream))
+               "server read credit releases the queued client write")
+              (cl-quic-kit:quic-server-poll server)
+              (progn
+                (multiple-value-bind (remaining-data fin-p)
+                    (cl-quic-kit:quic-connection-read-stream
+                     server-connection server-stream)
+                  (check
+                   (and (equalp remaining-data (subseq payload 2))
+                        fin-p)
+                   "server stream read returns remaining octets and FIN"))
+                (let* ((uni-stream
+                         (cl-quic-kit:quic-connection-open-stream
+                          server-connection :type :unidirectional))
+                       (application-bytes
+                         (make-array 1 :element-type (quote (unsigned-byte 8))
+                                     :initial-contents (quote (2)))))
+                  (cl-quic-kit:quic-connection-write-stream
+                   server-connection uni-stream application-bytes :fin-p t)
+                  (cl-quic-kit:quic-connection-flush server-connection)
+                  (cl-quic-kit:quic-server-poll server)
+                  (cl-quic-kit:client-poll client)
+                  (let ((peer-stream
+                          (cl-quic-kit:client-accept-peer-stream
+                           client :type :unidirectional)))
+                    (check peer-stream
+                           "client receives a server unidirectional stream")
+                    (when peer-stream
+                      (multiple-value-bind (received fin-p)
+                          (cl-quic-kit:client-read-stream client peer-stream)
+                        (check
+                         (and (equalp received application-bytes) fin-p)
+                         "raw unidirectional stream preserves the nonzero application prefix"))))))
+              (let* ((response-stream
+                      (cl-quic-kit:quic-connection-open-stream server-connection))
+                     (response
+                      (make-array 3 :element-type '(unsigned-byte 8)
+                                  :initial-contents (list 21 22 23))))
+                (cl-quic-kit:quic-connection-write-stream
+                 server-connection response-stream response :fin-p t)
+                (cl-quic-kit:quic-connection-flush server-connection)
+                (cl-quic-kit:quic-server-poll server)
+                (cl-quic-kit:client-poll client)
+                (let ((peer-stream
+                       (cl-quic-kit:client-accept-peer-stream
+                        client :type :bidirectional)))
+                  (check peer-stream
+                         "client receives a stream opened by the server")
+                  (multiple-value-bind (received fin-p)
+                      (cl-quic-kit:client-read-stream client peer-stream)
+                    (progn
+                      (check
+                       (and (equalp received response) fin-p)
+                       "server stream write and flush deliver octets and FIN")
+                      (let* ((engine
+                              (cl-quic-kit::quic-connection-stream-engine
+                               server-connection))
+                             (flow (cl-quic-kit::quic-client-flow-control engine))
+                             (peer-parameters
+                              (cl-quic-kit:quic-client-peer-transport-parameters engine))
+                             (peer-limit (cdr (assoc 8 peer-parameters)))
+                             (limit (cl-quic-kit:flow-control-max-streams-bidi flow))
+                             (limit-condition nil)
+                             (local-parameters
+                              (cl-quic-kit::%client-local-transport-parameters engine))
+                             (local-limit (cdr (assoc 8 local-parameters)))
+                             (client-flow (cl-quic-kit::quic-client-flow-control client))
+                             (client-peer-limit
+                              (cl-quic-kit:flow-control-max-streams-bidi client-flow))
+                             (stream-id (* 4 client-peer-limit)))
+                        (check
+                         (and (integerp peer-limit) (= peer-limit limit))
+                         "server stream limit matches negotiated peer bidi limit")
+                        (loop while (< (cl-quic-kit:flow-control-stream-count
+                                        flow :bidirectional)
+                                       limit)
+                              do (cl-quic-kit:quic-connection-open-stream server-connection))
+                        (check
+                         (= (cl-quic-kit:flow-control-stream-count flow :bidirectional) limit)
+                         "server API opens streams up to the negotiated peer limit")
+                        (handler-case
+                            (cl-quic-kit:quic-connection-open-stream server-connection)
+                          (cl-quic-kit:flow-control-limit-error (condition)
+                                                                (setf limit-condition condition)))
+                        (check
+                         (and limit-condition
+                              (= (cl-quic-kit:flow-control-error-limit limit-condition) limit)
+                              (= (cl-quic-kit:flow-control-error-attempted limit-condition)
+                                 (1+ limit)))
+                         "server API signals the flow-control limit condition at the peer maximum")
+                        (check
+                         (and (integerp local-limit) (= local-limit client-peer-limit))
+                         "client observes the server advertised bidi stream limit")
+                        (cl-quic-kit::%client-queue-frame
+                         client
+                         (cl-quic-kit:make-frame :stream :stream-id stream-id :offset 0
+                                                 :data #() :fin nil)
+                         :1-rtt)
+                        (cl-quic-kit:client-flush client)
+                        (cl-quic-kit:quic-server-poll server)
+                        (check
+                         (and (eq (cl-quic-kit:connection-state server-connection) :closing)
+                              (= (cl-quic-kit::quic-connection-closed-error server-connection) 4)
+                              (null (gethash stream-id (cl-quic-kit::quic-client-streams engine))))
+                         "server frame path rejects a peer stream beyond its advertised limit"))))))))
+        (when client
+          (cl-quic-kit:client-close client))
+        (if server
+            (cl-quic-kit:quic-server-close server)
+          (when socket
+            (cl-quic-kit:udp-close socket))))))
+  (server-test-stream-public-api))))

@@ -12,8 +12,9 @@ The package provides QUIC varints, packet and frame codecs, stream and flow-cont
 NewReno state, connection lifecycle management, and an explicit `cl-crypto-kit` backend boundary under `src/`.
 Before sending protected traffic, applications must call
 `cl-quic-kit.protection:configure-crypto-backend` with callbacks for `:hkdf-extract`, `:hkdf-expand`,
-`:aead-seal`, `:aead-open`, `:aes-ecb` or `:chacha20`, and `:constant-time-equal`. This setting is separate
-from TLS provider selection. `t/run.lisp` shows the test runner's adapter mapping.
+`:aead-seal`, `:aead-open`, and `:constant-time-equal`. Provide `:aes-ecb` for AES cipher suites and
+`:chacha20` for the ChaCha20-Poly1305 suite. This setting is separate from TLS provider selection.
+`t/run.lisp` shows how the test runner connects these callbacks to `cl-crypto-kit`.
 
 ## Client API
 
@@ -30,7 +31,7 @@ from TLS provider selection. `t/run.lisp` shows the test runner's adapter mappin
 parsed certificate objects in `:tls-trust-anchors`; parse a DER root certificate with
 `(cl-tls-kit.x509:parse-certificate-der root-certificate-der)`. The client does not load system trust roots.
 The default signature verifier uses cl-crypto-kit's `verify-signature`. The first
-`(cl-quic-kit:client-poll client)` call starts the TLS handshake for a client created with these network arguments.
+`(cl-quic-kit:client-poll client)` call starts the TLS handshake.
 The `:alpn` option takes a list of protocol names and defaults to `("h3")`; set it to `NIL` to omit ALPN.
 The optional `:idle-timeout` value uses seconds and defaults to 30; the client advertises it in milliseconds.
 Continue polling until
@@ -59,8 +60,9 @@ stream. Its second argument is currently unused. Pass the returned stream to `cl
   from the client and does not enqueue FIN. It drops writes waiting for flow control.
   STREAM frames already queued remain queued and may be sent by a later
   `(cl-quic-kit:client-poll client)` call.
-- `cl-quic-kit:quic-connection-closed-reason (connection)` returns a reason recorded on the connection as
-  octets. It is `NIL` if no connection reason was recorded, and `#()` if a recorded reason is empty. The
+- `cl-quic-kit:quic-connection-closed-reason (connection)` returns a recorded close reason as octets. A local
+  `quic-connection-close` or a peer `CONNECTION_CLOSE` records it. It is `NIL` if no reason was recorded, and
+  `#()` if the recorded reason is empty. The
   client's `(cl-quic-kit:client-close client :reason "client shutdown")` sends the optional `:reason` but
   does not populate this field, so the accessor can still return `NIL` after local close. For a client, read
   its reason with
@@ -133,15 +135,36 @@ none is ready. Each connection is returned once.
 A client that omits ALPN can complete the handshake without selecting a protocol, so an accepted connection
 can have no negotiated ALPN. Use `cl-quic-kit:quic-connection-alpn` to read the selected protocol; it returns
 `NIL` when none was selected.
-This API supports accepting connections and inspecting ALPN; it does not yet expose server-side stream
-operations or per-connection close.
+After `quic-server-accept-connection` returns a connection, use its stream API from the application loop.
+`cl-quic-kit:quic-connection-accept-stream` returns the next peer-initiated stream, or `NIL` when none is
+available. Pass `:type :bidirectional` or `:unidirectional` to filter the queue; the default `:any` accepts
+either direction. Each peer stream is returned once.
 
-`:max-connections` counts both handshaking and established connections. `:transport-parameters` accepts
-a keyword plist containing these six parameters. The values in the constructor example are the defaults;
-omitted keys use them. Unknown keys signal an error. Each supplied value must be a non-negative QUIC varint.
+`cl-quic-kit:quic-connection-open-stream` opens a local bidirectional stream by default. Pass
+`:type :unidirectional` for a unidirectional stream. `quic-connection-read-stream` returns buffered octets,
+empty when none are available. Its second value is true when peer FIN or reset has arrived and all buffered
+octets have been consumed. `quic-connection-write-stream`
+accepts an octet vector and optional `:fin-p t`; data beyond current flow-control credit remains queued.
+A generic unidirectional stream carries application data exactly as written. `quic-connection-flush`
+packetizes queued data and control frames. Call `quic-server-poll` to send pending datagrams and process new
+input.
 
-`cl-quic-kit:quic-server-close` marks tracked connections closed locally and closes the listener's owned
-UDP socket. It does not send QUIC `CONNECTION_CLOSE` frames.
+`:max-connections` counts both handshaking and established connections. `:max-handshakes` limits concurrent
+in-progress handshakes and defaults to `:max-connections`; it must be positive and no greater than
+`:max-connections`. `:transport-parameters` accepts a keyword plist containing the six parameters shown
+above. The values in the constructor example are the defaults; omitted keys use them. Unknown keys signal an
+error. Each supplied value must be a non-negative QUIC varint.
+
+`cl-quic-kit:quic-connection-close` sends a QUIC `CONNECTION_CLOSE` on a connection and is idempotent. Its
+optional `:error-code` accepts a QUIC error keyword or integer, and `:reason` accepts text or octets.
+
+`cl-quic-kit:quic-server-shutdown` stops admission of new connections and returns immediately. Its
+`:grace-period` is measured in seconds and defaults to 30. Continue calling `quic-server-poll` to drain active
+connections; the server closes when they finish or the grace period expires. Repeated calls do not extend the
+original deadline. `cl-quic-kit:quic-server-close` initiates a
+best-effort `CONNECTION_CLOSE` on active connections and closes the listener socket immediately. It cleans up
+server state even when a send fails, then signals the first QUIC error. Use server shutdown for graceful
+draining and server close for immediate local shutdown.
 
 ## Development
 

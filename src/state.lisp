@@ -28,6 +28,7 @@
   remote-retire-prior-to active-connection-id-limit
   tls-input tls-output io-read io-write on-close
   closed-error closed-reason close-kind close-frame draining-deadline
+  stream-engine
   (alpn nil))
 
 (defun connection-state (connection)
