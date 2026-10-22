@@ -538,9 +538,19 @@
                     (unless (or (and existing
                                      (server-connection-handshake-complete-p
                                       existing))
-                                (%server-retired-cid-active-p
-                                 (quic-server-retired-local-cids server)
-                                 destination-cid now))
+                                (and (null existing)
+                                     (or (gethash destination-cid
+                                                  (quic-server-connections server))
+                                         (loop for active being the hash-values
+                                                 of (quic-server-connections server)
+                                               thereis
+                                               (equalp
+                                                destination-cid
+                                                (server-connection-original-destination-connection-id
+                                                 active)))
+                                         (%server-retired-cid-active-p
+                                          (quic-server-retired-local-cids server)
+                                          destination-cid now))))
                       (let* ((record
                               (loop for candidate being the hash-values
                                     of (quic-server-retry-tokens server)
@@ -1028,17 +1038,21 @@
           server-connection)
     server-connection))
 (defun %server-find-initial-connection (server destination-cid source-cid)
-  (or (gethash destination-cid (quic-server-connections server))
-      (loop for server-connection being the hash-values
-              of (quic-server-connections server)
-            when (and
-                  (equalp destination-cid
-                          (server-connection-original-destination-connection-id
-                           server-connection))
-                  (equalp source-cid
-                          (server-connection-remote-connection-id
-                           server-connection)))
-              return server-connection)))
+  (let ((connection (gethash destination-cid (quic-server-connections server))))
+    (or (and connection
+             (equalp source-cid
+                     (server-connection-remote-connection-id connection))
+             connection)
+        (loop for server-connection being the hash-values
+                of (quic-server-connections server)
+              when (and
+                    (equalp destination-cid
+                            (server-connection-original-destination-connection-id
+                             server-connection))
+                    (equalp source-cid
+                            (server-connection-remote-connection-id
+                             server-connection)))
+                return server-connection))))
 (defun %server-start-or-feed-initial
     (server header path address record bytes now)
   (let* ((existing
