@@ -3496,7 +3496,7 @@
                  (and (eq (cl-quic-kit:connection-state
                            (cl-quic-kit:quic-client-connection new-client))
                           :handshaking)
-                      (null (cl-quic-kit::quic-client-retry-token new-client))
+                      (equalp (cl-quic-kit::quic-client-retry-token new-client) #())
                       (= (hash-table-count
                           (cl-quic-kit::quic-server-connections server))
                          2)
