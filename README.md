@@ -10,11 +10,15 @@ The packet, TLS, and loss-recovery code draws on these specifications:
 
 The package provides QUIC varints, packet and frame codecs, stream and flow-control state, loss recovery and
 NewReno state, connection lifecycle management, and an explicit `cl-crypto-kit` backend boundary under `src/`.
-Configure the crypto backend before constructing a QUIC client; construction derives Initial secrets
-immediately. Call `cl-quic-kit.protection:configure-crypto-backend` with callbacks for `:hkdf-extract`,
+Configure the QUIC packet-protection backend before constructing a client or processing Initial packets
+with a server. The client derives Initial secrets during construction; the server derives them when it
+handles an Initial packet. Call `cl-quic-kit.protection:configure-crypto-backend` with callbacks for
+`:hkdf-extract`,
 `:hkdf-expand`, `:aead-seal`, `:aead-open`, and `:constant-time-equal`. Provide `:aes-ecb` for AES cipher
-suites and `:chacha20` for the ChaCha20-Poly1305 suite. This setting is separate from TLS provider selection.
-`t/run.lisp` shows how the test runner connects these callbacks to `cl-crypto-kit`.
+suites and `:chacha20` for the ChaCha20-Poly1305 suite. This packet-protection backend is separate from TLS
+provider selection. The client accepts a cl-tls-kit provider object as `:tls-provider`; set the server
+provider as `:provider` within `:tls-server-options`. `t/run.lisp` shows how the test runner connects these
+callbacks to `cl-crypto-kit`.
 
 ## Client API
 
@@ -39,14 +43,14 @@ The `:alpn` option takes a list of protocol names and defaults to `("h3")`; set 
 The optional `:idle-timeout` value uses seconds and defaults to 30; the client advertises it in milliseconds.
 
 After the handshake, `(cl-quic-kit:client-open-stream client nil)` opens a locally initiated bidirectional
-stream. Its second argument is currently unused. Pass the returned stream to `client-write-stream` or
-`client-read-stream`.
+stream. Its second argument is currently unused. Pass the returned stream to
+`cl-quic-kit:client-write-stream` or `cl-quic-kit:client-read-stream`.
 
 - `cl-quic-kit:client-accept-peer-stream (client)` returns one available peer stream. Call
   `(cl-quic-kit:client-poll client)` to send queued frames and process available UDP datagrams, then call
   `(cl-quic-kit:client-accept-peer-stream client)` until it returns `NIL`. Poll again to process later
   datagrams. Each peer-initiated stream is returned once; locally opened streams are excluded. After
-  `(cl-quic-kit:client-close client)`, `client-accept-peer-stream` returns `NIL`; use
+  `(cl-quic-kit:client-close client)`, `cl-quic-kit:client-accept-peer-stream` returns `NIL`; use
   `(cl-quic-kit:quic-client-closed-p client)` to distinguish that case from no available stream. Pass a
   returned stream to `(cl-quic-kit:client-read-stream client stream)` to consume available octets. It
   returns an octet vector, which is empty when no data is buffered. The second return value is true when
@@ -61,13 +65,18 @@ stream. Its second argument is currently unused. Pass the returned stream to `cl
   from the client and does not enqueue FIN. It drops writes waiting for flow control.
   STREAM frames already queued remain queued and may be sent by a later
   `(cl-quic-kit:client-poll client)` call.
-- `cl-quic-kit:client-receive-frame (client frame &key (level :initial))` applies a decoded frame and checks
-  it against the selected packet-number space. Pass `:level :1-rtt` for stream or flow-control frames.
+- `cl-quic-kit:client-receive-frame (client frame &key (level :initial))` applies an already-decoded frame
+  directly to a client. Each call reuses packet number 0, so use it for frame-level tests rather than
+  processing traffic. Obtain a frame with `cl-quic-kit:decode-frame` or construct one with
+  `cl-quic-kit:make-frame`. Normal clients should call `cl-quic-kit:client-poll`, which receives UDP
+  datagrams and decodes their packets and frames; custom transports can pass full datagrams to
+  `cl-quic-kit:client-receive-datagram`. `:level` selects the encryption level for frame-permission checks and defaults to `:initial`;
+  pass `:level :1-rtt` for stream or flow-control frames.
 - `cl-quic-kit:quic-connection-closed-reason (connection)` returns the peer's recorded `CONNECTION_CLOSE`
   reason as octets. It is `NIL` if no peer reason was recorded, and `#()` if the recorded reason is empty.
   For a client, read it with
   `(cl-quic-kit:quic-connection-closed-reason (cl-quic-kit:quic-client-connection client))`. The optional
-  `:reason` passed to `client-close` is sent to the peer but does not populate this field.
+  `:reason` passed to `cl-quic-kit:client-close` is sent to the peer but does not populate this field.
 
 ## Server API
 
@@ -75,8 +84,7 @@ Create a listener with a positive `:max-connections` value. Supply the certifica
 key through `:tls-server-options`. The chain is a list of DER-encoded certificates with the leaf first; the
 private key must be a cl-crypto-kit ECDSA P-256 or Ed25519 private-key object. The API accepts DER
 certificate octets and private-key objects; it does not parse PEM files.
-The server tests include a [temporary credential helper](t/server.lisp) that creates a self-signed P-256
-certificate with OpenSSL.
+In the example, `bind-address` is the IPv4 interface and `port` is its UDP port.
 
 ```lisp
 (cl-quic-kit:make-quic-server
@@ -92,8 +100,7 @@ certificate with OpenSSL.
    :initial-max-streams-uni 25)
  :tls-server-options
  (list :certificate-chain certificate-chain-der
-       :private-key private-key
-       :alpn-protocols '("h3")))
+       :private-key private-key))
 ```
 
 The listener defaults to IPv4 address `0.0.0.0` and UDP port `443`. Set `:local-address` to an IPv4
@@ -101,7 +108,7 @@ address string and `:local-port` to an integer from 0 through 65535; port 0 bind
 The `:retry-policy` option accepts `:always` (the default) or `:never`; with `:never`, a tokenless Initial
 proceeds without a Retry packet.
 `:local-address` applies when the listener creates its socket. When supplying a socket, configure it with
-`:local-host` in `make-udp-socket`. To read the assigned port, create a socket and pass it to the listener:
+`:local-host` in `cl-quic-kit:make-udp-socket`. To read the assigned port, create a socket and pass it to the listener:
 
 ```lisp
 (let* ((socket (cl-quic-kit:make-udp-socket
@@ -111,8 +118,7 @@ proceeds without a Retry packet.
                 :max-connections 256
                 :tls-server-options
                 (list :certificate-chain certificate-chain-der
-                      :private-key private-key
-                      :alpn-protocols '("h3")))))
+                      :private-key private-key)))
   (values server (cl-quic-kit:udp-socket-local-port socket)))
 ```
 
@@ -121,10 +127,11 @@ port.
 
 The server passes `:tls-server-options` to cl-tls-kit's public
 [`make-tls13-server-driver`](https://github.com/nerima-lisp/cl-tls-kit/blob/d6cf61a9ac2c/docs/tls13-server-driver.md)
-constructor. The server defaults `:alpn-protocols` to `("h3")`, creates a cl-crypto-kit provider when
-`:provider` is omitted, and sets the driver's `:quic-transport-parameters` option from the encoded server
-parameters. The server buffers peer QUIC transport parameters as opaque bytes and decodes and validates them
-only after cl-tls-kit verifies the client's Finished and emits `:handshake-complete`.
+constructor. Within that plist, `:alpn-protocols` defaults to `("h3")` and `:cipher-suites` defaults to
+`#(#x1301 #x1302 #x1303)`. The server creates a cl-crypto-kit provider when `:provider` is omitted and sets
+the driver's `:quic-transport-parameters` option from the encoded server parameters. The server buffers peer
+QUIC transport parameters as opaque bytes and decodes and validates them only after cl-tls-kit verifies the
+client's Finished and emits `:handshake-complete`.
 
 The `crypto-kit:` package is provided by the `cl-crypto-kit` system. For a P-256 key, pass a 32-octet private
 scalar to
@@ -134,15 +141,20 @@ scalar to
 With the default nonblocking UDP socket, `cl-quic-kit:quic-server-poll` drains available datagrams,
 drives handshakes, and returns; call it from the application's event loop. It returns `NIL` while the server
 is open and true after it is closed. Call `cl-quic-kit:quic-server-close` to close the server immediately;
-it marks its connections closed, closes its owned UDP socket, and is safe to call repeatedly. After each poll,
-`cl-quic-kit:quic-server-accept-connection` returns one handshake-complete `quic-connection` or `NIL` if
-none is ready. Each connection is returned once.
+it marks its connections closed, discards completed connections waiting in the accept queue, closes its owned
+UDP socket, and is safe to call repeatedly. After each poll,
+call `cl-quic-kit:quic-server-accept-connection` repeatedly until it returns `NIL`. Each call returns one
+handshake-complete `cl-quic-kit:quic-connection`, and each connection is returned once.
 A client that omits ALPN can complete the handshake without selecting a protocol, so an accepted connection
 can have no negotiated ALPN. Use `cl-quic-kit:quic-connection-alpn` to read the selected protocol; it returns
 `NIL` when none was selected.
-The server negotiates the `h3` ALPN name by default, but its stream API exposes QUIC stream octets without
-adding HTTP/3 framing.
-After `quic-server-accept-connection` returns a connection, use its stream API from the application loop.
+The client and server stream APIs expose QUIC stream octets without adding HTTP/3 framing. An application
+using `h3` needs an HTTP/3 layer above these streams. Streams preserve byte order, but reads do not preserve
+write or STREAM-frame boundaries. An empty read with a false completion value means no data is buffered now;
+poll and read again.
+The connection-level stream functions below take a `cl-quic-kit:quic-connection`. They work with a server
+connection returned by `cl-quic-kit:quic-server-accept-connection` and a client connection returned by
+`cl-quic-kit:quic-client-connection`; client code can also use the client-specific helpers described above.
 `cl-quic-kit:quic-connection-accept-stream` returns the next peer-initiated stream, or `NIL` when none is
 available. Pass `:type :bidirectional` or `:unidirectional` to filter the queue; the default `:any` accepts
 either direction. Each peer stream is returned once. `NIL` only means that no matching stream is available
@@ -150,17 +162,18 @@ from that call. Use `(cl-quic-kit:connection-state connection)` to inspect wheth
 established, closing, draining, or closed.
 
 `cl-quic-kit:quic-connection-open-stream` opens a local bidirectional stream by default. Pass
-`:type :unidirectional` for a unidirectional stream. `quic-connection-read-stream` returns buffered octets,
-empty when none are available. Its second value is true after peer FIN arrives and all data through FIN has
-been read, or after peer reset, which discards unread buffered octets. `quic-connection-write-stream` accepts
+`:type :unidirectional` for a unidirectional stream. `cl-quic-kit:quic-connection-read-stream` returns
+buffered octets, which are empty when none are available. Its second value is true after peer FIN arrives
+and all data through FIN has been read, or after peer reset, which discards unread buffered octets.
+`cl-quic-kit:quic-connection-write-stream` accepts
 an octet vector and optional `:fin-p t`; data beyond current flow-control credit remains queued until more
-credit arrives. `quic-server-poll` drives packetization and sends pending datagrams.
-`quic-connection-flush` attempts to packetize queued control frames and stream data with available
-flow-control credit; frames blocked by congestion control remain queued. Call `quic-server-poll` to send
-any resulting datagrams. A locally opened unidirectional
-stream is send-only, while a peer-initiated unidirectional stream is receive-only. Reading from a send-only
-stream or writing to a receive-only stream signals `cl-quic-kit:stream-id-error`. A generic unidirectional stream
-carries application data exactly as written.
+credit arrives. For server connections, `cl-quic-kit:quic-server-poll` packetizes queued control frames and
+stream data with available credit, then sends pending datagrams. For client connections, use
+`cl-quic-kit:client-poll`; polling alone is sufficient after writes.
+`cl-quic-kit:quic-connection-flush` optionally attempts packetization before the next poll; it does not send
+datagrams, so most applications can omit it. Frames blocked by congestion control remain queued. A locally
+opened unidirectional stream is send-only, while a peer-initiated unidirectional stream is receive-only. Reading from a send-only stream or
+writing to a receive-only stream signals `cl-quic-kit:stream-id-error`.
 
 `:max-connections` counts handshaking and established connections. Closing and draining connections remain in
 the count until they reach `:closed` and their routes are removed. `:transport-parameters` accepts a keyword
@@ -192,6 +205,4 @@ temporary credentials:
 nix develop --command sbcl --non-interactive --load t/run.lisp
 ```
 
-The test runner loads the dependencies and configures packet protection with
-`cl-quic-kit.protection:configure-crypto-backend`. When no TLS provider is supplied, the QUIC client and server
-use cl-tls-kit's cl-crypto-kit provider.
+When no TLS provider is supplied, the QUIC client uses cl-tls-kit's cl-crypto-kit provider.
