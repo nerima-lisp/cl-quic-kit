@@ -611,7 +611,7 @@
     original-destination-connection-id local-connection-id
     remote-connection-id cipher-suite transport-parameters
     peer-transport-parameters pending-datagrams
-    (handshake-complete-p nil) (accepted-p nil))
+    (handshake-complete-p nil) (accepted-p nil) (close-response-attempted-p nil))
 
   (defun %server-routed-connections (server)
     (let ((seen (make-hash-table :test #'eq))
@@ -1063,10 +1063,40 @@
       (%server-process-protected-datagram server-connection bytes now)))
   server)
 (defun %server-process-protected-datagram (server-connection bytes now)
+  (setf (server-connection-now server-connection) now)
+  (let ((connection (server-connection-connection server-connection)))
+    (case (connection-state connection)
+      (:draining
+       (setf (server-connection-pending-datagrams server-connection) nil)
+       (return-from %server-process-protected-datagram server-connection))
+      (:closed
+       (return-from %server-process-protected-datagram server-connection))
+      (:closing
+       (let* ((engine (server-connection-engine server-connection))
+              (frame (connection-close-frame connection))
+              (frame-type (and frame (frame-type frame)))
+              (level
+                (or (and (%client-key engine :1-rtt :write) :1-rtt)
+                    (and (%client-key engine :handshake :write) :handshake)
+                    (and (%client-key engine :initial :write) :initial))))
+         (when (and (not (server-connection-close-response-attempted-p
+                          server-connection))
+                    (null (server-connection-pending-datagrams
+                           server-connection))
+                    frame level
+                    (or (eq frame-type :connection-close)
+                        (and (eq frame-type :application-close)
+                             (eq level :1-rtt))))
+           (let ((packet (%client-build-packet engine level (list frame))))
+             (when packet
+               (setf (server-connection-close-response-attempted-p
+                      server-connection)
+                     t)
+               (connection-write connection packet)))))
+       (return-from %server-process-protected-datagram server-connection))))
   (when (and (server-connection-handshake-complete-p server-connection)
              (eq (getf (%client-layout bytes) :type) :initial))
     (return-from %server-process-protected-datagram server-connection))
-  (setf (server-connection-now server-connection) now)
   (let ((engine (server-connection-engine server-connection))
         (at 0))
     (loop while (< at (length bytes)) do
@@ -1105,11 +1135,12 @@
                     ((:ack :ack-ecn)
                      (%client-handle-ack engine level frame))
                     ((:connection-close :application-close)
-                     (connection-receive-frame
-                      (server-connection-connection server-connection)
-                      frame :touch-p nil))))
-                (connection-touch
-                 (server-connection-connection server-connection) now)))))
+                     (connection-receive-frame connection frame :touch-p nil)))
+                  (when (member (connection-state connection)
+                                '(:closing :draining :closed))
+                    (return-from %server-process-protected-datagram
+                      server-connection)))
+                (connection-touch connection now)))))
         (setf at (+ at (getf layout :end)))
         (when (not (getf layout :long-p))
           (return))))
@@ -1131,16 +1162,24 @@
     (let ((connection (server-connection-connection server-connection)))
       (setf (server-connection-now server-connection) now)
       (connection-poll connection now)
-      (if (eq (connection-state connection) :closed)
-          (setf (server-connection-pending-datagrams server-connection) nil)
-          (progn
-            (%server-flush-pending-datagrams server-connection)
-            (client-poll (server-connection-engine server-connection) now)
-            (if (eq (connection-state connection) :closed)
-                (setf (server-connection-pending-datagrams server-connection) nil)
-                (%server-flush-pending-datagrams server-connection))))
-      (when (eq (connection-state connection) :closed)
-        (%server-remove-connection-routes server-connection))))
+      (case (connection-state connection)
+        (:closed
+         (setf (server-connection-pending-datagrams server-connection) nil)
+         (%server-remove-connection-routes server-connection))
+        (:draining
+         (setf (server-connection-pending-datagrams server-connection) nil))
+        (:closing
+         (%server-flush-pending-datagrams server-connection))
+        (otherwise
+         (%server-flush-pending-datagrams server-connection)
+         (client-poll (server-connection-engine server-connection) now)
+         (case (connection-state connection)
+           ((:closed :draining)
+            (setf (server-connection-pending-datagrams server-connection) nil)
+            (when (eq (connection-state connection) :closed)
+              (%server-remove-connection-routes server-connection)))
+           (otherwise
+            (%server-flush-pending-datagrams server-connection)))))))
   server)
 (defun quic-server-accept-connection (server)
   "Return the next completed connection, or NIL when none is available."
