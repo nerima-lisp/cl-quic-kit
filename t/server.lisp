@@ -3459,6 +3459,7 @@
                       (server-test-loopback-handshake server client))
                      (second-connection
                       (server-test-loopback-handshake server second-client))
+                     (client-stream nil)
                      (deadline nil))
                 (check
                  (and (eq (cl-quic-kit:connection-state first-connection)
@@ -3507,6 +3508,7 @@
                        (payload
                         (make-array 2 :element-type '(unsigned-byte 8)
                                     :initial-contents '(31 32))))
+                  (setf client-stream stream)
                   (cl-quic-kit:client-write-stream
                    client stream payload :fin-p t)
                   (cl-quic-kit:client-poll client)
@@ -3571,22 +3573,44 @@
                   (setf close-header
                         (cl-quic-kit:client-receive-datagram
                          client close-packet))
-                  (check
-                   (and close-header
-                        (eq (cl-quic-kit:connection-state
-                             (cl-quic-kit:quic-client-connection client))
-                            :draining)
-                        (eq (cl-quic-kit:connection-close-kind
-                             (cl-quic-kit:quic-client-connection client))
-                            :transport)
-                        (= (cl-quic-kit:connection-close-error-code
-                            (cl-quic-kit:quic-client-connection client))
-                           10)
-                        (equalp
-                         (cl-quic-kit:connection-close-reason
-                          (cl-quic-kit:quic-client-connection client))
-                         reason-bytes))
-                   "client decrypts the protected CONNECTION_CLOSE and enters draining")
+
+                  (check (and close-header
+                              (eq (cl-quic-kit:connection-state
+                                   (cl-quic-kit:quic-client-connection client))
+                                  :draining)
+                              (eq (cl-quic-kit:connection-close-kind
+                                   (cl-quic-kit:quic-client-connection client))
+                                  :transport)
+                              (= (cl-quic-kit::quic-connection-closed-error
+                                  (cl-quic-kit:quic-client-connection client))
+                                 10)
+                              (equalp
+                               (cl-quic-kit:quic-connection-closed-reason
+                                (cl-quic-kit:quic-client-connection client))
+                               reason-bytes))
+                         "client decrypts the protected CONNECTION_CLOSE and enters draining")
+                  (let ((condition nil))
+                    (handler-case
+                        (cl-quic-kit:quic-connection-open-stream
+                         (cl-quic-kit:quic-client-connection client))
+                      (cl-quic-kit:connection-closed (closed)
+                                                     (setf condition closed)))
+                    (check
+                     (and condition
+                          (= (cl-quic-kit:connection-close-error-code condition) 10)
+                          (equalp (cl-quic-kit:connection-close-reason condition) reason-bytes))
+                     "opening a stream after peer close signals the close details"))
+                  (let ((condition nil))
+                    (handler-case
+                        (cl-quic-kit:quic-connection-write-stream
+                         (cl-quic-kit:quic-client-connection client) client-stream #() :fin-p t)
+                      (cl-quic-kit:connection-closed (closed)
+                                                     (setf condition closed)))
+                    (check
+                     (and condition
+                          (= (cl-quic-kit:connection-close-error-code condition) 10)
+                          (equalp (cl-quic-kit:connection-close-reason condition) reason-bytes))
+                     "writing a stream after peer close signals the close details"))
                   (check
                    (eq (cl-quic-kit:connection-state second-connection)
                        :established)
@@ -3619,11 +3643,11 @@
                           (eq (cl-quic-kit:connection-close-kind
                                (cl-quic-kit:quic-client-connection second-client))
                               :transport)
-                          (= (cl-quic-kit:connection-close-error-code
+                          (= (cl-quic-kit::quic-connection-closed-error
                               (cl-quic-kit:quic-client-connection second-client))
                              1)
                           (equalp
-                           (cl-quic-kit:connection-close-reason
+                           (cl-quic-kit:quic-connection-closed-reason
                             (cl-quic-kit:quic-client-connection second-client))
                            shutdown-reason))
                      "deadline close reaches the remaining client with shutdown details"))))))

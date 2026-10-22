@@ -1397,8 +1397,8 @@
   (let ((engine (%quic-connection-stream-engine connection)))
     (when (member (connection-state connection) '(:closing :draining :closed))
       (error 'connection-closed
-             :error-code (or (connection-close-error-code connection) 0)
-             :reason (or (connection-close-reason connection) #())))
+             :error-code (or (quic-connection-closed-error connection) 0)
+             :reason (or (quic-connection-closed-reason connection) #())))
     (client-open-stream engine nil :stream-type type)))
 (defun quic-connection-read-stream (connection stream)
   (let ((engine (%quic-connection-stream-engine connection)))
@@ -1412,8 +1412,8 @@
   (let ((engine (%quic-connection-stream-engine connection)))
     (when (member (connection-state connection) '(:closing :draining :closed))
       (error 'connection-closed
-             :error-code (or (connection-close-error-code connection) 0)
-             :reason (or (connection-close-reason connection) #())))
+             :error-code (or (quic-connection-closed-error connection) 0)
+             :reason (or (quic-connection-closed-reason connection) #())))
     (client-write-stream engine stream octets :fin-p fin-p)))
 (defun quic-connection-flush (connection)
   (client-flush (%quic-connection-stream-engine connection)))
