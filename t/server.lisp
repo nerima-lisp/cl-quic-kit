@@ -2931,7 +2931,9 @@
                     #(101 102 103 104 105 106 107 108)
                     #(111 112 113 114 115 116 117 118))))
               (cl-quic-kit::%server-handle-datagram
-               server packet :peer 1200 11)
+               server packet
+               (list (cl-quic-kit::%udp-address "127.0.0.1") 12345)
+               1200 11)
               (check
                (and (= (hash-table-count
                         (cl-quic-kit::quic-server-connections server))
