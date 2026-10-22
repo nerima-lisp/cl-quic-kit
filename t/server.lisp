@@ -1368,13 +1368,17 @@
     (server-test-retry-policy-never)
     (server-test-evicted-retry-token))
     (defun server-test-poll-admits-initial-at-draining-deadline ()
-      (let* ((server-socket
+      (let* ((directory (server-test-make-temp-directory))
+             (server-tls-options
+              (nth-value 0 (server-test-tls-settings directory)))
+             (server-socket
               (cl-quic-kit:make-udp-socket
                :local-host "127.0.0.1" :local-port 0))
              (server
               (cl-quic-kit:make-quic-server
                :udp-socket server-socket :max-connections 1
-               :retry-policy :never))
+               :retry-policy :never
+               :tls-server-options server-tls-options))
              (peer
               (cl-quic-kit:make-udp-socket
                :remote-host "127.0.0.1"
@@ -1458,10 +1462,13 @@
                "poll admits a queued Initial after releasing a draining route at its deadline"))
           (setf (symbol-function receive-symbol) original-receive)
           (cl-quic-kit:udp-close peer)
-          (cl-quic-kit:quic-server-close server))))
+          (cl-quic-kit:quic-server-close server)
+          (server-test-remove-temp-directory directory))))
 
   (defun server-test-retry-full-used-cache-issues-retry ()
-    (let ((cl-quic-kit::*quic-server-retry-cache-limit* 1)
+    (let* ((cl-quic-kit::*quic-server-retry-cache-limit* 1)
+          (directory (server-test-make-temp-directory))
+          (server-tls-options (nth-value 0 (server-test-tls-settings directory)))
           (server-socket
            (cl-quic-kit:make-udp-socket
             :local-host "127.0.0.1" :local-port 0))
@@ -1473,7 +1480,8 @@
             (setf server
                   (cl-quic-kit:make-quic-server
                    :udp-socket server-socket :max-connections 1
-                   :retry-policy :always)
+                   :retry-policy :always
+                   :tls-server-options server-tls-options)
                   first-client
                   (cl-quic-kit:make-quic-client
                    :server-host "127.0.0.1"
@@ -1547,10 +1555,10 @@
                              (cl-quic-kit::server-retry-token-retry-source-connection-id record)
                              (cl-quic-kit::server-retry-token-client-source-connection-id record)))
                            (process-symbol
-                            (find-symbol "SERVER-PROCESS-PROTECTED-DATAGRAM" "CL-QUIC-KIT"))
+                            (find-symbol "%SERVER-PROCESS-PROTECTED-DATAGRAM" "CL-QUIC-KIT"))
                            (original-process (symbol-function process-symbol))
                            (invalid-symbol
-                            (find-symbol "SERVER-SEND-INVALID-TOKEN" "CL-QUIC-KIT"))
+                            (find-symbol "%SERVER-SEND-INVALID-TOKEN" "CL-QUIC-KIT"))
                            (original-invalid (symbol-function invalid-symbol))
                            (processed nil)
                            (invalid-token-p nil)
@@ -1589,9 +1597,11 @@
           (cl-quic-kit:client-close first-client))
         (when second-client
           (cl-quic-kit:client-close second-client))
-        (if server
-            (cl-quic-kit:quic-server-close server)
-          (cl-quic-kit:udp-close server-socket)))))
+        (progn
+          (if server
+              (cl-quic-kit:quic-server-close server)
+            (cl-quic-kit:udp-close server-socket))
+          (server-test-remove-temp-directory directory)))))
   (defun server-test-retry-full-used-cache-fails-closed-with-full-retired-cid-table ()
   (let* ((cl-quic-kit::*quic-server-retry-cache-limit* 1)
          (server-socket
@@ -2695,8 +2705,14 @@
                    :now-fn (lambda () 0)))
             (multiple-value-bind (token record)
                 (server-test-issue-retry server first-client 0)
-              (let* ((connection-id #(91 92 93 94 95 96 97 98))
-                     (remote-id #(71 72 73 74 75 76 77 78))
+              (let* ((connection-id
+                       (make-array 8
+                                   :element-type (quote (unsigned-byte 8))
+                                   :initial-contents (quote (91 92 93 94 95 96 97 98))))
+                     (remote-id
+                      (make-array 8
+                                  :element-type (quote (unsigned-byte 8))
+                                  :initial-contents (quote (71 72 73 74 75 76 77 78))))
                      (dummy-connection
                       (cl-quic-kit:make-quic-connection
                        :role :server :local-connection-id connection-id
@@ -2780,9 +2796,18 @@
               :udp-socket server-socket :max-connections 1
               :retry-policy :never))
            (writes nil)
-           (connection-id #(41 42 43 44 45 46 47 48))
-           (alias-id #(51 52 53 54 55 56 57 58))
-           (remote-id #(61 62 63 64 65 66 67 68))
+           (connection-id
+            (make-array 8
+                        :element-type (quote (unsigned-byte 8))
+                        :initial-contents (quote (41 42 43 44 45 46 47 48))))
+           (alias-id
+            (make-array 8
+                        :element-type (quote (unsigned-byte 8))
+                        :initial-contents (quote (51 52 53 54 55 56 57 58))))
+           (remote-id
+            (make-array 8
+                        :element-type (quote (unsigned-byte 8))
+                        :initial-contents (quote (61 62 63 64 65 66 67 68))))
            (connection
              (cl-quic-kit:make-quic-connection
               :role :server :local-connection-id connection-id
@@ -2883,8 +2908,14 @@
                 :udp-socket server-socket :max-connections 1
                 :retry-policy :never))
              (writes nil)
-             (server-cid #(31 32 33 34 35 36 37 38))
-             (peer-cid #(41 42 43 44 45 46 47 48))
+             (server-cid
+              (make-array 8
+                          :element-type (quote (unsigned-byte 8))
+                          :initial-contents (quote (31 32 33 34 35 36 37 38))))
+             (peer-cid
+              (make-array 8
+                          :element-type (quote (unsigned-byte 8))
+                          :initial-contents (quote (41 42 43 44 45 46 47 48))))
              (server-connection-state
                (cl-quic-kit:make-quic-connection
                 :role :server :local-connection-id server-cid

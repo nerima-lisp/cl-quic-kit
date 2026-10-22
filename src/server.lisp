@@ -361,10 +361,9 @@
                            retired-cids
                            (server-retry-token-retry-source-connection-id
                             old-record)
-                           now))))) tokens-to-evict))
-        (when (> (+ active-retired-count new-retirement-count)
+                           now))))) tokens-to-evict))) (when (> (+ active-retired-count new-retirement-count)
                  *quic-server-retry-cache-limit*)
-          (return-from %server-send-retry nil)))
+          (return-from %server-send-retry nil))
       (let* ((token (%server-new-token server))
              (retry-source-cid
                (%server-new-retry-source-connection-id
