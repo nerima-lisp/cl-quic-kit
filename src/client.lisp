@@ -1319,8 +1319,8 @@
                            :max-receive-data (%client-stream-receive-limit client id)
                            :max-send-data (%client-stream-send-limit client id))))))
 
-(defun client-receive-frame (client frame)
-  (%client-receive-frames client :initial 0 (list frame))
+(defun client-receive-frame (client frame &key (level :initial))
+  (%client-receive-frames client level 0 (list frame))
   frame)
 
 (defun %client-retry-header (bytes)
