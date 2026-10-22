@@ -50,7 +50,8 @@ stream. Its second argument is currently unused. Pass the returned stream to `cl
   `(cl-quic-kit:quic-client-closed-p client)` to distinguish that case from no available stream. Pass a
   returned stream to `(cl-quic-kit:client-read-stream client stream)` to consume available octets. It
   returns an octet vector, which is empty when no data is buffered. The second return value is true when
-  the peer's FIN or reset has arrived and all buffered octets are consumed.
+  all data through the peer's FIN has been consumed, or after a peer reset, which discards unread buffered
+  octets.
   To send FIN, write the final octets with
   `(cl-quic-kit:client-write-stream client stream octets :fin-p t)`. This marks
   the last STREAM frame with FIN. Call `(cl-quic-kit:client-poll client)` to send
@@ -60,6 +61,8 @@ stream. Its second argument is currently unused. Pass the returned stream to `cl
   from the client and does not enqueue FIN. It drops writes waiting for flow control.
   STREAM frames already queued remain queued and may be sent by a later
   `(cl-quic-kit:client-poll client)` call.
+- `cl-quic-kit:client-receive-frame (client frame &key (level :initial))` applies a decoded frame and checks
+  it against the selected packet-number space. Pass `:level :1-rtt` for stream or flow-control frames.
 - `cl-quic-kit:quic-connection-closed-reason (connection)` returns the peer's recorded `CONNECTION_CLOSE`
   reason as octets. It is `NIL` if no peer reason was recorded, and `#()` if the recorded reason is empty.
   For a client, read it with
