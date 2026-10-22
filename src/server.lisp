@@ -361,8 +361,7 @@
                            retired-cids
                            (server-retry-token-retry-source-connection-id
                             old-record)
-                           now))))
-                tokens-to-evict)))
+                           now))))) tokens-to-evict))
         (when (> (+ active-retired-count new-retirement-count)
                  *quic-server-retry-cache-limit*)
           (return-from %server-send-retry nil)))
@@ -596,8 +595,11 @@
                                     (%server-path
                                      server address original-dcid now t))))
                         (%server-note-received path byte-count now)
-                        (%server-handle-initial
-                         server header path address now bytes))))))))
+                        (if (and existing
+                                 (not (server-connection-handshake-complete-p existing))
+                                 (equalp address (server-connection-address existing)))
+                            (%server-process-protected-datagram existing bytes now)
+                          (%server-handle-initial server header path address now bytes)))))))))
            (t
             (route-existing)))))
     (quic-encoding-error () nil)

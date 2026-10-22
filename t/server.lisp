@@ -1528,18 +1528,63 @@
                  "an evicted used token is rejected through its retired Retry source CID")
                 (multiple-value-bind (fresh-token fresh-record)
                     (server-test-token-entry server)
-                  (check
-                   (and (not (equalp token fresh-token))
-                        (eq (cl-quic-kit::%server-token-status
-                             server fresh-token
-                             (cl-quic-kit::server-retry-token-address fresh-record)
-                             (cl-quic-kit::server-retry-token-retry-source-connection-id
-                              fresh-record)
-                             (cl-quic-kit::server-retry-token-client-source-connection-id
-                              fresh-record)
-                             0)
-                            :valid))
-                   "the new Retry token remains valid in the bounded cache")))))
+                  (progn
+                    (check
+                     (and (not (equalp token fresh-token))
+                          (eq (cl-quic-kit::%server-token-status
+                               server fresh-token
+                               (cl-quic-kit::server-retry-token-address fresh-record)
+                               (cl-quic-kit::server-retry-token-retry-source-connection-id
+                                fresh-record)
+                               (cl-quic-kit::server-retry-token-client-source-connection-id
+                                fresh-record)
+                               0)
+                              :valid))
+                     "the new Retry token remains valid in the bounded cache")
+                    (let* ((server-connection
+                            (cl-quic-kit::%server-find-initial-connection
+                             server
+                             (cl-quic-kit::server-retry-token-retry-source-connection-id record)
+                             (cl-quic-kit::server-retry-token-client-source-connection-id record)))
+                           (process-symbol
+                            (find-symbol "SERVER-PROCESS-PROTECTED-DATAGRAM" "CL-QUIC-KIT"))
+                           (original-process (symbol-function process-symbol))
+                           (invalid-symbol
+                            (find-symbol "SERVER-SEND-INVALID-TOKEN" "CL-QUIC-KIT"))
+                           (original-invalid (symbol-function invalid-symbol))
+                           (processed nil)
+                           (invalid-token-p nil)
+                           (duplicate
+                            (server-test-initial-packet
+                             cl-quic-kit:*quic-version-1*
+                             (cl-quic-kit::server-retry-token-retry-source-connection-id record)
+                             (cl-quic-kit::server-retry-token-client-source-connection-id record)
+                             token)))
+                      (check
+                       (and server-connection
+                            (not (cl-quic-kit::server-connection-handshake-complete-p
+                                  server-connection)))
+                       "the used Retry token belongs to an active handshake route")
+                      (unwind-protect
+                          (progn
+                            (setf (symbol-function process-symbol)
+                                  (lambda (candidate bytes at)
+                                    (declare (ignore bytes at))
+                                    (setf processed candidate)))
+                            (setf (symbol-function invalid-symbol)
+                                  (lambda (&rest arguments)
+                                    (declare (ignore arguments))
+                                    (setf invalid-token-p t)))
+                            (cl-quic-kit::%server-handle-datagram
+                             server duplicate
+                             (cl-quic-kit::server-retry-token-address record)
+                             (length duplicate) 0)
+                            (check
+                             (and (eq server-connection processed)
+                                  (not invalid-token-p))
+                             "a repeated Initial for an active route survives Retry token eviction"))
+                        (setf (symbol-function process-symbol) original-process
+                              (symbol-function invalid-symbol) original-invalid))))))))
         (when first-client
           (cl-quic-kit:client-close first-client))
         (when second-client
