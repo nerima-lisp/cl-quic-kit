@@ -5,6 +5,7 @@
             :initform "QUIC error"))
   (:report (lambda (c s) (write-string (quic-error-message c) s))))
 (define-condition quic-encoding-error (quic-error) ())
+(define-condition quic-frame-space-error (quic-error) ())
 (define-condition quic-crypto-error (quic-error) ())
 
 (defun quic-crypto-error-message (condition)

@@ -643,12 +643,17 @@
                             (setf wire bytes))
                 :now-fn (lambda () 0)))
        (receiver (cl-quic-kit:make-quic-client
+                  :connection
+                  (cl-quic-kit:make-quic-connection
+                   :role :server
+                   :local-connection-id receiver-id
+                   :io-write (lambda (connection bytes)
+                               (declare (ignore connection))
+                               (setf ack-wire bytes))
+                   :now-fn (lambda () 0))
                   :local-connection-id receiver-id
                   :destination-connection-id destination
                   :disable-hostname-verification-p t
-                  :io-write (lambda (connection bytes)
-                              (declare (ignore connection))
-                              (setf ack-wire bytes))
                   :now-fn (lambda () 0))))
   (cl-quic-kit:client-start sender)
   (check (and wire (>= (length wire) 1200))

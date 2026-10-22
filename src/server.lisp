@@ -878,16 +878,16 @@
              (connection (server-connection-connection server-connection))
              (local-idle-timeout (quic-connection-idle-timeout connection))
              (peer-idle-timeout (cdr (assoc 1 peer-parameters))))
-        (setf (quic-client-peer-transport-parameters
-               (server-connection-engine server-connection))
-              peer-parameters
-              (quic-connection-idle-timeout connection)
-              (if (and peer-idle-timeout (plusp peer-idle-timeout))
-                  (min local-idle-timeout (/ peer-idle-timeout 1000))
-                local-idle-timeout)
-              (server-amplification-state-validated-p
-               (server-connection-path server-connection))
-              t))
+        (progn
+  (%client-set-peer-transport-parameters
+   (server-connection-engine server-connection) peer-parameters)
+  (setf (quic-connection-idle-timeout connection)
+        (if (and peer-idle-timeout (plusp peer-idle-timeout))
+            (min local-idle-timeout (/ peer-idle-timeout 1000))
+            local-idle-timeout)
+        (server-amplification-state-validated-p
+         (server-connection-path server-connection))
+        t)))
       (connection-set-state (server-connection-connection server-connection)
                             :established)
       (setf (server-connection-handshake-complete-p server-connection) t)
@@ -903,6 +903,22 @@
        (server-connection-engine server-connection)
        (make-frame :handshake-done) :application)
       (client-flush (server-connection-engine server-connection))))
+  server-connection)
+(defun %server-close-on-frame-error (server-connection error-code)
+  (let* ((connection (server-connection-connection server-connection))
+         (engine (server-connection-engine server-connection))
+         (frame (%connection-prepare-close
+                 connection error-code "peer sent an invalid frame"))
+         (level (or (and (%client-key engine :1-rtt :write) :1-rtt)
+                    (and (%client-key engine :handshake :write) :handshake)
+                    (and (%client-key engine :initial :write) :initial))))
+    (when frame
+      (setf (quic-client-closed-p engine) t
+            (quic-client-pending-frames engine) nil
+            (quic-client-pending-stream-writes engine) nil)
+      (when level
+        (%client-queue-frame engine frame level)
+        (client-flush engine))))
   server-connection)
 (defun %server-handle-tls-events (server-connection events)
   (dolist (event events)
@@ -1152,50 +1168,75 @@
     (let ((engine (server-connection-engine server-connection))
           (at 0))
       (loop while (< at (length bytes)) do
-        (let* ((slice (subseq bytes at))
-               (layout (%client-layout
-                        slice
-                        :short-header-dcid-length
-                        (length (server-connection-local-connection-id
-                                 server-connection))))
-               (type (getf layout :type)))
-          (unless (eq type :0-rtt)
-            (multiple-value-bind (level number header)
-                (handler-case
-                    (%client-unprotect-packet engine slice layout)
-                  (crypto-kit:aead-authentication-failure ()
-                    (values nil nil nil)))
-              (when header
-                (let* ((frames (decode-frames (packet-header-payload header)))
-                       (space (%client-level-space level)))
-                  (setf (quic-client-received-packets engine)
-                        (%client-set-level-value
-                         (quic-client-received-packets engine) level
-                         (cons number
-                               (%client-level-value
-                                (quic-client-received-packets engine) level))))
-                  (cl-quic-kit.recovery:on-packet-received
-                   (quic-client-recovery engine) space number
-                   :ack-eliciting-p (%client-ack-eliciting-p frames))
-                  (dolist (frame frames)
-                    (case (frame-type frame)
-                      (:crypto
-                       (%server-feed-crypto
-                        server-connection level
-                        (frame-field frame :offset 0)
-                        (frame-field frame :data #())))
-                      ((:ack :ack-ecn)
-                       (%client-handle-ack engine level frame))
-                      ((:connection-close :application-close)
-                       (connection-receive-frame connection frame :touch-p nil)))
-                    (when (member (connection-state connection)
-                                  '(:closing :draining :closed))
-                      (return-from %server-process-protected-datagram
-                        server-connection)))
-                  (connection-touch connection now)))))
-          (setf at (+ at (getf layout :end)))
-          (when (not (getf layout :long-p))
-            (return))))
+            (let* ((slice (subseq bytes at))
+                   (layout (%client-layout
+                            slice
+                            :short-header-dcid-length
+                            (length (server-connection-local-connection-id
+                                     server-connection))))
+                   (type (getf layout :type)))
+              (unless (eq type :0-rtt)
+                (multiple-value-bind (level number header)
+                    (handler-case
+                        (%client-unprotect-packet engine slice layout)
+                      (crypto-kit:aead-authentication-failure ()
+                                                              (values nil nil nil)))
+                  (when header
+                    (let* ((frames (handler-case
+                                       (decode-frames (packet-header-payload header))
+                                     (quic-encoding-error (condition)
+                                                          (declare (ignore condition))
+                                                          (%server-close-on-frame-error server-connection 7)
+                                                          (return-from %server-process-protected-datagram server-connection))))
+                           (space (%client-level-space level)))
+                      (setf (quic-client-received-packets engine)
+                            (%client-set-level-value
+                             (quic-client-received-packets engine) level
+                             (cons number
+                                   (%client-level-value
+                                    (quic-client-received-packets engine) level))))
+                      (cl-quic-kit.recovery:on-packet-received
+                       (quic-client-recovery engine) space number
+                       :ack-eliciting-p (%client-ack-eliciting-p frames))
+                      (let ((flush-p nil))
+                        (dolist (frame frames)
+                          (handler-case
+                              (when (%client-process-received-frame
+                                     engine level frame
+                                     :crypto-handler
+                                     (lambda (client crypto-level crypto-frame)
+                                       (declare (ignore client))
+                                       (%server-feed-crypto
+                                        server-connection crypto-level
+                                        (frame-field crypto-frame :offset 0)
+                                        (frame-field crypto-frame :data #()))
+                                       nil)
+                                     :touch-p nil)
+                                (setf flush-p t))
+                            (stream-limit-error (condition)
+                                                (declare (ignore condition))
+                                                (%server-close-on-frame-error server-connection 4))
+                            (flow-control-error (condition)
+                                                (declare (ignore condition))
+                                                (%server-close-on-frame-error server-connection 3))
+                            (stream-id-error (condition)
+                                             (declare (ignore condition))
+                                             (%server-close-on-frame-error server-connection 5))
+                            (quic-encoding-error (condition)
+                                                 (declare (ignore condition))
+                                                 (%server-close-on-frame-error server-connection 7))
+                            (quic-error (condition)
+                                        (declare (ignore condition))
+                                        (%server-close-on-frame-error server-connection 10)))
+                          (when (member (connection-state connection)
+                                        '(:closing :draining :closed))
+                            (return-from %server-process-protected-datagram server-connection)))
+                        (when flush-p
+                          (client-flush engine)))
+                      (connection-touch connection now)))))
+              (setf at (+ at (getf layout :end)))
+              (when (not (getf layout :long-p))
+                (return))))
       server-connection)))
 (defun %server-flush-pending-datagrams (server-connection)
   (let ((remaining (server-connection-pending-datagrams server-connection)))
@@ -1236,3 +1277,43 @@
 (defun quic-server-accept-connection (server)
   "Return the next completed connection, or NIL when none is available."
   (pop (quic-server-accepted-connections server)))
+(defun %quic-connection-stream-engine (connection)
+  (let ((engine (quic-connection-stream-engine connection)))
+    (unless engine
+      (error 'quic-error :message "Connection has no QUIC stream engine"))
+    engine))
+(defun quic-connection-accept-stream (connection &key (type :any))
+  (unless (member type '(:any :bidirectional :unidirectional))
+    (error 'type-error :datum type
+           :expected-type '(member :any :bidirectional :unidirectional)))
+  (let ((engine (%quic-connection-stream-engine connection)))
+    (if (member (connection-state connection) '(:closing :draining :closed))
+        nil
+        (client-accept-peer-stream engine :type type))))
+(defun quic-connection-open-stream (connection &key (type :bidirectional))
+  (unless (member type '(:bidirectional :unidirectional))
+    (error 'type-error :datum type
+           :expected-type '(member :bidirectional :unidirectional)))
+  (let ((engine (%quic-connection-stream-engine connection)))
+    (when (member (connection-state connection) '(:closing :draining :closed))
+      (error 'connection-closed
+             :error-code (or (connection-close-error-code connection) 0)
+             :reason (or (connection-close-reason connection) #())))
+    (client-open-stream engine nil :stream-type type)))
+(defun quic-connection-read-stream (connection stream)
+  (let ((engine (%quic-connection-stream-engine connection)))
+    (unless (eq (gethash (stream-id stream) (quic-client-streams engine)) stream)
+      (error 'quic-error
+             :message "Cannot read a stream that is not registered with the connection"))
+    (unless (%stream-can-receive-p stream)
+      (error 'stream-id-error :stream-id (stream-id stream)))
+    (client-read-stream engine stream)))
+(defun quic-connection-write-stream (connection stream octets &key (fin-p nil))
+  (let ((engine (%quic-connection-stream-engine connection)))
+    (when (member (connection-state connection) '(:closing :draining :closed))
+      (error 'connection-closed
+             :error-code (or (connection-close-error-code connection) 0)
+             :reason (or (connection-close-reason connection) #())))
+    (client-write-stream engine stream octets :fin-p fin-p)))
+(defun quic-connection-flush (connection)
+  (client-flush (%quic-connection-stream-engine connection)))

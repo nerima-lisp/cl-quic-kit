@@ -39,6 +39,7 @@
    (attempted :initarg :attempted :reader flow-control-error-attempted)))
 (define-condition stream-id-error (error)
   ((stream-id :initarg :stream-id :reader invalid-stream-id)))
+(define-condition stream-limit-error (quic-error) ((limit :initarg :limit :reader stream-limit-error-limit) (attempted :initarg :attempted :reader stream-limit-error-attempted)))
 
 (defun %non-negative-integer (value name)
   (declare (ignore name))

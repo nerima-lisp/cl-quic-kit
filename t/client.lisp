@@ -450,10 +450,17 @@
            (local-stream (cl-quic-kit:client-open-stream client nil))
            (payload (cl-quic-kit:encode-varint 42))
            (response (cl-quic-kit:encode-varint 43)))
+      (let ((initial-frame (cl-quic-kit:make-frame :padding)))
+        (contract-check
+         (eq (cl-quic-kit:client-receive-frame client initial-frame)
+             initial-frame)
+         "client-receive-frame preserves its two-argument Initial-space behavior")
+        (cl-quic-kit:client-receive-frame
+         client (cl-quic-kit:make-frame :stream :stream-id 1 :data payload :fin t)
+         :level :1-rtt))
       (cl-quic-kit:client-receive-frame
-       client (cl-quic-kit:make-frame :stream :stream-id 1 :data payload :fin t))
-      (cl-quic-kit:client-receive-frame
-       client (cl-quic-kit:make-frame :stream :stream-id 5 :data payload :fin t))
+       client (cl-quic-kit:make-frame :stream :stream-id 5 :data payload :fin t)
+       :level :1-rtt)
       (cl-quic-kit:client-poll client)
       (let* ((first (cl-quic-kit:client-accept-peer-stream client))
              (second (cl-quic-kit:client-accept-peer-stream client))
@@ -497,7 +504,8 @@
                     :disable-hostname-verification-p t))
            (stream (cl-quic-kit:client-open-stream client nil)))
       (cl-quic-kit:client-receive-frame
-       client (cl-quic-kit:make-frame :max-data :maximum 0))
+       client (cl-quic-kit:make-frame :max-data :maximum 0)
+       :level :1-rtt)
       (cl-quic-kit:client-write-stream client stream
                                       (cl-quic-kit:encode-varint 1))
       (contract-check (cl-quic-kit:client-stream-write-pending-p client stream)
@@ -519,7 +527,8 @@
       (cl-quic-kit:client-receive-frame
        client (cl-quic-kit:make-frame :stream :stream-id 1
                                       :data (cl-quic-kit:encode-varint 7)
-                                      :fin t))
+                                      :fin t)
+       :level :1-rtt)
       (cl-quic-kit:client-close client :reason "client shutdown")
       (contract-check (null (cl-quic-kit:client-accept-peer-stream client))
                       "closed clients return NIL for queued peer streams"))
