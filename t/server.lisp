@@ -2308,7 +2308,17 @@
                           (eq (cl-quic-kit:connection-state
                                (cl-quic-kit::server-connection-connection server-connection))
                               :closing))
-                     "TLS alert close retries within the amplification limit and remains routed while draining")
+                     (format nil
+                             "TLS alert retry: response=~S pending=~D sent=~D received=~D queued=~D routed=~S state=~S"
+                             (and response (length response))
+                             (length pending)
+                             (cl-quic-kit::server-amplification-state-sent path)
+                             (cl-quic-kit::server-amplification-state-received path)
+                             (length (cl-quic-kit::server-connection-pending-datagrams server-connection))
+                             (eq (gethash connection-id (cl-quic-kit::quic-server-connections server))
+                                 server-connection)
+                             (cl-quic-kit:connection-state
+                              (cl-quic-kit::server-connection-connection server-connection))))
                     (let ((deadline
                            (cl-quic-kit:connection-draining-deadline
                             (cl-quic-kit::server-connection-connection server-connection))))
