@@ -6,11 +6,12 @@
 (defparameter *quic-server-path-cache-limit* 4096)
 
 (defstruct (quic-server (:constructor %make-quic-server))
-  udp-socket max-connections retry-policy retry-tokens
+  udp-socket max-connections max-handshakes retry-policy retry-tokens
   (retired-retry-cids (make-hash-table :test #'equalp))
   (retired-local-cids (make-hash-table :test #'equalp))
-  paths transport-parameters
-  tls-server-options connections accepted-connections closed-p)
+  paths transport-parameters tls-server-options connections accepted-connections
+  (shutdown-deadline nil) (shutdown-error-code :no-error) (shutdown-reason #())
+  closed-p)
 
 (defstruct (server-amplification-state
             (:constructor %make-server-amplification-state
@@ -43,10 +44,16 @@
         (error 'randomness-unavailable :operation operation)))))
 
 (defun make-quic-server (&key (local-address "0.0.0.0") (local-port 443)
-                              udp-socket max-connections (retry-policy :always)
+                              udp-socket max-connections
+                              (max-handshakes max-connections)
+                              (retry-policy :always)
                               transport-parameters tls-server-options)
   "Bind a QUIC UDP listener. The server takes ownership of UDP-SOCKET when supplied."
   (check-type max-connections (integer 1 *))
+  (check-type max-handshakes (integer 1 *))
+  (unless (<= max-handshakes max-connections)
+    (error 'type-error :datum max-handshakes
+           :expected-type `(integer 1 ,max-connections)))
   (check-type retry-policy (member :always :never))
   (unless udp-socket
     (check-type local-address string)
@@ -58,6 +65,7 @@
                                      :local-port local-port))))
     (%make-quic-server :udp-socket socket
                        :max-connections max-connections
+                       :max-handshakes max-handshakes
                        :retry-policy retry-policy
                        :retry-tokens (make-hash-table :test #'equalp)
                        :retired-retry-cids (make-hash-table :test #'equalp)
@@ -68,6 +76,9 @@
                        :tls-server-options (%server-copy-plist tls-server-options)
                        :connections (make-hash-table :test #'equalp)
                        :accepted-connections nil
+                       :shutdown-deadline nil
+                       :shutdown-error-code :no-error
+                       :shutdown-reason #()
                        :closed-p nil)))
 
 (defun %server-copy-address (address)
@@ -497,6 +508,23 @@
         (when record
           (incf (server-retry-token-next-packet-number record)))
         t))))
+(defun %server-send-connection-refused (server header record path address)
+  (unless path
+    (return-from %server-send-connection-refused nil))
+  (let ((packet-number (server-retry-token-next-packet-number record)))
+    (when (>= packet-number (ash 1 62))
+      (return-from %server-send-connection-refused nil))
+    (let ((packet
+           (%server-protected-initial
+            (packet-header-destination-connection-id header)
+            (packet-header-source-connection-id header)
+            (server-retry-token-retry-source-connection-id record)
+            packet-number
+            (list (make-frame :connection-close :error-code 2
+                              :frame-type 0 :reason #())))))
+      (when (%server-emit server path address packet)
+        (incf (server-retry-token-next-packet-number record))
+        t))))
 
 (defun %server-handle-initial (server header path address now bytes)
   (let ((token (packet-header-token header))
@@ -567,7 +595,7 @@
                                      (or (gethash destination-cid
                                                   (quic-server-connections server))
                                          (loop for active being the hash-values
-                                                 of (quic-server-connections server)
+                                               of (quic-server-connections server)
                                                thereis
                                                (equalp
                                                 destination-cid
@@ -575,7 +603,8 @@
                                                  active)))
                                          (%server-retired-cid-active-p
                                           (quic-server-retired-local-cids server)
-                                          destination-cid now))))
+                                          destination-cid now)))
+        (and (null existing) (quic-server-shutdown-deadline server)))
                       (let* ((record
                               (loop for candidate being the hash-values
                                     of (quic-server-retry-tokens server)
@@ -619,39 +648,88 @@
       (let* ((connection (server-connection-connection server-connection))
              (deadline (connection-draining-deadline connection)))
         (when (and deadline
-                   (member (connection-state connection) (list :closing :draining))
+                   (member (connection-state connection) '(:closing :draining))
                    (>= now deadline))
           (connection-poll connection now)
           (when (eq (connection-state connection) :closed)
             (setf (server-connection-pending-datagrams server-connection) nil)
             (%server-remove-connection-routes server-connection)))))
+    (let ((shutdown-deadline (quic-server-shutdown-deadline server)))
+      (when (and shutdown-deadline
+                 (or (>= now shutdown-deadline)
+                     (zerop (%server-connection-count server))))
+        (quic-server-close
+         server :error-code (quic-server-shutdown-error-code server)
+         :reason (quic-server-shutdown-reason server))
+        (return-from quic-server-poll t)))
     (loop
       (multiple-value-bind (bytes byte-count address)
           (udp-receive (quic-server-udp-socket server))
         (unless bytes
           (return))
         (%server-handle-datagram server bytes address byte-count now)))
-    (%server-poll-connections server now))
+    (%server-poll-connections server now)
+    (let ((shutdown-deadline (quic-server-shutdown-deadline server)))
+      (when (and shutdown-deadline
+                 (or (>= now shutdown-deadline)
+                     (zerop (%server-connection-count server))))
+        (quic-server-close
+         server :error-code (quic-server-shutdown-error-code server)
+         :reason (quic-server-shutdown-reason server))
+        (return-from quic-server-poll t))))
   nil)
 
-(defun quic-server-close (server)
-  "Close SERVER and its owned UDP socket. Repeated calls are harmless."
-  (unless (quic-server-closed-p server)
-    (setf (quic-server-closed-p server) t)
-    (maphash
-     (lambda (connection-id server-connection)
-       (declare (ignore connection-id))
-       (connection-set-state
-        (server-connection-connection server-connection) :closed))
-     (quic-server-connections server))
-    (clrhash (quic-server-connections server))
-    (setf (quic-server-accepted-connections server) nil)
-    (clrhash (quic-server-retry-tokens server))
-    (clrhash (quic-server-retired-retry-cids server))
-    (clrhash (quic-server-retired-local-cids server))
-    (clrhash (quic-server-paths server))
-    (udp-close (quic-server-udp-socket server)))
-  t)
+
+(defun quic-server-close (server &key (error-code :no-error) reason)
+  "Send best-effort connection closes, then close SERVER and its UDP socket."
+  (%quic-close-error-code error-code)
+  (let ((reason-octets (%quic-close-reason reason)))
+    (unless (quic-server-closed-p server)
+      (let ((connections (%server-routed-connections server))
+            (first-error nil))
+        (labels ((remember-error (condition)
+                   (unless first-error
+                     (setf first-error condition))))
+          (setf (quic-server-closed-p server) t)
+          (unwind-protect
+               (dolist (server-connection connections)
+                 (let ((connection
+                         (server-connection-connection server-connection)))
+                   (unless (member (connection-state connection)
+                                   '(:draining :closed))
+                     (handler-case
+                         (quic-connection-close
+                          connection :error-code error-code
+                          :reason reason-octets)
+                       (error (condition)
+                         (remember-error condition))))
+                   (handler-case
+                       (%server-flush-pending-datagrams server-connection)
+                     (error (condition)
+                       (remember-error condition)))))
+            (dolist (server-connection connections)
+              (let ((connection
+                      (server-connection-connection server-connection)))
+                (setf (server-connection-pending-datagrams server-connection) nil)
+                (handler-case
+                    (connection-set-state connection :closed)
+                  (error (condition)
+                    (remember-error condition)))))
+            (clrhash (quic-server-connections server))
+            (setf (quic-server-accepted-connections server) nil)
+            (clrhash (quic-server-retry-tokens server))
+            (clrhash (quic-server-retired-retry-cids server))
+            (clrhash (quic-server-retired-local-cids server))
+            (clrhash (quic-server-paths server))
+            (handler-case
+                (udp-close (quic-server-udp-socket server))
+              (error (condition)
+                (remember-error condition))))
+          (when first-error
+            (if (typep first-error 'quic-error)
+                (error first-error)
+                (error 'quic-error :message (princ-to-string first-error)))))))
+  t))
 (progn
   (defstruct (server-connection
               (:constructor %make-server-connection))
@@ -675,11 +753,18 @@
 
   (defun %server-connection-count (server)
     (length (%server-routed-connections server)))
+  (defun %server-handshaking-count (server)
+    (count-if
+     (lambda (server-connection)
+       (and (not (server-connection-handshake-complete-p server-connection))
+            (eq (connection-state
+                 (server-connection-connection server-connection))
+                :handshaking)))
+     (%server-routed-connections server)))
 
   (defun %server-remove-connection-routes (server-connection)
-    (let* ((routes
-             (quic-server-connections
-              (server-connection-server server-connection)))
+    (let* ((server (server-connection-server server-connection))
+           (routes (quic-server-connections server))
            (connection-ids nil))
       (maphash
        (lambda (connection-id candidate)
@@ -688,6 +773,10 @@
        routes)
       (dolist (connection-id connection-ids)
         (remhash connection-id routes))
+      (setf (quic-server-accepted-connections server)
+            (delete (server-connection-connection server-connection)
+                    (quic-server-accepted-connections server)
+                    :test #'eq))
       server-connection)))
 (defun %server-new-connection-id (server forbidden-cid)
   (loop repeat 4
@@ -1110,25 +1199,36 @@
 (defun %server-start-or-feed-initial
     (server header path address record bytes now)
   (let* ((existing
-           (%server-find-initial-connection
-            server
-            (packet-header-destination-connection-id header)
-            (packet-header-source-connection-id header)))
+          (%server-find-initial-connection
+           server
+           (packet-header-destination-connection-id header)
+           (packet-header-source-connection-id header)))
+         (existing-address-p
+          (and existing
+               (equalp address (server-connection-address existing))))
+         (capacity-p
+          (and (< (%server-connection-count server)
+                  (quic-server-max-connections server))
+               (< (%server-handshaking-count server)
+                  (quic-server-max-handshakes server))))
          (server-connection
-           (when (or (null existing)
-                     (equalp address
-                             (server-connection-address existing)))
-             (or existing
-                 (when (< (%server-connection-count server)
-                          (quic-server-max-connections server))
-                   (%server-create-connection
-                    server header path address record now))))))
+          (cond
+           (existing-address-p
+            existing)
+           ((and (null existing) capacity-p)
+            (%server-create-connection
+             server header path address record now))
+           (t nil))))
     (when server-connection
       (when record
         (when path
           (setf (server-amplification-state-validated-p path) t))
         (setf (server-retry-token-used-p record) t))
-      (%server-process-protected-datagram server-connection bytes now)))
+      (%server-process-protected-datagram server-connection bytes now))
+    (when (and (null existing) (null server-connection) record)
+      (when path
+        (setf (server-amplification-state-validated-p path) t))
+      (%server-send-connection-refused server header record path address)))
   server)
 (defun %server-process-protected-datagram (server-connection bytes now)
   (setf (server-connection-now server-connection) now)
@@ -1144,9 +1244,9 @@
               (frame (connection-close-frame connection))
               (frame-type (and frame (frame-type frame)))
               (level
-                (or (and (%client-key engine :1-rtt :write) :1-rtt)
-                    (and (%client-key engine :handshake :write) :handshake)
-                    (and (%client-key engine :initial :write) :initial))))
+               (or (and (%client-key engine :1-rtt :write) :1-rtt)
+                   (and (%client-key engine :handshake :write) :handshake)
+                   (and (%client-key engine :initial :write) :initial))))
          (when (and (not (server-connection-close-response-attempted-p
                           server-connection))
                     (null (server-connection-pending-datagrams
@@ -1317,3 +1417,82 @@
     (client-write-stream engine stream octets :fin-p fin-p)))
 (defun quic-connection-flush (connection)
   (client-flush (%quic-connection-stream-engine connection)))
+(progn
+  (defun %quic-close-error-code (error-code)
+    (let ((wire-code (%connection-error-code error-code)))
+      (unless (and (integerp wire-code)
+                   (<= 0 wire-code)
+                   (< wire-code (ash 1 62)))
+        (error 'type-error
+               :datum error-code
+               :expected-type
+               `(or (integer 0 ,(1- (ash 1 62)))
+                    (member :no-error :internal-error :frame-encoding-error
+                            :transport-parameter-error :protocol-violation
+                            :connection-id-limit :application-error))))
+      wire-code))
+
+  (defun %quic-close-reason (reason)
+    (cond
+     ((or (null reason)
+          (and (vectorp reason)
+               (zerop (length reason))
+               (eq (array-element-type reason) t)))
+      (make-array 0 :element-type '(unsigned-byte 8)))
+     ((stringp reason)
+      (%connection-reason-octets reason))
+     ((and (arrayp reason)
+           (= (array-rank reason) 1)
+           (nth-value 0
+             (subtypep (array-element-type reason) '(unsigned-byte 8))))
+      (%connection-reason-octets
+       (make-array (length reason)
+                   :element-type '(unsigned-byte 8)
+                   :initial-contents reason)))
+     (t
+      (error 'type-error :datum reason
+             :expected-type
+             '(or null string (array (unsigned-byte 8) (*)) (vector t 0))))))
+
+  (defun quic-connection-close (connection &key (error-code :no-error) reason)
+    "Queue a protected CONNECTION_CLOSE frame and return true."
+    (%quic-close-error-code error-code)
+    (let ((reason-octets (%quic-close-reason reason)))
+      (unless (member (connection-state connection)
+                      '(:closing :draining :closed))
+        (let* ((engine (%quic-connection-stream-engine connection))
+               (application-close-p (eq error-code :application-error))
+               (level (if application-close-p
+                          (and (%client-key engine :1-rtt :write) :1-rtt)
+                          (or (and (%client-key engine :1-rtt :write) :1-rtt)
+                              (and (%client-key engine :handshake :write) :handshake)
+                              (and (%client-key engine :initial :write) :initial)))))
+          (unless level
+            (error 'quic-error
+                   :message "No packet protection key is available for CONNECTION_CLOSE"))
+          (let ((frame (%connection-prepare-close connection error-code reason-octets)))
+            (when frame
+              (setf (quic-client-closed-p engine) t)
+              (%client-queue-frame engine frame level)
+              (client-flush engine)))))
+      t))
+
+  (defun quic-server-shutdown (server &key (grace-period 30)
+                                      (error-code :no-error) reason)
+    "Stop admitting new connections and close SERVER after draining or GRACE-PERIOD."
+    (check-type grace-period (real 0 *))
+    (%quic-close-error-code error-code)
+    (let ((reason-octets (%quic-close-reason reason)))
+      (unless (or (quic-server-shutdown-deadline server)
+                  (quic-server-closed-p server))
+        (setf (quic-server-shutdown-deadline server)
+              (+ (%quic-real-time) grace-period)
+              (quic-server-shutdown-error-code server) error-code
+              (quic-server-shutdown-reason server) reason-octets))
+      (when (and (not (quic-server-closed-p server))
+                 (quic-server-shutdown-deadline server)
+                 (zerop (%server-connection-count server)))
+        (quic-server-close
+         server :error-code (quic-server-shutdown-error-code server)
+         :reason (quic-server-shutdown-reason server)))
+      server)))
