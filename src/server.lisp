@@ -1093,58 +1093,58 @@
                       server-connection)
                      t)
                (connection-write connection packet)))))
-       (return-from %server-process-protected-datagram server-connection))))
-  (when (and (server-connection-handshake-complete-p server-connection)
-             (eq (getf (%client-layout bytes) :type) :initial))
-    (return-from %server-process-protected-datagram server-connection))
-  (let ((engine (server-connection-engine server-connection))
-        (at 0))
-    (loop while (< at (length bytes)) do
-      (let* ((slice (subseq bytes at))
-             (layout (%client-layout
-                      slice
-                      :short-header-dcid-length
-                      (length (server-connection-local-connection-id
-                               server-connection))))
-             (type (getf layout :type)))
-        (unless (eq type :0-rtt)
-          (multiple-value-bind (level number header)
-              (handler-case
-                  (%client-unprotect-packet engine slice layout)
-                (crypto-kit:aead-authentication-failure ()
-                  (values nil nil nil)))
-            (when header
-              (let* ((frames (decode-frames (packet-header-payload header)))
-                     (space (%client-level-space level)))
-                (setf (quic-client-received-packets engine)
-                      (%client-set-level-value
-                       (quic-client-received-packets engine) level
-                       (cons number
-                             (%client-level-value
-                              (quic-client-received-packets engine) level))))
-                (cl-quic-kit.recovery:on-packet-received
-                 (quic-client-recovery engine) space number
-                 :ack-eliciting-p (%client-ack-eliciting-p frames))
-                (dolist (frame frames)
-                  (case (frame-type frame)
-                    (:crypto
-                     (%server-feed-crypto
-                      server-connection level
-                      (frame-field frame :offset 0)
-                      (frame-field frame :data #())))
-                    ((:ack :ack-ecn)
-                     (%client-handle-ack engine level frame))
-                    ((:connection-close :application-close)
-                     (connection-receive-frame connection frame :touch-p nil)))
-                  (when (member (connection-state connection)
-                                '(:closing :draining :closed))
-                    (return-from %server-process-protected-datagram
-                      server-connection)))
-                (connection-touch connection now)))))
-        (setf at (+ at (getf layout :end)))
-        (when (not (getf layout :long-p))
-          (return))))
-  server-connection))
+       (return-from %server-process-protected-datagram server-connection)))
+    (when (and (server-connection-handshake-complete-p server-connection)
+               (eq (getf (%client-layout bytes) :type) :initial))
+      (return-from %server-process-protected-datagram server-connection))
+    (let ((engine (server-connection-engine server-connection))
+          (at 0))
+      (loop while (< at (length bytes)) do
+        (let* ((slice (subseq bytes at))
+               (layout (%client-layout
+                        slice
+                        :short-header-dcid-length
+                        (length (server-connection-local-connection-id
+                                 server-connection))))
+               (type (getf layout :type)))
+          (unless (eq type :0-rtt)
+            (multiple-value-bind (level number header)
+                (handler-case
+                    (%client-unprotect-packet engine slice layout)
+                  (crypto-kit:aead-authentication-failure ()
+                    (values nil nil nil)))
+              (when header
+                (let* ((frames (decode-frames (packet-header-payload header)))
+                       (space (%client-level-space level)))
+                  (setf (quic-client-received-packets engine)
+                        (%client-set-level-value
+                         (quic-client-received-packets engine) level
+                         (cons number
+                               (%client-level-value
+                                (quic-client-received-packets engine) level))))
+                  (cl-quic-kit.recovery:on-packet-received
+                   (quic-client-recovery engine) space number
+                   :ack-eliciting-p (%client-ack-eliciting-p frames))
+                  (dolist (frame frames)
+                    (case (frame-type frame)
+                      (:crypto
+                       (%server-feed-crypto
+                        server-connection level
+                        (frame-field frame :offset 0)
+                        (frame-field frame :data #())))
+                      ((:ack :ack-ecn)
+                       (%client-handle-ack engine level frame))
+                      ((:connection-close :application-close)
+                       (connection-receive-frame connection frame :touch-p nil)))
+                    (when (member (connection-state connection)
+                                  '(:closing :draining :closed))
+                      (return-from %server-process-protected-datagram
+                        server-connection)))
+                  (connection-touch connection now)))))
+          (setf at (+ at (getf layout :end)))
+          (when (not (getf layout :long-p))
+            (return))))
+      server-connection)))
 (defun %server-flush-pending-datagrams (server-connection)
   (let ((remaining (server-connection-pending-datagrams server-connection)))
     (loop while remaining do
