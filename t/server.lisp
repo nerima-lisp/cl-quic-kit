@@ -816,8 +816,52 @@
                        (cl-quic-kit:client-receive-datagram client response)))
                    (check (null response)
                           "a repeated same-tuple Retry token Initial receives no close or second Retry")
-                   (check (not (cl-quic-kit:quic-client-closed-p client))
-                          "a repeated same-tuple Retry token remains acceptable")))))
+                   (progn
+                    (check (not (cl-quic-kit:quic-client-closed-p client))
+                           "a repeated same-tuple Retry token remains acceptable")
+                    (let* ((retry-cid
+                             (cl-quic-kit::server-retry-token-retry-source-connection-id
+                              record))
+                           (server-connection
+                             (gethash retry-cid
+                                      (cl-quic-kit::quic-server-connections
+                                       server))))
+                      (check server-connection
+                             "the completed Retry connection remains routed")
+                      (cl-quic-kit:connection-set-state
+                       (cl-quic-kit::server-connection-connection
+                        server-connection)
+                       :closed)
+                      (cl-quic-kit:quic-server-poll server 0)
+                      (check (null (gethash retry-cid
+                                            (cl-quic-kit::quic-server-connections
+                                             server)))
+                             "terminal cleanup removes the used Retry route"))
+                    (cl-quic-kit:udp-send
+                     (cl-quic-kit::quic-client-udp-socket client) duplicate)
+                    (server-test-poll-until-datagram-received
+                     server server-socket duplicate 0)
+                    (let ((response
+                            (server-test-receive
+                             (cl-quic-kit::quic-client-udp-socket client))))
+                      (let ((header (cl-quic-kit:decode-packet-header response)))
+                        (check (and header
+                                    (eq (cl-quic-kit:packet-header-type header)
+                                        :initial))
+                               "a replayed used Retry token receives a protected Initial close")
+                        (cl-quic-kit:client-receive-datagram client response))
+                      (check
+                       (and (eq (cl-quic-kit:connection-state
+                                 (cl-quic-kit:quic-client-connection client))
+                                :draining)
+                            (= (cl-quic-kit::quic-connection-closed-error
+                                (cl-quic-kit:quic-client-connection client))
+                               #x0b))
+                       "a consumed Retry token is rejected after route removal"))
+                    (check
+                     (zerop (hash-table-count
+                             (cl-quic-kit::quic-server-connections server)))
+                     "a replayed used Retry token does not recreate a connection"))))))
         (when client
           (cl-quic-kit:client-close client))
         (unwind-protect
@@ -2788,13 +2832,18 @@
           (cl-quic-kit:udp-close server-socket)))))
 
   (defun server-test-terminal-connection-releases-capacity ()
-    (let* ((server-socket
+    (let* ((directory (server-test-make-temp-directory))
+           (server-tls-options
+            (append (nth-value 0 (server-test-tls-settings directory))
+                    (list :alpn-protocols (list "h3"))))
+           (server-socket
              (cl-quic-kit:make-udp-socket
               :local-host "127.0.0.1" :local-port 0))
            (server
              (cl-quic-kit:make-quic-server
               :udp-socket server-socket :max-connections 1
-              :retry-policy :never))
+              :retry-policy :never
+              :tls-server-options server-tls-options))
            (writes nil)
            (connection-id
             (make-array 8
@@ -2894,7 +2943,9 @@
                              of (cl-quic-kit::quic-server-connections server)
                            thereis (cl-quic-kit::server-connection-p active)))
                 "a new Initial is admitted after terminal connection cleanup")))
-        (cl-quic-kit:quic-server-close server))))
+        (unwind-protect
+             (cl-quic-kit:quic-server-close server)
+          (server-test-remove-temp-directory directory)))))
 
   (server-test-tls-alert-close-waits-for-amplification-budget)
   (server-test-retry-token-survives-capacity-rejection)

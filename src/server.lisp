@@ -441,6 +441,11 @@
                    source-cid
                    (server-retry-token-client-source-connection-id record))))
          (values :connection-id-mismatch record))
+        ((and (server-retry-token-used-p record)
+              (not (gethash
+                    (server-retry-token-retry-source-connection-id record)
+                    (quic-server-connections server))))
+         (values :invalid-token record))
         (t (values :valid record))))))
 
 (defun %server-protected-initial (key-destination-cid destination-cid source-cid packet-number frames)
