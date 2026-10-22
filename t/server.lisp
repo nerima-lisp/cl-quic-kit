@@ -816,8 +816,52 @@
                        (cl-quic-kit:client-receive-datagram client response)))
                    (check (null response)
                           "a repeated same-tuple Retry token Initial receives no close or second Retry")
-                   (check (not (cl-quic-kit:quic-client-closed-p client))
-                          "a repeated same-tuple Retry token remains acceptable")))))
+                   (progn
+                    (check (not (cl-quic-kit:quic-client-closed-p client))
+                           "a repeated same-tuple Retry token remains acceptable")
+                    (let* ((retry-cid
+                             (cl-quic-kit::server-retry-token-retry-source-connection-id
+                              record))
+                           (server-connection
+                             (gethash retry-cid
+                                      (cl-quic-kit::quic-server-connections
+                                       server))))
+                      (check server-connection
+                             "the completed Retry connection remains routed")
+                      (cl-quic-kit:connection-set-state
+                       (cl-quic-kit::server-connection-connection
+                        server-connection)
+                       :closed)
+                      (cl-quic-kit:quic-server-poll server 0)
+                      (check (null (gethash retry-cid
+                                            (cl-quic-kit::quic-server-connections
+                                             server)))
+                             "terminal cleanup removes the used Retry route"))
+                    (cl-quic-kit:udp-send
+                     (cl-quic-kit::quic-client-udp-socket client) duplicate)
+                    (server-test-poll-until-datagram-received
+                     server server-socket duplicate 0)
+                    (let ((response
+                            (server-test-receive
+                             (cl-quic-kit::quic-client-udp-socket client))))
+                      (let ((header (cl-quic-kit:decode-packet-header response)))
+                        (check (and header
+                                    (eq (cl-quic-kit:packet-header-type header)
+                                        :initial))
+                               "a replayed used Retry token receives a protected Initial close")
+                        (cl-quic-kit:client-receive-datagram client response))
+                      (check
+                       (and (eq (cl-quic-kit:connection-state
+                                 (cl-quic-kit:quic-client-connection client))
+                                :draining)
+                            (= (cl-quic-kit::quic-connection-closed-error
+                                (cl-quic-kit:quic-client-connection client))
+                               #x0b))
+                       "a consumed Retry token is rejected after route removal"))
+                    (check
+                     (zerop (hash-table-count
+                             (cl-quic-kit::quic-server-connections server)))
+                     "a replayed used Retry token does not recreate a connection"))))))
         (when client
           (cl-quic-kit:client-close client))
         (unwind-protect
@@ -1366,7 +1410,322 @@
 
     (progn (server-test-retry-token-validation) (server-test-corrupted-retry-token) (server-test-retry-same-tuple-duplicate))
     (server-test-retry-policy-never)
-    (server-test-evicted-retry-token)))
+    (server-test-evicted-retry-token))
+    (defun server-test-poll-admits-initial-at-draining-deadline ()
+      (let* ((directory (server-test-make-temp-directory))
+             (server-tls-options
+              (nth-value 0 (server-test-tls-settings directory)))
+             (server-socket
+              (cl-quic-kit:make-udp-socket
+               :local-host "127.0.0.1" :local-port 0))
+             (server
+              (cl-quic-kit:make-quic-server
+               :udp-socket server-socket :max-connections 1
+               :retry-policy :never
+               :tls-server-options server-tls-options))
+             (peer
+              (cl-quic-kit:make-udp-socket
+               :remote-host "127.0.0.1"
+               :remote-port (cl-quic-kit:udp-socket-local-port server-socket)
+               :non-blocking-p t))
+             (local-cid
+              (make-array 8 :element-type '(unsigned-byte 8)
+                          :initial-contents '(41 42 43 44 45 46 47 48)))
+             (alias-cid
+              (make-array 8 :element-type '(unsigned-byte 8)
+                          :initial-contents '(51 52 53 54 55 56 57 58)))
+             (remote-cid
+              (make-array 8 :element-type '(unsigned-byte 8)
+                          :initial-contents '(61 62 63 64 65 66 67 68)))
+             (connection
+              (cl-quic-kit:make-quic-connection
+               :role :server :local-connection-id local-cid
+               :now-fn (lambda () 0)))
+             (engine
+              (cl-quic-kit:make-quic-client
+               :connection connection :local-connection-id local-cid
+               :destination-connection-id remote-cid
+               :disable-hostname-verification-p t :now-fn (lambda () 0)))
+             (server-connection
+              (cl-quic-kit::%make-server-connection
+               :server server :connection connection :engine engine
+               :original-destination-connection-id
+               (make-array 8 :element-type '(unsigned-byte 8)
+                           :initial-contents '(11 12 13 14 15 16 17 18))
+               :local-connection-id local-cid :remote-connection-id remote-cid
+               :pending-datagrams nil))
+             (initial-packet
+              (server-test-initial-packet
+               cl-quic-kit:*quic-version-1*
+               #(101 102 103 104 105 106 107 108)
+               #(111 112 113 114 115 116 117 118)))
+             (receive-symbol (find-symbol "UDP-RECEIVE" "CL-QUIC-KIT"))
+             (original-receive (symbol-function receive-symbol))
+             (queued-datagram nil))
+        (unwind-protect
+            (progn
+              (cl-quic-kit:connection-set-state connection :draining)
+              (setf (cl-quic-kit::quic-connection-draining-deadline connection) 10
+                    (gethash local-cid
+                             (cl-quic-kit::quic-server-connections server))
+                    server-connection
+                    (gethash alias-cid
+                             (cl-quic-kit::quic-server-connections server))
+                    server-connection)
+              (cl-quic-kit:udp-send peer initial-packet)
+              (loop repeat 1000
+                    do (multiple-value-bind (bytes length address)
+                           (funcall original-receive server-socket)
+                         (when bytes
+                           (setf queued-datagram (list bytes length address))))
+                    when queued-datagram
+                    return queued-datagram
+                    do (sleep 0.001)
+                    finally (error "Timed out waiting for the queued Initial"))
+              (setf (symbol-function receive-symbol)
+                    (lambda (candidate-socket &rest arguments)
+                      (if (and (eq candidate-socket server-socket)
+                               queued-datagram)
+                          (multiple-value-prog1
+                              (values-list queued-datagram)
+                            (setf queued-datagram nil))
+                        (apply original-receive candidate-socket arguments))))
+              (cl-quic-kit:quic-server-poll server 10)
+              (check
+               (and (eq (cl-quic-kit:connection-state connection) :closed)
+                    (null (gethash local-cid
+                                   (cl-quic-kit::quic-server-connections server)))
+                    (null (gethash alias-cid
+                                   (cl-quic-kit::quic-server-connections server)))
+                    (= (hash-table-count
+                        (cl-quic-kit::quic-server-connections server))
+                       1)
+                    (loop for active being the hash-values
+                          of (cl-quic-kit::quic-server-connections server)
+                          thereis (cl-quic-kit::server-connection-p active)))
+               "poll admits a queued Initial after releasing a draining route at its deadline"))
+          (setf (symbol-function receive-symbol) original-receive)
+          (cl-quic-kit:udp-close peer)
+          (cl-quic-kit:quic-server-close server)
+          (server-test-remove-temp-directory directory))))
+
+  (defun server-test-retry-full-used-cache-issues-retry ()
+    (let* ((cl-quic-kit::*quic-server-retry-cache-limit* 1)
+          (directory (server-test-make-temp-directory))
+          (server-tls-options (nth-value 0 (server-test-tls-settings directory)))
+          (server-socket
+           (cl-quic-kit:make-udp-socket
+            :local-host "127.0.0.1" :local-port 0))
+          (server nil)
+          (first-client nil)
+          (second-client nil))
+      (unwind-protect
+          (progn
+            (setf server
+                  (cl-quic-kit:make-quic-server
+                   :udp-socket server-socket :max-connections 1
+                   :retry-policy :always
+                   :tls-server-options server-tls-options)
+                  first-client
+                  (cl-quic-kit:make-quic-client
+                   :server-host "127.0.0.1"
+                   :server-port (cl-quic-kit:udp-socket-local-port server-socket)
+                   :disable-hostname-verification-p t
+                   :now-fn (lambda () 0)))
+            (multiple-value-bind (token record)
+                (server-test-issue-retry server first-client 0)
+              (cl-quic-kit:client-poll first-client 0)
+              (server-test-poll-until
+               server
+               (lambda ()
+                 (and (cl-quic-kit::server-retry-token-used-p record)
+                      (= (cl-quic-kit::%server-connection-count server) 1)))
+               0)
+              (check
+               (and (cl-quic-kit::server-retry-token-used-p record)
+                    (= (cl-quic-kit::%server-connection-count server) 1))
+               "a token-bearing Initial fills connection capacity and uses its Retry token")
+              (setf second-client
+                    (cl-quic-kit:make-quic-client
+                     :server-host "127.0.0.1"
+                     :server-port (cl-quic-kit:udp-socket-local-port server-socket)
+                     :disable-hostname-verification-p t
+                     :now-fn (lambda () 0)))
+              (cl-quic-kit:client-poll second-client 0)
+              (server-test-poll-until-datagram-received
+               server server-socket nil 0)
+              (let* ((response
+                      (server-test-receive
+                       (cl-quic-kit::quic-client-udp-socket second-client) t))
+                     (header
+                      (and response
+                           (cl-quic-kit:decode-packet-header response))))
+                (check
+                 (and header
+                      (eq (cl-quic-kit:packet-header-type header) :retry)
+                      (= (hash-table-count
+                          (cl-quic-kit::quic-server-retry-tokens server))
+                         1)
+                      (null (gethash token
+                                     (cl-quic-kit::quic-server-retry-tokens server))))
+                 "a fresh Initial receives Retry when the bounded cache contains only a used token")
+                (check
+                 (eq (cl-quic-kit::%server-token-status
+                      server token
+                      (cl-quic-kit::server-retry-token-address record)
+                      (cl-quic-kit::server-retry-token-retry-source-connection-id record)
+                      (cl-quic-kit::server-retry-token-client-source-connection-id record)
+                      0)
+                     :invalid-token)
+                 "an evicted used token is rejected through its retired Retry source CID")
+                (multiple-value-bind (fresh-token fresh-record)
+                    (server-test-token-entry server)
+                  (progn
+                    (check
+                     (and (not (equalp token fresh-token))
+                          (eq (cl-quic-kit::%server-token-status
+                               server fresh-token
+                               (cl-quic-kit::server-retry-token-address fresh-record)
+                               (cl-quic-kit::server-retry-token-retry-source-connection-id
+                                fresh-record)
+                               (cl-quic-kit::server-retry-token-client-source-connection-id
+                                fresh-record)
+                               0)
+                              :valid))
+                     "the new Retry token remains valid in the bounded cache")
+                    (let* ((server-connection
+                            (cl-quic-kit::%server-find-initial-connection
+                             server
+                             (cl-quic-kit::server-retry-token-retry-source-connection-id record)
+                             (cl-quic-kit::server-retry-token-client-source-connection-id record)))
+                           (process-symbol
+                            (find-symbol "%SERVER-PROCESS-PROTECTED-DATAGRAM" "CL-QUIC-KIT"))
+                           (original-process (symbol-function process-symbol))
+                           (invalid-symbol
+                            (find-symbol "%SERVER-SEND-INVALID-TOKEN" "CL-QUIC-KIT"))
+                           (original-invalid (symbol-function invalid-symbol))
+                           (processed nil)
+                           (invalid-token-p nil)
+                           (duplicate
+                            (server-test-initial-packet
+                             cl-quic-kit:*quic-version-1*
+                             (cl-quic-kit::server-retry-token-retry-source-connection-id record)
+                             (cl-quic-kit::server-retry-token-client-source-connection-id record)
+                             token)))
+                      (check
+                       (and server-connection
+                            (not (cl-quic-kit::server-connection-handshake-complete-p
+                                  server-connection)))
+                       "the used Retry token belongs to an active handshake route")
+                      (unwind-protect
+                          (progn
+                            (setf (symbol-function process-symbol)
+                                  (lambda (candidate bytes at)
+                                    (declare (ignore bytes at))
+                                    (setf processed candidate)))
+                            (setf (symbol-function invalid-symbol)
+                                  (lambda (&rest arguments)
+                                    (declare (ignore arguments))
+                                    (setf invalid-token-p t)))
+                            (cl-quic-kit::%server-handle-datagram
+                             server duplicate
+                             (cl-quic-kit::server-retry-token-address record)
+                             (length duplicate) 0)
+                            (check
+                             (and (eq server-connection processed)
+                                  (not invalid-token-p))
+                             "a repeated Initial for an active route survives Retry token eviction"))
+                        (setf (symbol-function process-symbol) original-process
+                              (symbol-function invalid-symbol) original-invalid))))))))
+        (when first-client
+          (cl-quic-kit:client-close first-client))
+        (when second-client
+          (cl-quic-kit:client-close second-client))
+        (progn
+          (if server
+              (cl-quic-kit:quic-server-close server)
+            (cl-quic-kit:udp-close server-socket))
+          (server-test-remove-temp-directory directory)))))
+  (defun server-test-retry-full-used-cache-fails-closed-with-full-retired-cid-table ()
+  (let* ((cl-quic-kit::*quic-server-retry-cache-limit* 1)
+         (server-socket
+          (cl-quic-kit:make-udp-socket
+           :local-host "127.0.0.1" :local-port 0))
+         (peer
+          (cl-quic-kit:make-udp-socket
+           :remote-host "127.0.0.1"
+           :remote-port (cl-quic-kit:udp-socket-local-port server-socket)
+           :non-blocking-p t))
+         (server
+          (cl-quic-kit:make-quic-server
+           :udp-socket server-socket :max-connections 1
+           :retry-policy :always))
+         (token
+          (make-array 32 :element-type (quote (unsigned-byte 8))
+                      :initial-element 9))
+         (retry-cid
+          (make-array 8 :element-type (quote (unsigned-byte 8))
+                      :initial-contents (quote (21 22 23 24 25 26 27 28))))
+         (retained-cid
+          (make-array 8 :element-type (quote (unsigned-byte 8))
+                      :initial-contents (quote (31 32 33 34 35 36 37 38))))
+         (destination-cid
+          (make-array 8 :element-type (quote (unsigned-byte 8))
+                      :initial-contents (quote (41 42 43 44 45 46 47 48))))
+         (source-cid
+          (make-array 8 :element-type (quote (unsigned-byte 8))
+                      :initial-contents (quote (51 52 53 54 55 56 57 58))))
+         (record nil)
+         (address nil)
+         (path (cl-quic-kit::%make-server-amplification-state :received 1200))
+         (header
+          (cl-quic-kit:make-packet-header
+           :type :initial :version cl-quic-kit:*quic-version-1*
+           :destination-connection-id destination-cid
+           :source-connection-id source-cid :token #())))
+    (unwind-protect
+         (progn
+           (cl-quic-kit:udp-send
+            peer
+            (make-array 1 :element-type (quote (unsigned-byte 8))
+                        :initial-element 0))
+           (multiple-value-bind (received length peer-address)
+               (cl-quic-kit:udp-receive server-socket)
+             (check (and received (= length 1) peer-address)
+                    "retirement-capacity test obtains a live UDP peer address")
+             (setf address peer-address))
+           (setf record
+                 (cl-quic-kit::%make-server-retry-token
+                  :address address
+                  :original-destination-connection-id destination-cid
+                  :retry-source-connection-id retry-cid
+                  :client-source-connection-id source-cid
+                  :expires-at 100 :retain-until 100 :used-p t)
+                 (gethash token
+                          (cl-quic-kit::quic-server-retry-tokens server))
+                 record
+                 (gethash retained-cid
+                          (cl-quic-kit::quic-server-retired-retry-cids server))
+                 100)
+           (check
+            (and
+             (null (cl-quic-kit::%server-send-retry
+                    server header path address 0))
+             (eq record
+                 (gethash token
+                          (cl-quic-kit::quic-server-retry-tokens server)))
+             (= (hash-table-count
+                 (cl-quic-kit::quic-server-retry-tokens server))
+                1)
+             (= (hash-table-count
+                 (cl-quic-kit::quic-server-retired-retry-cids server))
+                1)
+             (= (cl-quic-kit::server-amplification-state-sent path) 0))
+            "Retry issuance fails closed when no bounded retired-CID slot is available")
+           (check (null (server-test-receive peer t))
+                  "no Retry datagram is emitted when the evicted token CID cannot be retired"))
+      (cl-quic-kit:udp-close peer)
+      (cl-quic-kit:quic-server-close server)))))
 (progn
   (let* ((directory (server-test-make-temp-directory))
          (socket nil)
@@ -1460,6 +1819,9 @@
               (when socket
                 (cl-quic-kit:udp-close socket)))
           (server-test-remove-temp-directory directory))))))
+(progn (server-test-poll-admits-initial-at-draining-deadline)
+         (server-test-retry-full-used-cache-issues-retry)
+         (server-test-retry-full-used-cache-fails-closed-with-full-retired-cid-table))
 
 (progn
   (let* ((directory (server-test-make-temp-directory))
@@ -1920,7 +2282,10 @@
                (let* ((header (cl-quic-kit:decode-packet-header response))
                       (server-cid
                         (cl-quic-kit:packet-header-source-connection-id header))
-                      (connection (cl-quic-kit:quic-client-connection client)))
+                      (connection (cl-quic-kit:quic-client-connection client))
+                      (server-connection
+                       (gethash server-cid
+                                (cl-quic-kit::quic-server-connections server))))
                  (check (<= (length response) (* 3 (length packet)))
                         "fatal TLS alert CONNECTION_CLOSE respects the three-times amplification limit")
                  (cl-quic-kit:client-receive-datagram client response)
@@ -1928,19 +2293,98 @@
                              (= (cl-quic-kit::quic-connection-closed-error connection)
                                 (+ #x0100 47)))
                         "fatal TLS alert 47 reaches the client as QUIC crypto error 0x012f")
-                 (check (and (zerop (hash-table-count
-                                     (cl-quic-kit::quic-server-connections server)))
-                             (null (gethash server-cid
-                                             (cl-quic-kit::quic-server-connections server)))
-                             (null (cl-quic-kit:quic-server-accept-connection server)))
-                        "fatal TLS alert closes and removes the server CID route before acceptance")
+                 (check
+                  (and server-connection
+                       (= (hash-table-count
+                          (cl-quic-kit::quic-server-connections server))
+                          1)
+                       (eq (gethash server-cid
+                                (cl-quic-kit::quic-server-connections server))
+                            server-connection)
+                       (eq (cl-quic-kit:connection-state
+                            (cl-quic-kit::server-connection-connection
+                             server-connection))
+                           :closing)
+                       (null (cl-quic-kit:quic-server-accept-connection
+                              server)))
+                  "fatal TLS alert retains its server CID route during closing before acceptance")
                  (cl-quic-kit:udp-send client-socket packet)
                  (server-test-poll-until-datagram-received server socket packet)
-                 (check (and (zerop (hash-table-count
-                                     (cl-quic-kit::quic-server-connections server)))
-                             (null (cl-quic-kit:udp-receive client-socket))
-                             (null (cl-quic-kit:quic-server-accept-connection server)))
-                        "replaying the exact Initial after a fatal TLS alert creates no replacement connection")))))
+                 (progn
+                  (let ((replay-response (server-test-receive client-socket t)))
+                    (when replay-response
+                      (cl-quic-kit:client-receive-datagram client replay-response))
+                    (check
+                     (and replay-response
+                          (= (hash-table-count
+                             (cl-quic-kit::quic-server-connections server))
+                             1)
+                          (eq (gethash server-cid
+                                   (cl-quic-kit::quic-server-connections server))
+                               server-connection)
+                          (<= (cl-quic-kit::server-amplification-state-sent
+                               (cl-quic-kit::server-connection-path server-connection))
+                              (* 3 (cl-quic-kit::server-amplification-state-received
+                                    (cl-quic-kit::server-connection-path
+                                     server-connection))))
+                          (eq (cl-quic-kit:connection-state
+                               (cl-quic-kit::server-connection-connection
+                                server-connection))
+                              :closing)
+                          (eq (cl-quic-kit:connection-state connection) :draining)
+                          (= (cl-quic-kit::quic-connection-closed-error connection)
+                             (+ #x0100 47))
+                          (null (cl-quic-kit:quic-server-accept-connection
+                                 server)))
+                     "replaying the exact Initial elicits a close response on the existing connection"))
+                  (progn
+                    (let ((sent-before
+                           (cl-quic-kit::server-amplification-state-sent
+                            (cl-quic-kit::server-connection-path
+                             server-connection)))
+                          (received-before
+                           (cl-quic-kit::server-amplification-state-received
+                            (cl-quic-kit::server-connection-path
+                             server-connection))))
+                      (cl-quic-kit:udp-send client-socket packet)
+                      (server-test-poll-until-datagram-received
+                       server socket packet)
+                      (check
+                       (and (cl-quic-kit::server-connection-close-response-attempted-p
+                             server-connection)
+                            (> (cl-quic-kit::server-amplification-state-received
+                                (cl-quic-kit::server-connection-path
+                                 server-connection))
+                               received-before)
+                            (= (cl-quic-kit::server-amplification-state-sent
+                                (cl-quic-kit::server-connection-path
+                                 server-connection))
+                               sent-before)
+                            (<= (cl-quic-kit::server-amplification-state-sent
+                                 (cl-quic-kit::server-connection-path
+                                  server-connection))
+                                (* 3 (cl-quic-kit::server-amplification-state-received
+                                      (cl-quic-kit::server-connection-path
+                                       server-connection))))
+                            (null (server-test-receive client-socket t)))
+                       "closing connections rate-limit repeated CONNECTION_CLOSE responses"))
+                    (cl-quic-kit:quic-server-poll
+                     server
+                     (cl-quic-kit:connection-draining-deadline
+                      (cl-quic-kit::server-connection-connection
+                       server-connection))))
+                  (check
+                   (and (eq (cl-quic-kit:connection-state
+                             (cl-quic-kit::server-connection-connection
+                              server-connection))
+                            :closed)
+                        (zerop (hash-table-count
+                                (cl-quic-kit::quic-server-connections server)))
+                        (null (gethash server-cid
+                                       (cl-quic-kit::quic-server-connections server)))
+                        (null (cl-quic-kit:quic-server-accept-connection
+                               server)))
+                   "fatal TLS alert removes the server CID route after draining"))))))
       (unwind-protect
            (when client
              (cl-quic-kit:client-close client))
@@ -2092,3 +2536,513 @@
                  (when socket
                    (cl-quic-kit:udp-close socket)))
           (server-test-remove-temp-directory directory))))))
+(progn
+  (defun server-test-make-pending-alert-connection
+      (server address connection-id path now)
+    (let* ((remote-id (make-array 8 :element-type (quote (unsigned-byte 8))
+                                  :initial-contents (quote (21 22 23 24 25 26 27 28))))
+           (server-connection
+            (cl-quic-kit::%make-server-connection
+             :server server :path path :address address :now now
+             :original-destination-connection-id connection-id
+             :local-connection-id connection-id
+             :remote-connection-id remote-id
+             :pending-datagrams nil))
+           (connection
+            (cl-quic-kit:make-quic-connection
+             :role :server :local-connection-id connection-id
+             :now-fn
+             (lambda ()
+               (cl-quic-kit::server-connection-now server-connection))
+             :idle-timeout 1
+             :io-write
+             (lambda (ignored bytes)
+               (declare (ignore ignored))
+               (cl-quic-kit::%server-engine-write server-connection bytes))))
+           (engine
+            (cl-quic-kit:make-quic-client
+             :connection connection :local-connection-id connection-id
+             :destination-connection-id remote-id
+             :disable-hostname-verification-p t
+             :now-fn
+             (lambda ()
+               (cl-quic-kit::server-connection-now server-connection)))))
+      (setf (cl-quic-kit::server-connection-connection server-connection)
+            connection
+            (cl-quic-kit::server-connection-engine server-connection)
+            engine)
+      (let ((initial
+             (cl-quic-kit.protection:derive-initial-secrets connection-id)))
+        (cl-quic-kit::%client-set-key engine :initial :write
+                                      (getf initial :server)))
+      (setf (gethash connection-id
+                     (cl-quic-kit::quic-server-connections server))
+            server-connection)
+      server-connection))
+
+  (defun server-test-tls-alert-close-waits-for-amplification-budget ()
+    (let* ((server-socket
+            (cl-quic-kit:make-udp-socket
+             :local-host "127.0.0.1" :local-port 0))
+           (server
+            (cl-quic-kit:make-quic-server
+             :udp-socket server-socket :max-connections 1
+             :retry-policy :never))
+           (peer
+            (cl-quic-kit:make-udp-socket
+             :remote-host "127.0.0.1"
+             :remote-port (cl-quic-kit:udp-socket-local-port server-socket)
+             :non-blocking-p t))
+           (address nil))
+      (unwind-protect
+          (progn
+            (cl-quic-kit:udp-send
+             peer (make-array 1 :element-type (quote (unsigned-byte 8))
+                              :initial-element 1))
+            (loop repeat 1000
+                  do (multiple-value-bind (bytes length source-address)
+                         (cl-quic-kit:udp-receive server-socket)
+                       (declare (ignore length))
+                       (when bytes
+                         (setf address source-address)))
+                  (when address
+                    (return))
+                  (sleep 0.001)
+                  finally (error "Did not receive the test peer datagram"))
+            (let* ((path
+                    (cl-quic-kit::%make-server-amplification-state
+                     :received 1200 :sent 3600))
+                   (connection-id (make-array 8 :element-type (quote (unsigned-byte 8))
+                                              :initial-contents (quote (1 2 3 4 5 6 7 8))))
+                   (server-connection
+                    (server-test-make-pending-alert-connection
+                     server address connection-id path 1)))
+              (cl-quic-kit::%server-handle-tls-events
+               server-connection
+               (list (list :type :alert :description 47)))
+              (check
+               (and (cl-quic-kit::server-connection-pending-datagrams
+                     server-connection)
+                    (eq (gethash connection-id
+                                 (cl-quic-kit::quic-server-connections server))
+                        server-connection)
+                    (= (hash-table-count
+                        (cl-quic-kit::quic-server-connections server))
+                       1))
+               "TLS alert close remains routed while amplification blocks its output")
+              (check
+               (and (= (cl-quic-kit::server-amplification-state-sent path)
+                       (* 3 (cl-quic-kit::server-amplification-state-received path)))
+                    (null (server-test-receive peer t)))
+               "TLS alert close emits nothing beyond the three-times amplification limit")
+              (let ((pending
+                     (first
+                      (cl-quic-kit::server-connection-pending-datagrams
+                       server-connection))))
+                (progn
+                  (loop repeat 8
+                        do (cl-quic-kit::%server-process-protected-datagram
+                            server-connection #(64) 1))
+                  (check
+                   (and (= (length (cl-quic-kit::server-connection-pending-datagrams
+                                    server-connection))
+                           1)
+                        (not (cl-quic-kit::server-connection-close-response-attempted-p
+                              server-connection)))
+                   "closing flood does not add responses to an amplification-blocked close queue")
+                  (setf (cl-quic-kit::server-amplification-state-received path)
+                        (ceiling (+ (cl-quic-kit::server-amplification-state-sent path)
+                                    (length pending))
+                                 3)))
+                (cl-quic-kit:quic-server-poll server 2)
+                (let ((response (server-test-receive peer t)))
+                  (progn
+                    (check
+                     (and response
+                          (= (length response) (length pending))
+                          (= (cl-quic-kit::server-amplification-state-sent path)
+                             (+ 3600 (length pending)))
+                          (<= (cl-quic-kit::server-amplification-state-sent path)
+                              (* 3 (cl-quic-kit::server-amplification-state-received path)))
+                          (null
+                           (cl-quic-kit::server-connection-pending-datagrams
+                            server-connection))
+                          (eq (gethash connection-id
+                                       (cl-quic-kit::quic-server-connections server))
+                              server-connection)
+                          (eq (cl-quic-kit:connection-state
+                               (cl-quic-kit::server-connection-connection server-connection))
+                              :closing))
+                     (format nil
+                             "TLS alert retry: response=~S pending=~D sent=~D received=~D queued=~D routed=~S state=~S"
+                             (and response (length response))
+                             (length pending)
+                             (cl-quic-kit::server-amplification-state-sent path)
+                             (cl-quic-kit::server-amplification-state-received path)
+                             (length (cl-quic-kit::server-connection-pending-datagrams server-connection))
+                             (eq (gethash connection-id (cl-quic-kit::quic-server-connections server))
+                                 server-connection)
+                             (cl-quic-kit:connection-state
+                              (cl-quic-kit::server-connection-connection server-connection))))
+                    (let ((deadline
+                           (cl-quic-kit:connection-draining-deadline
+                            (cl-quic-kit::server-connection-connection server-connection))))
+                      (cl-quic-kit:quic-server-poll server deadline)
+                      (check
+                       (and (eq (cl-quic-kit:connection-state
+                                 (cl-quic-kit::server-connection-connection server-connection))
+                                :closed)
+                            (null (gethash connection-id
+                                           (cl-quic-kit::quic-server-connections server)))
+                            (zerop (hash-table-count
+                                    (cl-quic-kit::quic-server-connections server))))
+                       "TLS alert close removes routes after its draining deadline")))))
+              (let* ((expired-id (make-array 8 :element-type (quote (unsigned-byte 8))
+                                             :initial-contents (quote (31 32 33 34 35 36 37 38))))
+                     (expired-path
+                      (cl-quic-kit::%make-server-amplification-state
+                       :received 1200 :sent 3600))
+                     (expired-connection
+                      (server-test-make-pending-alert-connection
+                       server address expired-id expired-path 3)))
+                (cl-quic-kit::%server-handle-tls-events
+                 expired-connection
+                 (list (list :type :alert :description 47)))
+                (let ((deadline
+                       (cl-quic-kit:connection-draining-deadline
+                        (cl-quic-kit::server-connection-connection
+                         expired-connection))))
+                  (cl-quic-kit:quic-server-poll server deadline)
+                  (check
+                   (and (eq (cl-quic-kit:connection-state
+                             (cl-quic-kit::server-connection-connection
+                              expired-connection))
+                            :closed)
+                        (null (gethash expired-id
+                                       (cl-quic-kit::quic-server-connections
+                                        server)))
+                        (zerop (hash-table-count
+                                (cl-quic-kit::quic-server-connections server))))
+                   "TLS alert pending output is discarded when its close deadline expires"))))
+            (cl-quic-kit:udp-close peer)
+            (cl-quic-kit:quic-server-close server)))))
+
+  (defun server-test-retry-token-survives-capacity-rejection ()
+    (let ((cl-quic-kit::*quic-server-retry-cache-limit* 1)
+          (server-socket
+           (cl-quic-kit:make-udp-socket
+            :local-host "127.0.0.1" :local-port 0))
+          (server nil)
+          (first-client nil)
+          (second-client nil))
+      (unwind-protect
+          (progn
+            (setf server
+                  (cl-quic-kit:make-quic-server
+                   :udp-socket server-socket :max-connections 1
+                   :retry-policy :always)
+                  first-client
+                  (cl-quic-kit:make-quic-client
+                   :server-host "127.0.0.1"
+                   :server-port (cl-quic-kit:udp-socket-local-port server-socket)
+                   :disable-hostname-verification-p t
+                   :now-fn (lambda () 0)))
+            (multiple-value-bind (token record)
+                (server-test-issue-retry server first-client 0)
+              (let* ((connection-id
+                       (make-array 8
+                                   :element-type (quote (unsigned-byte 8))
+                                   :initial-contents (quote (91 92 93 94 95 96 97 98))))
+                     (remote-id
+                      (make-array 8
+                                  :element-type (quote (unsigned-byte 8))
+                                  :initial-contents (quote (71 72 73 74 75 76 77 78))))
+                     (dummy-connection
+                      (cl-quic-kit:make-quic-connection
+                       :role :server :local-connection-id connection-id
+                       :now-fn (lambda () 0)))
+                     (dummy-engine
+                      (cl-quic-kit:make-quic-client
+                       :connection dummy-connection
+                       :local-connection-id connection-id
+                       :destination-connection-id remote-id
+                       :disable-hostname-verification-p t
+                       :now-fn (lambda () 0)))
+                     (dummy
+                      (cl-quic-kit::%make-server-connection
+                       :server server :connection dummy-connection
+                       :engine dummy-engine
+                       :original-destination-connection-id
+                       #(81 82 83 84 85 86 87 88)
+                       :local-connection-id connection-id
+                       :remote-connection-id remote-id
+                       :pending-datagrams nil)))
+                (setf (gethash connection-id
+                               (cl-quic-kit::quic-server-connections server))
+                      dummy)
+                (progn
+                  (cl-quic-kit:client-poll first-client 0)
+                  (server-test-poll-until-datagram-received
+                   server server-socket nil 0))
+                (check
+                 (and
+                  (not (cl-quic-kit::server-retry-token-used-p record))
+                  (eq record
+                      (gethash token
+                               (cl-quic-kit::quic-server-retry-tokens server)))
+                  (eq dummy
+                      (gethash connection-id
+                               (cl-quic-kit::quic-server-connections server)))
+                  (= (hash-table-count
+                      (cl-quic-kit::quic-server-connections server))
+                     1))
+                 "a valid Retry token remains unused when connection capacity rejects it")
+                (setf second-client
+                      (cl-quic-kit:make-quic-client
+                       :server-host "127.0.0.1"
+                       :server-port (cl-quic-kit:udp-socket-local-port server-socket)
+                       :disable-hostname-verification-p t
+                       :now-fn (lambda () 0)))
+                (cl-quic-kit:client-poll second-client 0)
+                (server-test-poll-until-datagram-received
+                 server server-socket nil 0)
+                (let* ((response
+                        (server-test-receive
+                         (cl-quic-kit::quic-client-udp-socket second-client)
+                         t))
+                       (header
+                        (and response
+                             (cl-quic-kit:decode-packet-header response))))
+                  (check
+                   (and header
+                        (eq (cl-quic-kit:packet-header-type header) :retry)
+                        (null
+                         (gethash token
+                                  (cl-quic-kit::quic-server-retry-tokens server)))
+                        (= (hash-table-count
+                            (cl-quic-kit::quic-server-retry-tokens server))
+                           1))
+                   "a fresh Retry evicts the unconsumed rejected token at cache capacity")))))
+        (when first-client
+          (cl-quic-kit:client-close first-client))
+        (when second-client
+          (cl-quic-kit:client-close second-client))
+        (if server
+            (cl-quic-kit:quic-server-close server)
+          (cl-quic-kit:udp-close server-socket)))))
+
+  (defun server-test-terminal-connection-releases-capacity ()
+    (let* ((directory (server-test-make-temp-directory))
+           (server-tls-options
+            (append (nth-value 0 (server-test-tls-settings directory))
+                    (list :alpn-protocols (list "h3"))))
+           (server-socket
+             (cl-quic-kit:make-udp-socket
+              :local-host "127.0.0.1" :local-port 0))
+           (server
+             (cl-quic-kit:make-quic-server
+              :udp-socket server-socket :max-connections 1
+              :retry-policy :never
+              :tls-server-options server-tls-options))
+           (writes nil)
+           (connection-id
+            (make-array 8
+                        :element-type (quote (unsigned-byte 8))
+                        :initial-contents (quote (41 42 43 44 45 46 47 48))))
+           (alias-id
+            (make-array 8
+                        :element-type (quote (unsigned-byte 8))
+                        :initial-contents (quote (51 52 53 54 55 56 57 58))))
+           (remote-id
+            (make-array 8
+                        :element-type (quote (unsigned-byte 8))
+                        :initial-contents (quote (61 62 63 64 65 66 67 68))))
+           (connection
+             (cl-quic-kit:make-quic-connection
+              :role :server :local-connection-id connection-id
+              :now-fn (lambda () 5)
+              :io-write
+              (lambda (ignored bytes)
+                (declare (ignore ignored))
+                (push bytes writes))))
+           (engine
+             (cl-quic-kit:make-quic-client
+              :connection connection :local-connection-id connection-id
+              :destination-connection-id remote-id
+              :disable-hostname-verification-p t :now-fn (lambda () 5)))
+           (server-connection
+             (cl-quic-kit::%make-server-connection
+              :server server :connection connection :engine engine
+              :original-destination-connection-id #(11 12 13 14 15 16 17 18)
+              :local-connection-id connection-id
+              :remote-connection-id remote-id
+              :pending-datagrams (list #(1))))
+           (secret (make-array 32 :element-type '(unsigned-byte 8)
+                               :initial-element 7)))
+      (unwind-protect
+           (progn
+             (cl-quic-kit:connection-set-state connection :draining)
+             (setf (cl-quic-kit::quic-connection-draining-deadline connection) 10
+                   (gethash connection-id
+                            (cl-quic-kit::quic-server-connections server))
+                   server-connection
+                   (gethash alias-id
+                            (cl-quic-kit::quic-server-connections server))
+                   server-connection)
+             (cl-quic-kit::%client-set-key
+              engine :1-rtt :write
+              (cl-quic-kit.protection:make-key-set secret))
+             (cl-quic-kit::%client-queue-frame
+              engine (cl-quic-kit:make-frame :ping) :1-rtt)
+             (check
+              (eq (handler-case
+                      (cl-quic-kit::%server-process-protected-datagram
+                       server-connection #(64) 5)
+                    (error () nil))
+                  server-connection)
+              "draining connections ignore packet input before decryption")
+             (cl-quic-kit:quic-server-poll server 5)
+             (check
+              (and (eq (cl-quic-kit:connection-state connection) :draining)
+                   (null writes)
+                   (null (cl-quic-kit::server-connection-pending-datagrams
+                          server-connection))
+                   (cl-quic-kit::quic-client-pending-frames engine)
+                   (= (hash-table-count
+                       (cl-quic-kit::quic-server-connections server))
+                      2)
+                   (eq (gethash connection-id
+                                (cl-quic-kit::quic-server-connections server))
+                       server-connection)
+                   (eq (gethash alias-id
+                                (cl-quic-kit::quic-server-connections server))
+                       server-connection))
+              "draining polling suppresses output and retains every CID alias")
+             (cl-quic-kit:quic-server-poll server 10)
+             (check
+              (and (eq (cl-quic-kit:connection-state connection) :closed)
+                   (zerop (hash-table-count
+                           (cl-quic-kit::quic-server-connections server)))
+                   (null (gethash connection-id
+                                  (cl-quic-kit::quic-server-connections server)))
+                   (null (gethash alias-id
+                                  (cl-quic-kit::quic-server-connections server))))
+              "terminal connection polling removes every CID alias from capacity")
+             (let ((packet
+                     (server-test-initial-packet
+                      cl-quic-kit:*quic-version-1*
+                      #(101 102 103 104 105 106 107 108)
+                      #(111 112 113 114 115 116 117 118))))
+               (cl-quic-kit::%server-handle-datagram
+                server packet :peer 1200 11)
+               (check
+                (and (= (hash-table-count
+                         (cl-quic-kit::quic-server-connections server))
+                        1)
+                     (loop for active being the hash-values
+                             of (cl-quic-kit::quic-server-connections server)
+                           thereis (cl-quic-kit::server-connection-p active)))
+                "a new Initial is admitted after terminal connection cleanup")))
+        (unwind-protect
+             (cl-quic-kit:quic-server-close server)
+          (server-test-remove-temp-directory directory)))))
+
+  (server-test-tls-alert-close-waits-for-amplification-budget)
+  (server-test-retry-token-survives-capacity-rejection)
+  (progn
+    (defun server-test-peer-close-stops-coalesced-packet-processing ()
+      (let* ((server-socket
+               (cl-quic-kit:make-udp-socket
+                :local-host "127.0.0.1" :local-port 0))
+             (server
+               (cl-quic-kit:make-quic-server
+                :udp-socket server-socket :max-connections 1
+                :retry-policy :never))
+             (writes nil)
+             (server-cid
+              (make-array 8
+                          :element-type (quote (unsigned-byte 8))
+                          :initial-contents (quote (31 32 33 34 35 36 37 38))))
+             (peer-cid
+              (make-array 8
+                          :element-type (quote (unsigned-byte 8))
+                          :initial-contents (quote (41 42 43 44 45 46 47 48))))
+             (server-connection-state
+               (cl-quic-kit:make-quic-connection
+                :role :server :local-connection-id server-cid
+                :now-fn (lambda () 0)
+                :io-write
+                (lambda (ignored bytes)
+                  (declare (ignore ignored))
+                  (push bytes writes))))
+             (server-engine
+               (cl-quic-kit:make-quic-client
+                :connection server-connection-state
+                :local-connection-id server-cid
+                :destination-connection-id peer-cid
+                :disable-hostname-verification-p t :now-fn (lambda () 0)))
+             (server-connection
+               (cl-quic-kit::%make-server-connection
+                :server server :connection server-connection-state
+                :engine server-engine :local-connection-id server-cid
+                :remote-connection-id peer-cid))
+             (peer-connection
+               (cl-quic-kit:make-quic-connection
+                :role :client :local-connection-id peer-cid
+                :now-fn (lambda () 0)))
+             (peer-engine
+               (cl-quic-kit:make-quic-client
+                :connection peer-connection
+                :local-connection-id peer-cid
+                :destination-connection-id server-cid
+                :disable-hostname-verification-p t :now-fn (lambda () 0)))
+             (secret (make-array 32 :element-type (quote (unsigned-byte 8))
+                                 :initial-element 7)))
+        (unwind-protect
+             (progn
+               (cl-quic-kit:connection-set-state
+                server-connection-state :established)
+               (dolist (level (list :handshake :1-rtt))
+                 (cl-quic-kit::%client-set-key
+                  server-engine level :read
+                  (cl-quic-kit.protection:make-key-set secret))
+                 (cl-quic-kit::%client-set-key
+                  peer-engine level :write
+                  (cl-quic-kit.protection:make-key-set secret)))
+               (let* ((close-packet
+                        (cl-quic-kit::%client-build-packet
+                         peer-engine :handshake
+                         (list
+                          (cl-quic-kit:make-frame
+                           :connection-close :error-code #x55
+                           :frame-type 0 :reason #()))))
+                      (later-packet
+                        (cl-quic-kit::%client-build-packet
+                         peer-engine :application
+                         (list
+                          (cl-quic-kit:make-frame
+                           :crypto :offset 0 :data #(1)))))
+                      (datagram
+                        (and close-packet later-packet
+                             (concatenate (quote (vector (unsigned-byte 8)))
+                                          close-packet later-packet)))
+                      (result
+                        (and datagram
+                             (handler-case
+                                 (cl-quic-kit::%server-process-protected-datagram
+                                  server-connection datagram 5)
+                               (error () nil)))))
+                 (check
+                  (and datagram
+                       (eq result server-connection)
+                       (eq (cl-quic-kit:connection-state
+                            server-connection-state)
+                           :draining)
+                       (= (cl-quic-kit::quic-connection-last-activity
+                           server-connection-state)
+                          0)
+                       (null writes))
+                  "server stops processing coalesced packets after peer close")))
+          (cl-quic-kit:quic-server-close server))))
+    (server-test-peer-close-stops-coalesced-packet-processing)
+    (server-test-terminal-connection-releases-capacity)))

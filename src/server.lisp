@@ -317,15 +317,15 @@
 (defun %server-send-retry (server header path address now)
   (unless path
     (return-from %server-send-retry nil))
-  (labels ((oldest-unused-retry-token (excluded)
+  (labels ((oldest-retry-token (excluded used-p)
              (let ((oldest-token nil)
                    (oldest-retain-until nil))
                (maphash
                 (lambda (token record)
                   (when (and
                          (server-retry-token-p record)
-                         (not (server-retry-token-used-p record))
-                         (not (member token excluded :test #'equalp)))
+                         (eql used-p (server-retry-token-used-p record))
+                         (not (member token excluded :test (function equalp))))
                     (let ((retain-until
                             (or (server-retry-token-retain-until record) 0)))
                       (when (or (null oldest-retain-until)
@@ -341,10 +341,29 @@
            (tokens-to-evict nil))
       (dotimes (index tokens-needed)
         (declare (ignore index))
-        (let ((token (oldest-unused-retry-token tokens-to-evict)))
+        (let ((token (or (oldest-retry-token tokens-to-evict nil)
+                         (oldest-retry-token tokens-to-evict t))))
           (unless token
             (return-from %server-send-retry nil))
           (push token tokens-to-evict)))
+      (let* ((retired-cids (quic-server-retired-retry-cids server))
+             (active-retired-count
+               (loop for expires-at being the hash-values of retired-cids
+                     count (> expires-at now)))
+             (new-retirement-count
+               (count-if
+                (lambda (old-token)
+                  (let ((old-record
+                          (gethash old-token (quic-server-retry-tokens server))))
+                    (and old-record
+                         (not
+                          (%server-retired-cid-active-p
+                           retired-cids
+                           (server-retry-token-retry-source-connection-id
+                            old-record)
+                           now))))) tokens-to-evict))) (when (> (+ active-retired-count new-retirement-count)
+                 *quic-server-retry-cache-limit*)
+          (return-from %server-send-retry nil))
       (let* ((token (%server-new-token server))
              (retry-source-cid
                (%server-new-retry-source-connection-id
@@ -375,7 +394,8 @@
           (setf (gethash token (quic-server-retry-tokens server)) record)
           (setf (server-amplification-state-expires-at path)
                 (server-retry-token-retain-until record))
-          t)))))
+          t))))))
+
 
 (defun %server-version-negotiation-packet (destination-cid source-cid)
   (let ((packet (encode-version-negotiation
@@ -421,6 +441,11 @@
                    source-cid
                    (server-retry-token-client-source-connection-id record))))
          (values :connection-id-mismatch record))
+        ((and (server-retry-token-used-p record)
+              (not (gethash
+                    (server-retry-token-retry-source-connection-id record)
+                    (quic-server-connections server))))
+         (values :invalid-token record))
         (t (values :valid record))))))
 
 (defun %server-protected-initial (key-destination-cid destination-cid source-cid packet-number frames)
@@ -489,9 +514,6 @@
            (t
             (%server-send-invalid-token server header nil path address))))
         ((eq status :valid)
-         (when path
-           (setf (server-amplification-state-validated-p path) t
-                 (server-retry-token-used-p record) t))
          (%server-start-or-feed-initial server header path address record bytes now))
         (t
          (%server-send-invalid-token
@@ -541,9 +563,19 @@
                     (unless (or (and existing
                                      (server-connection-handshake-complete-p
                                       existing))
-                                (%server-retired-cid-active-p
-                                 (quic-server-retired-local-cids server)
-                                 destination-cid now))
+                                (and (null existing)
+                                     (or (gethash destination-cid
+                                                  (quic-server-connections server))
+                                         (loop for active being the hash-values
+                                                 of (quic-server-connections server)
+                                               thereis
+                                               (equalp
+                                                destination-cid
+                                                (server-connection-original-destination-connection-id
+                                                 active)))
+                                         (%server-retired-cid-active-p
+                                          (quic-server-retired-local-cids server)
+                                          destination-cid now))))
                       (let* ((record
                               (loop for candidate being the hash-values
                                     of (quic-server-retry-tokens server)
@@ -567,8 +599,11 @@
                                     (%server-path
                                      server address original-dcid now t))))
                         (%server-note-received path byte-count now)
-                        (%server-handle-initial
-                         server header path address now bytes))))))))
+                        (if (and existing
+                                 (not (server-connection-handshake-complete-p existing))
+                                 (equalp address (server-connection-address existing)))
+                            (%server-process-protected-datagram existing bytes now)
+                          (%server-handle-initial server header path address now bytes)))))))))
            (t
             (route-existing)))))
     (quic-encoding-error () nil)
@@ -580,6 +615,16 @@
     (return-from quic-server-poll t))
   (let ((now (or at (%quic-real-time))))
     (%server-prune-expired-state server now)
+    (dolist (server-connection (%server-routed-connections server))
+      (let* ((connection (server-connection-connection server-connection))
+             (deadline (connection-draining-deadline connection)))
+        (when (and deadline
+                   (member (connection-state connection) (list :closing :draining))
+                   (>= now deadline))
+          (connection-poll connection now)
+          (when (eq (connection-state connection) :closed)
+            (setf (server-connection-pending-datagrams server-connection) nil)
+            (%server-remove-connection-routes server-connection)))))
     (loop
       (multiple-value-bind (bytes byte-count address)
           (udp-receive (quic-server-udp-socket server))
@@ -607,13 +652,43 @@
     (clrhash (quic-server-paths server))
     (udp-close (quic-server-udp-socket server)))
   t)
-(defstruct (server-connection
-            (:constructor %make-server-connection))
-  server connection engine tls-boundary tls-driver path address now
-  original-destination-connection-id local-connection-id
-  remote-connection-id cipher-suite transport-parameters
-  peer-transport-parameters pending-datagrams
-  (handshake-complete-p nil) (accepted-p nil))
+(progn
+  (defstruct (server-connection
+              (:constructor %make-server-connection))
+    server connection engine tls-boundary tls-driver path address now
+    original-destination-connection-id local-connection-id
+    remote-connection-id cipher-suite transport-parameters
+    peer-transport-parameters pending-datagrams
+    (handshake-complete-p nil) (accepted-p nil) (close-response-attempted-p nil))
+
+  (defun %server-routed-connections (server)
+    (let ((seen (make-hash-table :test #'eq))
+          (connections nil))
+      (maphash
+       (lambda (connection-id server-connection)
+         (declare (ignore connection-id))
+         (unless (gethash server-connection seen)
+           (setf (gethash server-connection seen) t)
+           (push server-connection connections)))
+       (quic-server-connections server))
+      (nreverse connections)))
+
+  (defun %server-connection-count (server)
+    (length (%server-routed-connections server)))
+
+  (defun %server-remove-connection-routes (server-connection)
+    (let* ((routes
+             (quic-server-connections
+              (server-connection-server server-connection)))
+           (connection-ids nil))
+      (maphash
+       (lambda (connection-id candidate)
+         (when (eq candidate server-connection)
+           (push connection-id connection-ids)))
+       routes)
+      (dolist (connection-id connection-ids)
+        (remhash connection-id routes))
+      server-connection)))
 (defun %server-new-connection-id (server forbidden-cid)
   (loop repeat 4
         for candidate = (%server-random-octets 8 :connection-id)
@@ -896,9 +971,6 @@
                      (%quic-real-time))
                  *quic-server-retry-token-retention*)
               *quic-server-path-cache-limit*)
-             (remhash (server-connection-local-connection-id server-connection)
-                      (quic-server-connections
-                       (server-connection-server server-connection)))
              (return-from %server-handle-tls-events server-connection)))
           (:handshake-complete
            (%server-complete-connection server-connection))
@@ -1004,17 +1076,21 @@
           server-connection)
     server-connection))
 (defun %server-find-initial-connection (server destination-cid source-cid)
-  (or (gethash destination-cid (quic-server-connections server))
-      (loop for server-connection being the hash-values
-              of (quic-server-connections server)
-            when (and
-                  (equalp destination-cid
-                          (server-connection-original-destination-connection-id
-                           server-connection))
-                  (equalp source-cid
-                          (server-connection-remote-connection-id
-                           server-connection)))
-              return server-connection)))
+  (let ((connection (gethash destination-cid (quic-server-connections server))))
+    (or (and connection
+             (equalp source-cid
+                     (server-connection-remote-connection-id connection))
+             connection)
+        (loop for server-connection being the hash-values
+                of (quic-server-connections server)
+              when (and
+                    (equalp destination-cid
+                            (server-connection-original-destination-connection-id
+                             server-connection))
+                    (equalp source-cid
+                            (server-connection-remote-connection-id
+                             server-connection)))
+                return server-connection))))
 (defun %server-start-or-feed-initial
     (server header path address record bytes now)
   (let* ((existing
@@ -1027,65 +1103,100 @@
                      (equalp address
                              (server-connection-address existing)))
              (or existing
-                 (when (< (hash-table-count (quic-server-connections server))
+                 (when (< (%server-connection-count server)
                           (quic-server-max-connections server))
                    (%server-create-connection
                     server header path address record now))))))
     (when server-connection
+      (when record
+        (when path
+          (setf (server-amplification-state-validated-p path) t))
+        (setf (server-retry-token-used-p record) t))
       (%server-process-protected-datagram server-connection bytes now)))
   server)
 (defun %server-process-protected-datagram (server-connection bytes now)
-  (when (and (server-connection-handshake-complete-p server-connection)
-             (eq (getf (%client-layout bytes) :type) :initial))
-    (return-from %server-process-protected-datagram server-connection))
   (setf (server-connection-now server-connection) now)
-  (let ((engine (server-connection-engine server-connection))
-        (at 0))
-    (loop while (< at (length bytes)) do
-      (let* ((slice (subseq bytes at))
-             (layout (%client-layout
-                      slice
-                      :short-header-dcid-length
-                      (length (server-connection-local-connection-id
-                               server-connection))))
-             (type (getf layout :type)))
-        (unless (eq type :0-rtt)
-          (multiple-value-bind (level number header)
-              (handler-case
-                  (%client-unprotect-packet engine slice layout)
-                (crypto-kit:aead-authentication-failure ()
-                  (values nil nil nil)))
-            (when header
-              (let* ((frames (decode-frames (packet-header-payload header)))
-                     (space (%client-level-space level)))
-                (setf (quic-client-received-packets engine)
-                      (%client-set-level-value
-                       (quic-client-received-packets engine) level
-                       (cons number
-                             (%client-level-value
-                              (quic-client-received-packets engine) level))))
-                (cl-quic-kit.recovery:on-packet-received
-                 (quic-client-recovery engine) space number
-                 :ack-eliciting-p (%client-ack-eliciting-p frames))
-                (dolist (frame frames)
-                  (case (frame-type frame)
-                    (:crypto
-                     (%server-feed-crypto
-                      server-connection level
-                      (frame-field frame :offset 0)
-                      (frame-field frame :data #())))
-                    ((:ack :ack-ecn)
-                     (%client-handle-ack engine level frame))
-                    ((:connection-close :application-close)
-                     (connection-receive-frame
-                      (server-connection-connection server-connection)
-                      frame :touch-p nil))))
-                (connection-touch
-                 (server-connection-connection server-connection) now)))))
-        (setf at (+ at (getf layout :end)))
-        (when (not (getf layout :long-p))
-          (return))))
-  server-connection))
+  (let ((connection (server-connection-connection server-connection)))
+    (case (connection-state connection)
+      (:draining
+       (setf (server-connection-pending-datagrams server-connection) nil)
+       (return-from %server-process-protected-datagram server-connection))
+      (:closed
+       (return-from %server-process-protected-datagram server-connection))
+      (:closing
+       (let* ((engine (server-connection-engine server-connection))
+              (frame (connection-close-frame connection))
+              (frame-type (and frame (frame-type frame)))
+              (level
+                (or (and (%client-key engine :1-rtt :write) :1-rtt)
+                    (and (%client-key engine :handshake :write) :handshake)
+                    (and (%client-key engine :initial :write) :initial))))
+         (when (and (not (server-connection-close-response-attempted-p
+                          server-connection))
+                    (null (server-connection-pending-datagrams
+                           server-connection))
+                    frame level
+                    (or (eq frame-type :connection-close)
+                        (and (eq frame-type :application-close)
+                             (eq level :1-rtt))))
+           (let ((packet (%client-build-packet engine level (list frame))))
+             (when packet
+               (setf (server-connection-close-response-attempted-p
+                      server-connection)
+                     t)
+               (connection-write connection packet)))))
+       (return-from %server-process-protected-datagram server-connection)))
+    (when (and (server-connection-handshake-complete-p server-connection)
+               (eq (getf (%client-layout bytes) :type) :initial))
+      (return-from %server-process-protected-datagram server-connection))
+    (let ((engine (server-connection-engine server-connection))
+          (at 0))
+      (loop while (< at (length bytes)) do
+        (let* ((slice (subseq bytes at))
+               (layout (%client-layout
+                        slice
+                        :short-header-dcid-length
+                        (length (server-connection-local-connection-id
+                                 server-connection))))
+               (type (getf layout :type)))
+          (unless (eq type :0-rtt)
+            (multiple-value-bind (level number header)
+                (handler-case
+                    (%client-unprotect-packet engine slice layout)
+                  (crypto-kit:aead-authentication-failure ()
+                    (values nil nil nil)))
+              (when header
+                (let* ((frames (decode-frames (packet-header-payload header)))
+                       (space (%client-level-space level)))
+                  (setf (quic-client-received-packets engine)
+                        (%client-set-level-value
+                         (quic-client-received-packets engine) level
+                         (cons number
+                               (%client-level-value
+                                (quic-client-received-packets engine) level))))
+                  (cl-quic-kit.recovery:on-packet-received
+                   (quic-client-recovery engine) space number
+                   :ack-eliciting-p (%client-ack-eliciting-p frames))
+                  (dolist (frame frames)
+                    (case (frame-type frame)
+                      (:crypto
+                       (%server-feed-crypto
+                        server-connection level
+                        (frame-field frame :offset 0)
+                        (frame-field frame :data #())))
+                      ((:ack :ack-ecn)
+                       (%client-handle-ack engine level frame))
+                      ((:connection-close :application-close)
+                       (connection-receive-frame connection frame :touch-p nil)))
+                    (when (member (connection-state connection)
+                                  '(:closing :draining :closed))
+                      (return-from %server-process-protected-datagram
+                        server-connection)))
+                  (connection-touch connection now)))))
+          (setf at (+ at (getf layout :end)))
+          (when (not (getf layout :long-p))
+            (return))))
+      server-connection)))
 (defun %server-flush-pending-datagrams (server-connection)
   (let ((remaining (server-connection-pending-datagrams server-connection)))
     (loop while remaining do
@@ -1099,14 +1210,28 @@
     (setf (server-connection-pending-datagrams server-connection) remaining))
   server-connection)
 (defun %server-poll-connections (server now)
-  (maphash
-   (lambda (connection-id server-connection)
-     (declare (ignore connection-id))
-     (setf (server-connection-now server-connection) now)
-     (%server-flush-pending-datagrams server-connection)
-     (client-poll (server-connection-engine server-connection) now)
-     (%server-flush-pending-datagrams server-connection))
-   (quic-server-connections server))
+  (dolist (server-connection (%server-routed-connections server))
+    (let ((connection (server-connection-connection server-connection)))
+      (setf (server-connection-now server-connection) now)
+      (connection-poll connection now)
+      (case (connection-state connection)
+        (:closed
+         (setf (server-connection-pending-datagrams server-connection) nil)
+         (%server-remove-connection-routes server-connection))
+        (:draining
+         (setf (server-connection-pending-datagrams server-connection) nil))
+        (:closing
+         (%server-flush-pending-datagrams server-connection))
+        (otherwise
+         (%server-flush-pending-datagrams server-connection)
+         (client-poll (server-connection-engine server-connection) now)
+         (case (connection-state connection)
+           ((:closed :draining)
+            (setf (server-connection-pending-datagrams server-connection) nil)
+            (when (eq (connection-state connection) :closed)
+              (%server-remove-connection-routes server-connection)))
+           (otherwise
+            (%server-flush-pending-datagrams server-connection)))))))
   server)
 (defun quic-server-accept-connection (server)
   "Return the next completed connection, or NIL when none is available."
