@@ -140,11 +140,28 @@ scalar to
 
 With the default nonblocking UDP socket, `cl-quic-kit:quic-server-poll` drains available datagrams,
 drives handshakes, and returns; call it from the application's event loop. It returns `NIL` while the server
-is open and true after it is closed. Call `cl-quic-kit:quic-server-close` to close the server immediately;
-it marks its connections closed, discards completed connections waiting in the accept queue, closes its owned
-UDP socket, and is safe to call repeatedly. After each poll,
-call `cl-quic-kit:quic-server-accept-connection` repeatedly until it returns `NIL`. Each call returns one
-handshake-complete `cl-quic-kit:quic-connection`, and each connection is returned once.
+is open and true after it is closed. `cl-quic-kit:quic-server-close` closes the server immediately: it attempts
+to send a protected CONNECTION_CLOSE for each active connection, clears routes and completed connections
+waiting in the accept queue, and closes its owned UDP socket. It completes cleanup even if sending or closing
+the socket fails, then re-signals the first error. Repeated calls are safe.
+
+After each poll, call `cl-quic-kit:quic-server-accept-connection` repeatedly until it returns `NIL`. Each call
+returns one handshake-complete `cl-quic-kit:quic-connection`, and each connection is returned once.
+
+For graceful shutdown, call `cl-quic-kit:quic-server-shutdown`. It stops admitting new connections while
+existing connections remain usable, so the application can finish work and close connections with
+`cl-quic-kit:quic-connection-close`. The default grace period is 30 seconds. The first call sets the shutdown
+deadline; repeated calls do not change it. Continue polling until `cl-quic-kit:quic-server-poll` returns true.
+The server closes sooner if all routed connections have ended, or at the deadline it attempts to send
+CONNECTION_CLOSE to remaining active connections and closes its socket.
+
+`cl-quic-kit:quic-connection-close` sends a protected CONNECTION_CLOSE and moves an active connection to
+closing. Its `:error-code` defaults to `:no-error` and accepts an integer from 0 through 2^62-1 or one of
+`:no-error`, `:internal-error`, `:frame-encoding-error`, `:transport-parameter-error`,
+`:protocol-violation`, `:connection-id-limit`, and `:application-error`. `:reason` may be `NIL`, a string,
+or an octet vector and is truncated to the QUIC reason limit. Repeated calls on a closing, draining, or closed
+connection do not send another close frame.
+
 A client that omits ALPN can complete the handshake without selecting a protocol, so an accepted connection
 can have no negotiated ALPN. Use `cl-quic-kit:quic-connection-alpn` to read the selected protocol; it returns
 `NIL` when none was selected.
@@ -173,15 +190,17 @@ stream data with available credit, then sends pending datagrams. For client conn
 `cl-quic-kit:quic-connection-flush` attempts to packetize queued writes and send resulting datagrams
 immediately. Data beyond current flow-control credit remains in the write queue; congestion control can leave
 frames queued, and a server's amplification limit can defer datagrams. Polling retries packetization and
-sending. Call flush between polls when an immediate send attempt is needed; otherwise, polling is sufficient.
+sending. Call flush between polls when an immediate send attempt is needed.
 A locally opened unidirectional stream is
 send-only, while a peer-initiated unidirectional stream is receive-only. Reading from a send-only stream or
 writing to a receive-only stream signals `cl-quic-kit:stream-id-error`.
 
 `:max-connections` counts handshaking and established connections. Closing and draining connections remain in
-the count until they reach `:closed` and their routes are removed. `:transport-parameters` accepts a keyword
-plist containing the six parameters shown above. The values in the constructor example are the defaults;
-omitted keys use them. Unknown keys signal an error. Each supplied value must be a non-negative QUIC varint.
+the count until they reach `:closed` and their routes are removed. `:max-handshakes` limits incomplete
+handshakes; it defaults to `:max-connections` and must be a positive integer no greater than that limit.
+`:transport-parameters` accepts a keyword plist containing the six parameters shown above. The values in the
+constructor example are the defaults; omitted keys use them. Unknown keys signal an error. Each supplied value
+must be a non-negative QUIC varint.
 
 ## Development
 

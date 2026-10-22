@@ -1012,6 +1012,10 @@
        (connection-receive-frame (quic-client-connection client) frame
                                  :touch-p touch-p))
       (:handshake-done
+       (unless (eq (quic-connection-role (quic-client-connection client))
+                  :client)
+         (error 'quic-frame-space-error
+                :message "HANDSHAKE_DONE is only valid for a client endpoint"))
        (unless (quic-client-closed-p client)
          (setf (quic-client-application-handshake-confirmed-p client) t)
          (connection-set-state (quic-client-connection client) :established))))

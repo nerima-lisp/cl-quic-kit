@@ -88,7 +88,9 @@
    #:quic-connection-open-stream
    #:quic-connection-read-stream
    #:quic-connection-write-stream
-   #:quic-connection-flush))
+   #:quic-connection-flush
+   #:quic-connection-close
+   #:quic-server-shutdown))
 
 (in-package #:cl-quic-kit)
 
