@@ -2092,3 +2092,314 @@
                  (when socket
                    (cl-quic-kit:udp-close socket)))
           (server-test-remove-temp-directory directory))))))
+(progn
+  (defun server-test-make-pending-alert-connection
+      (server address connection-id path now)
+    (let* ((remote-id #(21 22 23 24 25 26 27 28))
+           (server-connection
+             (cl-quic-kit::%make-server-connection
+              :server server :path path :address address :now now
+              :original-destination-connection-id connection-id
+              :local-connection-id connection-id
+              :remote-connection-id remote-id
+              :pending-datagrams nil))
+           (connection
+             (cl-quic-kit:make-quic-connection
+              :role :server :local-connection-id connection-id
+              :now-fn
+              (lambda ()
+                (cl-quic-kit::server-connection-now server-connection))
+              :idle-timeout 1
+              :io-write
+              (lambda (ignored bytes)
+                (declare (ignore ignored))
+                (cl-quic-kit::%server-engine-write server-connection bytes))))
+           (engine
+             (cl-quic-kit:make-quic-client
+              :connection connection :local-connection-id connection-id
+              :destination-connection-id remote-id
+              :disable-hostname-verification-p t
+              :now-fn
+              (lambda ()
+                (cl-quic-kit::server-connection-now server-connection)))))
+      (setf (cl-quic-kit::server-connection-connection server-connection)
+            connection
+            (cl-quic-kit::server-connection-engine server-connection)
+            engine)
+      (let ((initial
+              (cl-quic-kit.protection:derive-initial-secrets connection-id)))
+        (cl-quic-kit::%client-set-key engine :initial :write
+                                      (getf initial :server)))
+      (setf (gethash connection-id
+                     (cl-quic-kit::quic-server-connections server))
+            server-connection)
+      server-connection))
+
+  (defun server-test-tls-alert-close-waits-for-amplification-budget ()
+    (let* ((server-socket
+             (cl-quic-kit:make-udp-socket
+              :local-host "127.0.0.1" :local-port 0))
+           (server
+             (cl-quic-kit:make-quic-server
+              :udp-socket server-socket :max-connections 1
+              :retry-policy :never))
+           (peer
+             (cl-quic-kit:make-udp-socket
+              :remote-host "127.0.0.1"
+              :remote-port (cl-quic-kit:udp-socket-local-port server-socket)
+              :non-blocking-p t))
+           (address nil))
+      (unwind-protect
+           (progn
+             (cl-quic-kit:udp-send peer #(1))
+             (loop repeat 1000
+                   do (multiple-value-bind (bytes length source-address)
+                          (cl-quic-kit:udp-receive server-socket)
+                        (declare (ignore length))
+                        (when bytes
+                          (setf address source-address)))
+                   when address
+                     return
+                   do (sleep 0.001)
+                   finally (error "Did not receive the test peer datagram"))
+             (let* ((path
+                      (cl-quic-kit::%make-server-amplification-state
+                       :received 1200 :sent 3600))
+                    (connection-id #(1 2 3 4 5 6 7 8))
+                    (server-connection
+                      (server-test-make-pending-alert-connection
+                       server address connection-id path 1)))
+               (cl-quic-kit::%server-handle-tls-events
+                server-connection
+                (list (list :type :alert :description 47)))
+               (check
+                (and (cl-quic-kit::server-connection-pending-datagrams
+                      server-connection)
+                     (eq (gethash connection-id
+                                  (cl-quic-kit::quic-server-connections server))
+                         server-connection)
+                     (= (hash-table-count
+                         (cl-quic-kit::quic-server-connections server))
+                        1))
+                "TLS alert close remains routed while amplification blocks its output")
+               (check
+                (and (= (cl-quic-kit::server-amplification-state-sent path)
+                        (* 3 (cl-quic-kit::server-amplification-state-received path)))
+                     (null (server-test-receive peer t)))
+                "TLS alert close emits nothing beyond the three-times amplification limit")
+               (let ((pending
+                       (first
+                        (cl-quic-kit::server-connection-pending-datagrams
+                         server-connection))))
+                 (setf (cl-quic-kit::server-amplification-state-received path)
+                       1600)
+                 (cl-quic-kit:quic-server-poll server 2)
+                 (let ((response (server-test-receive peer t)))
+                   (check
+                    (and response
+                         (= (length response) (length pending))
+                         (= (cl-quic-kit::server-amplification-state-sent path)
+                            (+ 3600 (length pending)))
+                         (<= (cl-quic-kit::server-amplification-state-sent path)
+                             (* 3 (cl-quic-kit::server-amplification-state-received
+                                   path)))
+                         (null
+                          (cl-quic-kit::server-connection-pending-datagrams
+                           server-connection))
+                         (null (gethash connection-id
+                                        (cl-quic-kit::quic-server-connections
+                                         server))))
+                    "TLS alert close retries once budget allows and stays within the amplification limit")))
+               (let* ((expired-id #(31 32 33 34 35 36 37 38))
+                      (expired-path
+                        (cl-quic-kit::%make-server-amplification-state
+                         :received 1200 :sent 3600))
+                      (expired-connection
+                        (server-test-make-pending-alert-connection
+                         server address expired-id expired-path 3)))
+                 (cl-quic-kit::%server-handle-tls-events
+                  expired-connection
+                  (list (list :type :alert :description 47)))
+                 (let ((deadline
+                         (cl-quic-kit:connection-draining-deadline
+                          (cl-quic-kit::server-connection-connection
+                           expired-connection))))
+                   (cl-quic-kit:quic-server-poll server deadline)
+                   (check
+                    (and (eq (cl-quic-kit:connection-state
+                              (cl-quic-kit::server-connection-connection
+                               expired-connection))
+                             :closed)
+                         (null (gethash expired-id
+                                        (cl-quic-kit::quic-server-connections
+                                         server)))
+                         (zerop (hash-table-count
+                                 (cl-quic-kit::quic-server-connections server))))
+                    "TLS alert pending output is discarded when its close deadline expires"))))
+        (cl-quic-kit:udp-close peer)
+        (cl-quic-kit:quic-server-close server)))))
+
+  (defun server-test-retry-token-survives-capacity-rejection ()
+    (let ((cl-quic-kit::*quic-server-retry-cache-limit* 1)
+          (server-socket
+           (cl-quic-kit:make-udp-socket
+            :local-host "127.0.0.1" :local-port 0))
+          (server nil)
+          (first-client nil)
+          (second-client nil))
+      (unwind-protect
+          (progn
+            (setf server
+                  (cl-quic-kit:make-quic-server
+                   :udp-socket server-socket :max-connections 1
+                   :retry-policy :always)
+                  first-client
+                  (cl-quic-kit:make-quic-client
+                   :server-host "127.0.0.1"
+                   :server-port
+                   (cl-quic-kit:udp-socket-local-port server-socket)
+                   :hostname "localhost" :now-fn (lambda () 0)))
+            (multiple-value-bind (token record)
+                (server-test-issue-retry server first-client 0)
+              (let* ((connection-id #(91 92 93 94 95 96 97 98))
+                     (remote-id #(71 72 73 74 75 76 77 78))
+                     (dummy-connection
+                      (cl-quic-kit:make-quic-connection
+                       :role :server :local-connection-id connection-id
+                       :now-fn (lambda () 0)))
+                     (dummy-engine
+                      (cl-quic-kit:make-quic-client
+                       :connection dummy-connection
+                       :local-connection-id connection-id
+                       :destination-connection-id remote-id
+                       :disable-hostname-verification-p t
+                       :now-fn (lambda () 0)))
+                     (dummy
+                      (cl-quic-kit::%make-server-connection
+                       :server server :connection dummy-connection
+                       :engine dummy-engine
+                       :original-destination-connection-id
+                       #(81 82 83 84 85 86 87 88)
+                       :local-connection-id connection-id
+                       :remote-connection-id remote-id
+                       :pending-datagrams nil)))
+                (setf (gethash connection-id
+                               (cl-quic-kit::quic-server-connections server))
+                      dummy)
+                (progn
+                  (cl-quic-kit:client-poll first-client 0)
+                  (server-test-poll-until-datagram-received
+                   server server-socket nil 0))
+                (check
+                 (and
+                  (not (cl-quic-kit::server-retry-token-used-p record))
+                  (eq record
+                      (gethash token
+                               (cl-quic-kit::quic-server-retry-tokens server)))
+                  (eq dummy
+                      (gethash connection-id
+                               (cl-quic-kit::quic-server-connections server)))
+                  (= (hash-table-count
+                      (cl-quic-kit::quic-server-connections server))
+                     1))
+                 "a valid Retry token remains unused when connection capacity rejects it")
+                (setf second-client
+                      (cl-quic-kit:make-quic-client
+                       :server-host "127.0.0.1"
+                       :server-port
+                       (cl-quic-kit:udp-socket-local-port server-socket)
+                       :hostname "localhost" :now-fn (lambda () 0)))
+                (cl-quic-kit:client-poll second-client 0)
+                (server-test-poll-until-datagram-received
+                 server server-socket nil 0)
+                (let* ((response
+                        (server-test-receive
+                         (cl-quic-kit::quic-client-udp-socket second-client)
+                         t))
+                       (header
+                        (and response
+                             (cl-quic-kit:decode-packet-header response))))
+                  (check
+                   (and header
+                        (eq (cl-quic-kit:packet-header-type header) :retry)
+                        (null
+                         (gethash token
+                                  (cl-quic-kit::quic-server-retry-tokens server)))
+                        (= (hash-table-count
+                            (cl-quic-kit::quic-server-retry-tokens server))
+                           1))
+                   "a fresh Retry evicts the unconsumed rejected token at cache capacity")))))
+        (when first-client
+          (cl-quic-kit:client-close first-client))
+        (when second-client
+          (cl-quic-kit:client-close second-client))
+        (if server
+            (cl-quic-kit:quic-server-close server)
+          (cl-quic-kit:udp-close server-socket)))))
+
+  (defun server-test-terminal-connection-releases-capacity ()
+    (let* ((server-socket
+             (cl-quic-kit:make-udp-socket
+              :local-host "127.0.0.1" :local-port 0))
+           (server
+             (cl-quic-kit:make-quic-server
+              :udp-socket server-socket :max-connections 1
+              :retry-policy :never))
+           (connection-id #(41 42 43 44 45 46 47 48))
+           (alias-id #(51 52 53 54 55 56 57 58))
+           (remote-id #(61 62 63 64 65 66 67 68))
+           (connection
+             (cl-quic-kit:make-quic-connection
+              :role :server :local-connection-id connection-id
+              :now-fn (lambda () 5)))
+           (engine
+             (cl-quic-kit:make-quic-client
+              :connection connection :local-connection-id connection-id
+              :destination-connection-id remote-id
+              :disable-hostname-verification-p t :now-fn (lambda () 5)))
+           (server-connection
+             (cl-quic-kit::%make-server-connection
+              :server server :connection connection :engine engine
+              :original-destination-connection-id #(11 12 13 14 15 16 17 18)
+              :local-connection-id connection-id
+              :remote-connection-id remote-id :pending-datagrams nil)))
+      (unwind-protect
+           (progn
+             (cl-quic-kit:connection-set-state connection :draining)
+             (setf (cl-quic-kit::quic-connection-draining-deadline connection) 5
+                   (gethash connection-id
+                            (cl-quic-kit::quic-server-connections server))
+                   server-connection
+                   (gethash alias-id
+                            (cl-quic-kit::quic-server-connections server))
+                   server-connection)
+             (cl-quic-kit:quic-server-poll server 5)
+             (check
+              (and (eq (cl-quic-kit:connection-state connection) :closed)
+                   (zerop (hash-table-count
+                           (cl-quic-kit::quic-server-connections server)))
+                   (null (gethash connection-id
+                                  (cl-quic-kit::quic-server-connections server)))
+                   (null (gethash alias-id
+                                  (cl-quic-kit::quic-server-connections server))))
+              "terminal connection polling removes every CID alias from capacity")
+             (let ((packet
+                     (server-test-initial-packet
+                      cl-quic-kit:*quic-version-1*
+                      #(101 102 103 104 105 106 107 108)
+                      #(111 112 113 114 115 116 117 118))))
+               (cl-quic-kit::%server-handle-datagram
+                server packet :peer 1200 6)
+               (check
+                (and (= (hash-table-count
+                         (cl-quic-kit::quic-server-connections server))
+                        1)
+                     (loop for active being the hash-values
+                             of (cl-quic-kit::quic-server-connections server)
+                           thereis (cl-quic-kit::server-connection-p active)))
+                "a new Initial is admitted after terminal connection cleanup")))
+        (cl-quic-kit:quic-server-close server))))
+
+  (server-test-tls-alert-close-waits-for-amplification-budget)
+  (server-test-retry-token-survives-capacity-rejection)
+  (server-test-terminal-connection-releases-capacity))

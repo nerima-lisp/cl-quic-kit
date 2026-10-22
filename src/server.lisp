@@ -489,9 +489,6 @@
            (t
             (%server-send-invalid-token server header nil path address))))
         ((eq status :valid)
-         (when path
-           (setf (server-amplification-state-validated-p path) t
-                 (server-retry-token-used-p record) t))
          (%server-start-or-feed-initial server header path address record bytes now))
         (t
          (%server-send-invalid-token
@@ -607,13 +604,43 @@
     (clrhash (quic-server-paths server))
     (udp-close (quic-server-udp-socket server)))
   t)
-(defstruct (server-connection
-            (:constructor %make-server-connection))
-  server connection engine tls-boundary tls-driver path address now
-  original-destination-connection-id local-connection-id
-  remote-connection-id cipher-suite transport-parameters
-  peer-transport-parameters pending-datagrams
-  (handshake-complete-p nil) (accepted-p nil))
+(progn
+  (defstruct (server-connection
+              (:constructor %make-server-connection))
+    server connection engine tls-boundary tls-driver path address now
+    original-destination-connection-id local-connection-id
+    remote-connection-id cipher-suite transport-parameters
+    peer-transport-parameters pending-datagrams
+    (handshake-complete-p nil) (accepted-p nil))
+
+  (defun %server-routed-connections (server)
+    (let ((seen (make-hash-table :test #'eq))
+          (connections nil))
+      (maphash
+       (lambda (connection-id server-connection)
+         (declare (ignore connection-id))
+         (unless (gethash server-connection seen)
+           (setf (gethash server-connection seen) t)
+           (push server-connection connections)))
+       (quic-server-connections server))
+      (nreverse connections)))
+
+  (defun %server-connection-count (server)
+    (length (%server-routed-connections server)))
+
+  (defun %server-remove-connection-routes (server-connection)
+    (let* ((routes
+             (quic-server-connections
+              (server-connection-server server-connection)))
+           (connection-ids nil))
+      (maphash
+       (lambda (connection-id candidate)
+         (when (eq candidate server-connection)
+           (push connection-id connection-ids)))
+       routes)
+      (dolist (connection-id connection-ids)
+        (remhash connection-id routes))
+      server-connection)))
 (defun %server-new-connection-id (server forbidden-cid)
   (loop repeat 4
         for candidate = (%server-random-octets 8 :connection-id)
@@ -896,9 +923,6 @@
                      (%quic-real-time))
                  *quic-server-retry-token-retention*)
               *quic-server-path-cache-limit*)
-             (remhash (server-connection-local-connection-id server-connection)
-                      (quic-server-connections
-                       (server-connection-server server-connection)))
              (return-from %server-handle-tls-events server-connection)))
           (:handshake-complete
            (%server-complete-connection server-connection))
@@ -1027,11 +1051,15 @@
                      (equalp address
                              (server-connection-address existing)))
              (or existing
-                 (when (< (hash-table-count (quic-server-connections server))
+                 (when (< (%server-connection-count server)
                           (quic-server-max-connections server))
                    (%server-create-connection
                     server header path address record now))))))
     (when server-connection
+      (when record
+        (when path
+          (setf (server-amplification-state-validated-p path) t))
+        (setf (server-retry-token-used-p record) t))
       (%server-process-protected-datagram server-connection bytes now)))
   server)
 (defun %server-process-protected-datagram (server-connection bytes now)
@@ -1099,14 +1127,23 @@
     (setf (server-connection-pending-datagrams server-connection) remaining))
   server-connection)
 (defun %server-poll-connections (server now)
-  (maphash
-   (lambda (connection-id server-connection)
-     (declare (ignore connection-id))
-     (setf (server-connection-now server-connection) now)
-     (%server-flush-pending-datagrams server-connection)
-     (client-poll (server-connection-engine server-connection) now)
-     (%server-flush-pending-datagrams server-connection))
-   (quic-server-connections server))
+  (dolist (server-connection (%server-routed-connections server))
+    (let ((connection (server-connection-connection server-connection)))
+      (setf (server-connection-now server-connection) now)
+      (connection-poll connection now)
+      (if (eq (connection-state connection) :closed)
+          (setf (server-connection-pending-datagrams server-connection) nil)
+          (progn
+            (%server-flush-pending-datagrams server-connection)
+            (client-poll (server-connection-engine server-connection) now)
+            (if (eq (connection-state connection) :closed)
+                (setf (server-connection-pending-datagrams server-connection) nil)
+                (%server-flush-pending-datagrams server-connection))))
+      (when (or (eq (connection-state connection) :closed)
+                (and (eq (connection-state connection) :closing)
+                     (null
+                      (server-connection-pending-datagrams server-connection))))
+        (%server-remove-connection-routes server-connection))))
   server)
 (defun quic-server-accept-connection (server)
   "Return the next completed connection, or NIL when none is available."
