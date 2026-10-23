@@ -151,6 +151,55 @@
       (cl-quic-kit:flow-control-error () (setf rejected t)))
     (stream-flow-check rejected
                        "conflicting retransmission is rejected after data is read")))
+(let* ((flow (cl-quic-kit:make-flow-control-state :max-data 16))
+       (stream (cl-quic-kit:make-stream 0 :local-initiator :client
+                                        :flow-control flow))
+       (sparse-stream (cl-quic-kit:make-stream 0 :local-initiator :client)))
+  (cl-quic-kit:stream-receive-data stream 0 (octets 1 2 3 4))
+  (multiple-value-bind (data fin) (cl-quic-kit:stream-read stream 2)
+    (stream-flow-check (and (equalp data (octets 1 2)) (not fin))
+                       "partial reads preserve the unread stream payload"))
+  (cl-quic-kit::stream-release-consumed-data stream)
+  (let ((segments (cl-quic-kit::stream-received-segments stream)))
+    (stream-flow-check
+     (and (= (length segments) 1)
+          (= (caar segments) 2)
+          (equalp (cdar segments) (octets 3 4)))
+     "consumed payload is released while unread overlap data remains"))
+  (let ((rejected nil))
+    (handler-case
+        (cl-quic-kit:stream-receive-data stream 0 (octets 9 2 9 4))
+      (cl-quic-kit:flow-control-error () (setf rejected t)))
+    (stream-flow-check rejected
+                       "conflicting overlap is rejected in unread payload"))
+  (cl-quic-kit:stream-receive-data stream 0 (octets 9 2 3 4))
+  (stream-flow-check
+   (and (equalp (cl-quic-kit::stream-read-buffer stream) (octets 3 4))
+        (= (cl-quic-kit:flow-control-connection-received flow) 4)
+        (equal (cl-quic-kit::stream-receive-ranges stream)
+               (list (cons 0 4))))
+   "a consumed duplicate uses offset ranges without replacing unread data")
+  (cl-quic-kit:stream-receive-data stream 4 (octets 5) :fin t)
+  (stream-flow-check (= (cl-quic-kit::stream-receive-final-size stream) 5)
+                     "final size can extend a released receive range")
+  (let ((rejected nil))
+    (handler-case
+        (cl-quic-kit:stream-receive-data stream 5 (octets 6))
+      (cl-quic-kit:flow-control-error () (setf rejected t)))
+    (stream-flow-check rejected
+                       "data beyond final size remains rejected"))
+  (cl-quic-kit:stream-receive-data sparse-stream 0 (octets 1 2))
+  (cl-quic-kit:stream-receive-data sparse-stream 4 (octets 5 6))
+  (multiple-value-bind (data fin) (cl-quic-kit:stream-read sparse-stream)
+    (stream-flow-check (and (equalp data (octets 1 2)) (not fin))
+                       "contiguous bytes can be read before a sparse range"))
+  (cl-quic-kit::stream-release-consumed-data sparse-stream)
+  (let ((rejected nil))
+    (handler-case
+        (cl-quic-kit:stream-receive-data sparse-stream 2 (octets 3) :fin t)
+      (cl-quic-kit:flow-control-error () (setf rejected t)))
+    (stream-flow-check rejected
+                       "FIN below a sparse range remains rejected after payload release")))
 
 (let ((stream (cl-quic-kit:make-stream 0 :local-initiator :client)))
   (cl-quic-kit:stream-receive-data stream 3 (octets 4 5))
