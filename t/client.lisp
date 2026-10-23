@@ -20,6 +20,70 @@
                   (= (cl-quic-kit:frame-field frame :stream-id) 0)
                   (equalp (cl-quic-kit:frame-field frame :data) payload))
              "client stream writes are encoded through the injected connection I/O"))))
+(let* ((client (cl-quic-kit:make-quic-client
+                :connection (cl-quic-kit:make-quic-connection)
+                :disable-hostname-verification-p t))
+       (flow (cl-quic-kit::quic-client-flow-control client))
+       (window-size 4096)
+       (window-count 40)
+       (payload (make-array window-size :element-type '(unsigned-byte 8)
+                            :initial-element 42))
+       (conflicting-payload
+         (make-array window-size :element-type '(unsigned-byte 8)
+                     :initial-element 43))
+       (initial-connection-limit
+         (cl-quic-kit:flow-control-connection-receive-limit flow))
+       (stream nil))
+  (dotimes (window window-count)
+    (let* ((offset (* window window-size))
+           (end (+ offset window-size))
+           (last-window (= window (1- window-count))))
+      (cl-quic-kit:client-receive-frame
+       client (cl-quic-kit:make-frame :stream :stream-id 1 :offset offset
+                                      :data payload)
+       :level :1-rtt)
+      (unless stream
+        (setf stream (gethash 1 (cl-quic-kit::quic-client-streams client))))
+      (check
+       (and (= (loop for segment in (cl-quic-kit::stream-received-segments stream)
+                     sum (length (cdr segment)))
+               window-size)
+            (= (cl-quic-kit:stream-readable-bytes stream) window-size))
+       "unread client stream payload remains buffered")
+      (multiple-value-bind (data fin)
+          (cl-quic-kit:client-read-stream client stream)
+        (check (and (equalp data payload) (not fin))
+               "client reads return the received stream window"))
+      (check (and (null (cl-quic-kit::stream-received-segments stream))
+                  (null (cl-quic-kit::stream-segments stream))
+                  (zerop (cl-quic-kit:stream-readable-bytes stream)))
+             "client reads release consumed payload after credit regrant")
+      (let ((received-before
+              (cl-quic-kit:flow-control-connection-received flow)))
+        (cl-quic-kit:client-receive-frame
+         client (cl-quic-kit:make-frame :stream :stream-id 1 :offset offset
+                                        :data conflicting-payload
+                                        :fin last-window)
+         :level :1-rtt)
+        (check (= (cl-quic-kit:flow-control-connection-received flow)
+                  received-before)
+               "consumed duplicate ranges do not consume connection credit again"))
+      (check (and (null (cl-quic-kit::stream-received-segments stream))
+                  (equal (cl-quic-kit::stream-receive-ranges stream)
+                         (list (cons 0 end))))
+             "released payload remains accounted by receive ranges")
+      (when last-window
+        (check (= (cl-quic-kit::stream-receive-final-size stream) end)
+               "final size remains valid after consumed payload is released"))))
+  (check (= (cl-quic-kit:flow-control-connection-receive-limit flow)
+            (+ initial-connection-limit (* window-size window-count)))
+         "client reads regrant connection receive credit for returned bytes")
+  (check (= (cl-quic-kit::stream-receive-max-offset stream)
+            (+ (* window-size window-count) 65536))
+         "client reads regrant stream receive credit")
+  (check (= (cl-quic-kit:flow-control-connection-received flow)
+            (* window-size window-count))
+         "conflicting consumed duplicates are counted only once"))
 
 (let* ((connection (cl-quic-kit:make-quic-connection))
        (client (cl-quic-kit:make-quic-client

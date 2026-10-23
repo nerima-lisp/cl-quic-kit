@@ -1239,6 +1239,7 @@
         (flow-control-update-max-receive-data flow connection-maximum)
         (%client-queue-frame
          client (make-frame :max-data :maximum connection-maximum) :1-rtt))
+      (stream-release-consumed-data stream)
       (values data fin))))
 
 (defun client-accept-peer-stream (client &key (type :any))
