@@ -55,17 +55,19 @@
                               (retry-policy :always)
                               transport-parameters tls-server-options)
   "Bind a QUIC UDP listener. The server takes ownership of UDP-SOCKET when supplied."
-  (check-type max-connections (integer 1 *))
-  (check-type max-handshakes (integer 1 *))
+  (cl-quic-kit::%check-type-redacted max-connections (integer 1 *) :invalid-max-connections)
+  (cl-quic-kit::%check-type-redacted max-handshakes (integer 1 *) :invalid-max-handshakes)
   (unless (<= max-handshakes max-connections)
     (error 'type-error :datum :invalid-handshake-limit
            :expected-type `(integer 1 ,max-connections)))
-  (check-type retry-policy (member :always :never))
+  (cl-quic-kit::%check-type-redacted retry-policy (member :always :never) :invalid-retry-policy)
   (unless udp-socket
-    (check-type local-address string)
-    (check-type local-port (integer 0 65535)))
+    (cl-quic-kit::%check-type-redacted local-address string :invalid-local-address)
+    (cl-quic-kit::%check-type-redacted local-port (integer 0 65535) :invalid-local-port))
   (when (and udp-socket (not (udp-socket-p udp-socket)))
-    (error 'type-error :datum udp-socket :expected-type 'udp-socket))
+    (error 'type-error
+           :datum :invalid-udp-socket
+           :expected-type 'udp-socket))
   (let ((socket (or udp-socket
                     (make-udp-socket :local-host local-address
                                      :local-port local-port))))
@@ -1419,15 +1421,17 @@
     engine))
 (defun quic-connection-accept-stream (connection &key (type :any))
   (unless (member type '(:any :bidirectional :unidirectional))
-    (error 'type-error :datum type
+    (error 'type-error
+           :datum :invalid-peer-stream-type
            :expected-type '(member :any :bidirectional :unidirectional)))
   (let ((engine (%quic-connection-stream-engine connection)))
     (if (member (connection-state connection) '(:closing :draining :closed))
         nil
-        (client-accept-peer-stream engine :type type))))
+      (client-accept-peer-stream engine :type type))))
 (defun quic-connection-open-stream (connection &key (type :bidirectional))
   (unless (member type '(:bidirectional :unidirectional))
-    (error 'type-error :datum type
+    (error 'type-error
+           :datum :invalid-stream-type
            :expected-type '(member :bidirectional :unidirectional)))
   (let ((engine (%quic-connection-stream-engine connection)))
     (when (member (connection-state connection) '(:closing :draining :closed))
@@ -1459,12 +1463,11 @@
                    (<= 0 wire-code)
                    (< wire-code (ash 1 62)))
         (error 'type-error
-               :datum error-code
-               :expected-type
-               `(or (integer 0 ,(1- (ash 1 62)))
-                    (member :no-error :internal-error :frame-encoding-error
-                            :transport-parameter-error :protocol-violation
-                            :connection-id-limit :application-error))))
+               :datum :invalid-close-error-code
+               :expected-type `(or (integer 0 ,(1- (ash 1 62)))
+                                   (member :no-error :internal-error :frame-encoding-error
+                                           :transport-parameter-error :protocol-violation
+                                           :connection-id-limit :application-error))))
       wire-code))
 
   (defun %quic-close-reason (reason)
@@ -1479,15 +1482,15 @@
      ((and (arrayp reason)
            (= (array-rank reason) 1)
            (nth-value 0
-             (subtypep (array-element-type reason) '(unsigned-byte 8))))
+                      (subtypep (array-element-type reason) '(unsigned-byte 8))))
       (%connection-reason-octets
        (make-array (length reason)
                    :element-type '(unsigned-byte 8)
                    :initial-contents reason)))
      (t
-      (error 'type-error :datum reason
-             :expected-type
-             '(or null string (array (unsigned-byte 8) (*)) (vector t 0))))))
+      (error 'type-error
+             :datum :invalid-close-reason
+             :expected-type '(or null string (array (unsigned-byte 8) (*)) (vector t 0))))))
 
   (defun quic-connection-close (connection &key (error-code :no-error) reason)
     "Queue a protected CONNECTION_CLOSE frame and return true."
@@ -1515,7 +1518,7 @@
   (defun quic-server-shutdown (server &key (grace-period 30)
                                       (error-code :no-error) reason)
     "Stop admitting new connections and close SERVER after draining or GRACE-PERIOD."
-    (check-type grace-period (real 0 *))
+    (cl-quic-kit::%check-type-redacted grace-period (real 0 *) :invalid-grace-period)
     (%quic-close-error-code error-code)
     (let ((reason-octets (%quic-close-reason reason)))
       (unless (or (quic-server-shutdown-deadline server)

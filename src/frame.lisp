@@ -4,14 +4,34 @@
 (defun make-frame (type &rest fields) (%make-frame type fields))
 (defun frame-field (frame key &optional default) (getf (frame-fields frame) key default))
 
-(defparameter *frame-type-codes*
-  '((:padding . 0) (:ping . 1) (:ack . 2) (:ack-ecn . 3) (:reset-stream . 4)
+(defparameter *frame-type-codes* '((:padding . 0) (:ping . 1) (:ack . 2) (:ack-ecn . 3) (:reset-stream . 4)
     (:stop-sending . 5) (:crypto . 6) (:new-token . 7) (:max-data . 16)
     (:max-stream-data . 17) (:max-streams-bidi . 18) (:max-streams-uni . 19)
     (:data-blocked . 20) (:stream-data-blocked . 21) (:streams-blocked-bidi . 22)
     (:streams-blocked-uni . 23) (:new-connection-id . 24) (:retire-connection-id . 25)
     (:path-challenge . 26) (:path-response . 27) (:connection-close . 28)
     (:application-close . 29) (:handshake-done . 30) (:datagram . 49)))
+(defmethod print-object ((object frame) output)
+  (print-unreadable-object (object output :type t :identity nil)
+                           (let ((type (frame-type object)))
+                             (format output "type ~A"
+                                     (or (and (eq type :stream) :stream)
+                                         (and (assoc type *frame-type-codes*) type)
+                                         (car (rassoc type *frame-type-codes*))
+                                         :unknown))
+                             (dolist (key '(:token :data :reason :connection-id
+                                                   :stateless-reset-token))
+                               (let ((value (getf (frame-fields object) key)))
+                                 (when value
+                                   (let ((payload-length
+                                          (cond
+                                           ((stringp value) (length value))
+                                           ((and (arrayp value) (= (array-rank value) 1))
+                                            (length value)))))
+                                     (when payload-length
+                                       (format output " ~A-length ~D"
+                                               (string-downcase (symbol-name key))
+                                               payload-length)))))))))
 
 (defun %frame-error (message) (error 'quic-encoding-error :message message))
 (defun %empty-octets () (make-array 0 :element-type '(unsigned-byte 8)))

@@ -251,9 +251,9 @@ for ChaCha20, and constant-time-equal receives two octet vectors."
   (apply #'apply-header-protection arguments))
 
 (defun reconstruct-packet-number (truncated-packet-number packet-number-length
-                                  largest-received-packet-number)
+                                                          largest-received-packet-number)
   "Reconstruct a full packet number as specified by RFC 9000 Appendix A."
-  (check-type packet-number-length (integer 1 4))
+  (cl-quic-kit::%check-type-redacted packet-number-length (integer 1 4) :invalid-packet-number-length)
   (unless (and (integerp truncated-packet-number)
                (<= 0 truncated-packet-number))
     (error "Truncated packet number must be a non-negative integer: ~S"

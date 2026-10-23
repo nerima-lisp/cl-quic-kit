@@ -1209,7 +1209,9 @@
            :message "Cannot write to a stream that is not registered with the client"))
   (unless (and (arrayp octets) (= (array-rank octets) 1)
                (subtypep (array-element-type octets) '(unsigned-byte 8)))
-    (error 'type-error :datum octets :expected-type '(vector (unsigned-byte 8))))
+    (error 'type-error
+           :datum :invalid-stream-data
+           :expected-type '(vector (unsigned-byte 8))))
   (%client-write-stream-available client stream octets fin-p))
 
 (defun client-stream-write-pending-p (client stream)
@@ -1248,7 +1250,8 @@
 
 (defun client-accept-peer-stream (client &key (type :any))
   (unless (member type '(:any :bidirectional :unidirectional))
-    (error 'type-error :datum type
+    (error 'type-error
+           :datum :invalid-peer-stream-type
            :expected-type '(member :any :bidirectional :unidirectional)))
   (unless (quic-client-closed-p client)
     (let ((streams nil)
