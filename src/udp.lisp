@@ -9,17 +9,19 @@
 
 (defun %udp-octets (value)
   (unless (typep value '(simple-array (unsigned-byte 8) (*)))
-    (error 'type-error :datum value
+    (error 'type-error
+           :datum :invalid-udp-data
            :expected-type '(simple-array (unsigned-byte 8) (*))))
   value)
 
 (defun %udp-address (host)
   (cond
-    ((null host) #(0 0 0 0))
-    ((stringp host) (sb-bsd-sockets:make-inet-address host))
-    ((and (vectorp host) (= (length host) 4)) host)
-    (t (error 'type-error :datum host
-              :expected-type '(or null string (vector (unsigned-byte 8)))))))
+   ((null host) #(0 0 0 0))
+   ((stringp host) (sb-bsd-sockets:make-inet-address host))
+   ((and (vectorp host) (= (length host) 4)) host)
+   (t (error 'type-error
+             :datum :invalid-udp-address
+             :expected-type '(or null string (vector (unsigned-byte 8)))))))
 
 (defun make-udp-socket (&key (local-host "0.0.0.0") (local-port 0)
                               remote-host remote-port (non-blocking-p t))

@@ -60,7 +60,7 @@
     state))
 
 (defun recovery-space (state name)
-  (check-type name (member :initial :handshake :application))
+  (cl-quic-kit::%check-type-redacted name (member :initial :handshake :application) :invalid-recovery-space)
   (%space state name))
 
 (defun reset-packet-number-space (state space-name)

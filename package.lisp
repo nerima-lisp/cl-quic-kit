@@ -149,3 +149,21 @@ RFC 9000 permits connection IDs from zero through twenty octets."
     (if (and symbol (fboundp symbol))
         (symbol-function symbol)
         (error 'crypto-unavailable :operation operation))))
+(defmacro %check-type-redacted (place typespec datum)
+  (let ((value (gensym "VALUE"))
+        (expected-type (gensym "EXPECTED-TYPE")))
+    `(let ((,expected-type (quote ,typespec)))
+       (loop for ,value = ,place
+             until (typep ,value ,expected-type)
+             do (restart-case
+                 (error (make-condition
+                         (find-class (quote type-error))
+                         :datum ,datum
+                         :expected-type ,expected-type))
+                 (store-value (new-value)
+                              :report "Supply a replacement value."
+                              :interactive (lambda ()
+                                             (format *query-io* "Supply a replacement value: ")
+                                             (finish-output *query-io*)
+                                             (list (eval (read *query-io*))))
+                              (setf ,place new-value)))))))

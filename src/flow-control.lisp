@@ -44,7 +44,9 @@
 (defun %non-negative-integer (value name)
   (declare (ignore name))
   (unless (and (integerp value) (<= 0 value))
-    (error 'type-error :datum value :expected-type `(integer 0)))
+    (error 'type-error
+           :datum :invalid-non-negative-integer
+           :expected-type `(integer 0)))
   value)
 
 (defun %raise-limit (limit attempted)

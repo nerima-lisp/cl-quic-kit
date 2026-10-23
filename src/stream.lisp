@@ -13,7 +13,9 @@
 (defun %stream-octets (data)
   (unless (and (arrayp data) (= (array-rank data) 1)
                (subtypep (array-element-type data) '(unsigned-byte 8)))
-    (error 'type-error :datum data :expected-type '(vector (unsigned-byte 8))))
+    (error 'type-error
+           :datum :invalid-stream-data
+           :expected-type '(vector (unsigned-byte 8))))
   data)
 
 (defun %copy-octets (data start end)
@@ -49,11 +51,13 @@
   flow-control)
 
 (defun make-stream (id &key (local-initiator :client) flow-control
-                              max-send-data max-receive-data)
+                       max-send-data max-receive-data)
   (let ((direction (stream-id-direction id))
         (initiator (stream-id-initiator id)))
     (unless (member local-initiator '(:client :server))
-      (error 'type-error :datum local-initiator :expected-type '(member :client :server)))
+      (error 'type-error
+             :datum :invalid-stream-initiator
+             :expected-type '(member :client :server)))
     (when max-send-data (%non-negative-integer max-send-data :max-send-data))
     (when max-receive-data (%non-negative-integer max-receive-data :max-receive-data))
     (when (and max-send-data (> max-send-data *quic-max-offset*))
@@ -61,7 +65,9 @@
     (when (and max-receive-data (> max-receive-data *quic-max-offset*))
       (error 'flow-control-error))
     (when (and flow-control (not (typep flow-control 'flow-control-state)))
-      (error 'type-error :datum flow-control :expected-type 'flow-control-state))
+      (error 'type-error
+             :datum :invalid-flow-control-state
+             :expected-type 'flow-control-state))
     (%make-stream :id id :direction direction :initiator initiator
                   :local-p (eq initiator local-initiator)
                   :send-max-offset (or max-send-data *quic-max-offset*)
@@ -394,3 +400,14 @@
            (and (stream-receive-final-size stream)
                 (= (stream-receive-offset stream)
                    (stream-receive-final-size stream))))))
+(defmethod print-object ((object stream) output)
+  (print-unreadable-object (object output :type t :identity nil)
+                           (let ((buffered-payload-length
+                                  (+ (length (stream-read-buffer object))
+                                     (loop for segment in (stream-segments object)
+                                           sum (length (cdr segment)))))
+                                 (retained-payload-length
+                                  (loop for segment in (stream-received-segments object)
+                                        sum (length (cdr segment)))))
+                             (format output "buffered-payload-length ~D retained-payload-length ~D"
+                                     buffered-payload-length retained-payload-length))))

@@ -3930,6 +3930,223 @@
       (check (and condition
                   (eq (type-error-datum condition) :invalid-handshake-limit))
              "server admission type errors use a stable classification")))
+  (progn
+  (defun server-test-f7-secret-redaction ()
+    (let* ((marker "PRIVATE-MARKER-QUIC-REDACTION")
+           (input (list marker))
+           (streams (make-hash-table))
+           (client (cl-quic-kit::%make-quic-client
+                    :streams streams :clock (lambda () 0)))
+           (stream (cl-quic-kit:make-stream 0))
+           (token-frame (cl-quic-kit:make-frame :new-token :token marker))
+           (crypto-frame
+            (cl-quic-kit:make-frame :crypto :offset 0
+                                    :data (map '(vector (unsigned-byte 8))
+                                               #'char-code marker)))
+           (receive-stream (cl-quic-kit:make-stream 1)))
+      (setf (gethash 0 streams) stream)
+      (cl-quic-kit:stream-receive-data
+       receive-stream 0
+       (cl-quic-kit:frame-field crypto-frame :data))
+      (check (equal marker (cl-quic-kit:frame-field token-frame :token))
+             "printer test stores the marker in a NEW_TOKEN frame")
+      (check (equalp (cl-quic-kit:frame-field crypto-frame :data)
+                     (cl-quic-kit::stream-read-buffer receive-stream))
+             "printer test stores the marker bytes in a CRYPTO frame and received stream")
+      (let ((token-report (princ-to-string token-frame))
+            (crypto-report (princ-to-string crypto-frame))
+            (stream-report (princ-to-string receive-stream)))
+        (check (and (not (search marker token-report))
+                    (not (search "#(" token-report))
+                    (search (format nil "token-length ~D" (length marker))
+                            token-report))
+               "frame printer exposes only NEW_TOKEN length metadata")
+        (check (and
+                (not (search marker crypto-report))
+                (not (search (format nil "~{~D~^ ~}"
+                                     (coerce (cl-quic-kit:frame-field crypto-frame :data)
+                                             (quote list)))
+                             crypto-report))
+                (not (search "#(" crypto-report))
+                (search (format nil "data-length ~D"
+                                (length (cl-quic-kit:frame-field crypto-frame :data)))
+                        crypto-report))
+               "frame printer redacts CRYPTO payload bytes and reports their length")
+        (progn
+          (check (and
+                  (not (search marker stream-report))
+                  (not (search (format nil "~{~D~^ ~}"
+                                       (coerce (cl-quic-kit:frame-field crypto-frame :data)
+                                               (quote list)))
+                               stream-report))
+                  (not (search "#(" stream-report))
+                  (search (format nil "buffered-payload-length ~D retained-payload-length ~D"
+                                  (length (cl-quic-kit::stream-read-buffer receive-stream))
+                                  (loop for segment in (cl-quic-kit::stream-received-segments receive-stream)
+                                        sum (length (cdr segment))))
+                          stream-report))
+                 "stream printer redacts received data and reports buffered length")
+          (let* ((payload (map (quote (vector (unsigned-byte 8))) (function char-code) marker))
+                 (secret-report (format nil "~{~D~^ ~}" (coerce payload (quote list))))
+                 (reason-frame (cl-quic-kit:make-frame :connection-close :reason payload))
+                 (connection-id-frame
+                  (cl-quic-kit:make-frame :new-connection-id
+                                          :connection-id payload
+                                          :stateless-reset-token payload)))
+            (check (and (equalp payload (cl-quic-kit:frame-field reason-frame :reason))
+                        (equalp payload (cl-quic-kit:frame-field connection-id-frame :connection-id))
+                        (equalp payload (cl-quic-kit:frame-field connection-id-frame :stateless-reset-token)))
+                   "printer test stores marker bytes in CONNECTION_CLOSE and NEW_CONNECTION_ID frames")
+            (let ((reason-report (princ-to-string reason-frame))
+                  (connection-id-report (princ-to-string connection-id-frame)))
+              (check (and (not (search marker reason-report))
+                          (not (search secret-report reason-report))
+                          (not (search "#(" reason-report))
+                          (search (format nil "reason-length ~D" (length payload)) reason-report))
+                     "frame printer redacts CONNECTION_CLOSE reason bytes and reports their length")
+              (check (and (not (search marker connection-id-report))
+                          (not (search secret-report connection-id-report))
+                          (not (search "#(" connection-id-report))
+                          (search (format nil "connection-id-length ~D" (length payload)) connection-id-report)
+                          (search (format nil "stateless-reset-token-length ~D" (length payload)) connection-id-report))
+                     "frame printer redacts connection ID and reset token bytes")))
+          (let* ((payload (map (quote (vector (unsigned-byte 8))) (function char-code) marker))
+                 (out-of-order-stream (cl-quic-kit:make-stream 3)))
+            (cl-quic-kit:stream-receive-data out-of-order-stream 5 payload)
+            (check (equalp payload (cdr (first (cl-quic-kit::stream-segments out-of-order-stream))))
+                   "printer test stores bytes in an out-of-order stream segment")
+            (let ((report (princ-to-string out-of-order-stream)))
+              (check (and
+                      (not (search marker report))
+                      (not (search (format nil "~{~D~^ ~}" (coerce payload (quote list))) report))
+                      (not (search "#(" report))
+                      (search (format nil "buffered-payload-length ~D" (length payload)) report))
+                     "stream printer redacts out-of-order segment bytes and reports their length")))))
+      (labels ((redacted-type-error-p (action classification)
+                                      (handler-case
+                                          (progn (funcall action) nil)
+                                        (type-error (condition)
+                                                    (and (eq (type-error-datum condition) classification)
+                                                         (not (search marker (princ-to-string condition))))))))
+        (check (redacted-type-error-p
+                (lambda () (cl-quic-kit::%stream-octets input))
+                :invalid-stream-data)
+               "stream octet type errors redact caller input")
+        (check (redacted-type-error-p
+                (lambda () (cl-quic-kit::%udp-octets input))
+                :invalid-udp-data)
+               "UDP octet type errors redact caller input")
+        (check (redacted-type-error-p
+                (lambda () (cl-quic-kit::%quic-close-reason input))
+                :invalid-close-reason)
+               "close reason type errors redact caller input")
+        (check (redacted-type-error-p
+                (lambda ()
+                  (cl-quic-kit:client-write-stream client stream input))
+                :invalid-stream-data)
+               "client stream write type errors redact caller input")
+        (check (redacted-type-error-p
+                (lambda ()
+                  (cl-quic-kit:client-accept-peer-stream client :type input))
+                :invalid-peer-stream-type)
+               "client peer stream selection type errors redact caller input")
+        (check (redacted-type-error-p
+                (lambda () (cl-quic-kit::%non-negative-integer input :limit))
+                :invalid-non-negative-integer)
+               "flow-control integer type errors redact caller input")
+        (check (redacted-type-error-p
+                (lambda ()
+                  (cl-quic-kit:make-quic-server
+                   :udp-socket input :max-connections 1 :max-handshakes 1))
+                :invalid-udp-socket)
+               "server UDP socket type errors redact caller input")
+        (check (redacted-type-error-p
+                (lambda ()
+                  (cl-quic-kit:quic-connection-accept-stream nil :type input))
+                :invalid-peer-stream-type)
+               "connection accept stream type errors redact caller input")
+        (check (redacted-type-error-p
+                (lambda ()
+                  (cl-quic-kit:quic-connection-open-stream nil :type input))
+                :invalid-stream-type)
+               "connection open stream type errors redact caller input")
+        (check (redacted-type-error-p
+                (lambda () (cl-quic-kit::%quic-close-error-code input))
+                :invalid-close-error-code)
+               "close error code type errors redact caller input")
+        (check (redacted-type-error-p
+                (lambda ()
+                  (cl-quic-kit:make-stream 0 :local-initiator input))
+                :invalid-stream-initiator)
+               "stream initiator type errors redact caller input")
+        (check (redacted-type-error-p
+                (lambda ()
+                  (cl-quic-kit:make-stream 0 :flow-control input))
+                :invalid-flow-control-state)
+               "stream flow-control type errors redact caller input")
+        (check (redacted-type-error-p
+                (lambda () (cl-quic-kit::%udp-address input))
+                :invalid-udp-address)
+               "UDP address type errors redact caller input")
+        (check (redacted-type-error-p
+                (lambda ()
+                  (cl-quic-kit.protection:reconstruct-packet-number 0 input -1))
+                :invalid-packet-number-length)
+               "packet number length type errors redact caller input")
+        (check (redacted-type-error-p
+                (lambda ()
+                  (cl-quic-kit.recovery:recovery-space nil input))
+                :invalid-recovery-space)
+               "recovery space type errors redact caller input")
+        (check (redacted-type-error-p
+                (lambda ()
+                  (cl-quic-kit:make-quic-server
+                   :max-connections input :max-handshakes 1))
+                :invalid-max-connections)
+               "max-connections type errors redact caller input")
+        (check (redacted-type-error-p
+                (lambda ()
+                  (cl-quic-kit:make-quic-server
+                   :max-connections 1 :max-handshakes input))
+                :invalid-max-handshakes)
+               "max-handshakes type errors redact caller input")
+        (check (redacted-type-error-p
+                (lambda ()
+                  (cl-quic-kit:make-quic-server
+                   :max-connections 1 :max-handshakes 1 :retry-policy input))
+                :invalid-retry-policy)
+               "retry policy type errors redact caller input")
+        (check (redacted-type-error-p
+                (lambda ()
+                  (cl-quic-kit:make-quic-server
+                   :max-connections 1 :max-handshakes 1 :local-address input))
+                :invalid-local-address)
+               "local address type errors redact caller input")
+        (check (redacted-type-error-p
+                (lambda ()
+                  (cl-quic-kit:make-quic-server
+                   :max-connections 1 :max-handshakes 1 :local-port input))
+                :invalid-local-port)
+               "local port type errors redact caller input")
+        (progn
+          (check (redacted-type-error-p
+                  (lambda ()
+                    (cl-quic-kit:quic-server-shutdown nil :grace-period input))
+                  :invalid-grace-period)
+                 "shutdown grace period type errors redact caller input")
+          (let ((result nil))
+            (handler-bind ((type-error
+                            (lambda (condition)
+                              (when (eq (type-error-datum condition)
+                                        :invalid-packet-number-length)
+                                (invoke-restart
+                                 (find-restart (quote store-value) condition)
+                                 1)))))
+              (setf result
+                    (cl-quic-kit.protection:reconstruct-packet-number 0 input -1)))
+            (check (eql result 0)
+                   "redacted type checks retain the store-value restart"))))))
+  (server-test-f7-secret-redaction))
   (server-test-server-close-send-failure-cleans-up))
 #+linux (progn
   (defun server-test-server-close-completes-after-linux-syscall-error ()
