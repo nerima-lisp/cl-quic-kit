@@ -65,13 +65,20 @@ stream. Its second argument is currently unused. Pass the returned stream to
   from the client and does not enqueue FIN. It drops writes waiting for flow control.
   STREAM frames already queued remain queued and may be sent by a later
   `(cl-quic-kit:client-poll client)` call.
+- `cl-quic-kit:client-receive-frames (client level packet-number frames)` applies the complete decoded
+  `frames` list from one packet. The caller passes that packet's `level` (`:initial`, `:handshake`, `:0-rtt`,
+  or `:1-rtt`) and `packet-number` for the whole list. A separate call with the same packet number is recorded
+  again for ACK processing and its frames are processed again. Use it when a custom transport has decoded
+  packet frames and needs to preserve their packet number. For full datagrams, use
+  `cl-quic-kit:client-receive-datagram`.
 - `cl-quic-kit:client-receive-frame (client frame &key (level :initial))` applies an already-decoded frame
-  directly to a client. Each call reuses packet number 0, so use it for frame-level tests rather than
-  processing traffic. Obtain a frame with `cl-quic-kit:decode-frame` or construct one with
+  directly to a client with packet number 0. The `:level` keyword selects the encryption level for
+  frame-permission checks and defaults to `:initial`; pass `:level :1-rtt` for stream or flow-control frames.
+  Use it for frame-level tests; call
+  `cl-quic-kit:client-receive-frames` when the packet number matters. Obtain a frame with
+  `cl-quic-kit:decode-frame` or construct one with
   `cl-quic-kit:make-frame`. Normal clients should call `cl-quic-kit:client-poll`, which receives UDP
-  datagrams and decodes their packets and frames; custom transports can pass full datagrams to
-  `cl-quic-kit:client-receive-datagram`. `:level` selects the encryption level for frame-permission checks and defaults to `:initial`;
-  pass `:level :1-rtt` for stream or flow-control frames.
+  datagrams and decodes their packets and frames.
 - `cl-quic-kit:quic-connection-closed-reason (connection)` returns the peer's recorded `CONNECTION_CLOSE`
   reason as octets. It is `NIL` if no peer reason was recorded, and `#()` if the recorded reason is empty.
   For a client, read it with

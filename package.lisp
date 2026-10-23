@@ -90,7 +90,7 @@
    #:quic-connection-write-stream
    #:quic-connection-flush
    #:quic-connection-close
-   #:quic-server-shutdown))
+   #:quic-server-shutdown #:client-receive-frames))
 
 (in-package #:cl-quic-kit)
 
