@@ -12,6 +12,9 @@
   paths transport-parameters tls-server-options connections accepted-connections
   (shutdown-deadline nil) (shutdown-error-code :no-error) (shutdown-reason #())
   closed-p)
+(defmethod print-object ((server quic-server) stream)
+  (print-unreadable-object (server stream :type t)
+    (write-string "redacted" stream)))
 
 (defstruct (server-amplification-state
             (:constructor %make-server-amplification-state
@@ -27,6 +30,9 @@
   address original-destination-connection-id retry-source-connection-id
   client-source-connection-id expires-at retain-until used-p
   next-packet-number)
+(defmethod print-object ((token server-retry-token) stream)
+  (print-unreadable-object (token stream :type t)
+    (write-string "redacted" stream)))
 
 (defun %server-random-octets (length &optional (operation :retry-token))
   (let ((random (%client-function "CRYPTO-KIT" "RANDOM-OCTETS")))
@@ -52,7 +58,7 @@
   (check-type max-connections (integer 1 *))
   (check-type max-handshakes (integer 1 *))
   (unless (<= max-handshakes max-connections)
-    (error 'type-error :datum max-handshakes
+    (error 'type-error :datum :invalid-handshake-limit
            :expected-type `(integer 1 ,max-connections)))
   (check-type retry-policy (member :always :never))
   (unless udp-socket
@@ -755,6 +761,9 @@
     remote-connection-id cipher-suite transport-parameters
     peer-transport-parameters pending-datagrams
     (handshake-complete-p nil) (accepted-p nil) (close-response-attempted-p nil))
+  (defmethod print-object ((server-connection server-connection) stream)
+  (print-unreadable-object (server-connection stream :type t)
+    (write-string "redacted" stream)))
 
   (defun %server-routed-connections (server)
     (let ((seen (make-hash-table :test #'eq))
@@ -822,14 +831,14 @@
   (let ((length (and (listp plist) (list-length plist)))
         (keys nil))
     (unless (and (or (null plist) length) (evenp (or length 0)))
-      (error 'type-error :datum plist :expected-type 'list))
+      (error 'type-error :datum :invalid-server-options :expected-type 'list))
     (loop for tail on plist by #'cddr
           for key = (car tail)
           do (unless (keywordp key)
-               (error 'type-error :datum key :expected-type 'keyword))
-             (when (member key keys)
-               (error 'quic-error :message "Duplicate server option"))
-             (push key keys))
+               (error 'type-error :datum :invalid-server-option-key :expected-type 'keyword))
+          (when (member key keys)
+            (error 'quic-error :message "Duplicate server option"))
+          (push key keys))
     (copy-list plist)))
 (defun %server-normalize-transport-parameters (parameters)
   (let* ((options (%server-copy-plist parameters))

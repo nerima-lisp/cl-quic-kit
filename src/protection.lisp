@@ -54,7 +54,7 @@ for ChaCha20, and constant-time-equal receives two octet vectors."
 (defun %protection-octets (value name)
   (declare (ignore name))
   (unless (typep value '(simple-array (unsigned-byte 8) (*)))
-    (error 'type-error :datum value
+    (error 'type-error :datum :invalid-octet-vector
            :expected-type '(simple-array (unsigned-byte 8) (*))))
   value)
 
@@ -104,6 +104,9 @@ for ChaCha20, and constant-time-equal receives two octet vectors."
 
 (defstruct (key-set (:constructor %make-key-set (key iv hp cipher)))
   key iv hp cipher)
+(defmethod print-object ((key-set key-set) stream)
+  (print-unreadable-object (key-set stream :type t)
+    (write-string "redacted" stream)))
 
 (defun %normalize-cipher (cipher)
   (case cipher

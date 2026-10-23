@@ -30,6 +30,9 @@
   closed-error closed-reason close-kind close-frame draining-deadline
   stream-engine
   (alpn nil))
+(defmethod print-object ((connection quic-connection) stream)
+  (print-unreadable-object (connection stream :type t)
+    (write-string "redacted" stream)))
 
 (defun connection-state (connection)
   (quic-connection-state connection))

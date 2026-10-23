@@ -597,3 +597,42 @@
       (contract-check (null (cl-quic-kit:client-accept-peer-stream client))
                       "closed clients return NIL for queued peer streams"))
     (format t "client public API contract: ~D checks~%" checks)))
+(let* ((secret (make-array 12 :element-type '(unsigned-byte 8)
+                            :initial-contents '(83 69 67 82 69 84 45 68 85 77 77 89)))
+       (secret-report (format nil "~{~D~^ ~}" (coerce secret 'list)))
+       (header (cl-quic-kit:make-packet-header
+                :destination-connection-id secret
+                :source-connection-id secret
+                :token secret
+                :payload secret
+                :retry-integrity-tag secret))
+       (key-set (cl-quic-kit.protection::%make-key-set
+                 secret secret secret :aes-128-gcm))
+       (connection (cl-quic-kit:make-quic-connection
+                    :local-connection-id secret))
+       (client (cl-quic-kit::%make-quic-client
+                :connection connection
+                :retry-token secret
+                :application-read-secret secret
+                :application-write-secret secret)))
+  (setf (cl-quic-kit::quic-connection-stream-engine connection) client)
+  (labels ((check-redacted (object description)
+             (let ((report (princ-to-string object)))
+               (check (and (search "redacted" report)
+                           (not (search secret-report report)))
+                      description))))
+    (check-redacted header "packet header printer redacts octet fields")
+    (check-redacted key-set "protection key-set printer redacts key bytes")
+    (check-redacted client "QUIC client printer redacts secret state")
+    (check-redacted connection "connection printer redacts secret state")
+    (check-redacted (list client connection)
+                    "client/connection cycle prints without exposing secret state"))
+  (let ((condition nil))
+    (handler-case
+        (cl-quic-kit.protection::%protection-octets (list :secret secret) "secret")
+      (type-error (caught) (setf condition caught)))
+    (let ((report (and condition (princ-to-string condition))))
+      (check (and condition
+                  (eq (type-error-datum condition) :invalid-octet-vector)
+                  (not (search secret-report report)))
+             "type errors retain a safe octet classification datum"))))

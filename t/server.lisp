@@ -3882,6 +3882,54 @@
       (run-case (function cl-quic-kit:quic-server-close) "repeated close")
       (run-case (function cl-quic-kit:quic-server-poll) "poll")))
   (server-test-server-close-retries-incomplete-close))
+  (let* ((secret (make-array 12 :element-type t
+                             :initial-contents #(83 69 67 82 69 84 45 68 85 77 77 89)))
+         (secret-report (format nil "~{~D~^ ~}" (coerce secret 'list)))
+         (server (cl-quic-kit::%make-quic-server
+                  :tls-server-options (list :private-key secret)))
+         (retry-token
+          (cl-quic-kit::%make-server-retry-token
+           :retry-source-connection-id secret))
+         (server-connection
+          (cl-quic-kit::%make-server-connection :server server)))
+    (labels ((safe-print-p (object)
+                           (let ((report (princ-to-string object)))
+                             (and (search "redacted" report)
+                                  (not (search secret-report report))))))
+      (check (safe-print-p server)
+             "server printer redacts private TLS options")
+      (check (safe-print-p retry-token)
+             "Retry token record printer redacts connection identifiers")
+      (check (safe-print-p server-connection)
+             "server connection printer redacts TLS state"))
+    (let ((condition nil))
+      (handler-case
+          (cl-quic-kit::%server-copy-plist
+           (list :private-key secret :orphan))
+        (type-error (caught) (setf condition caught)))
+      (progn
+        (let ((report (and condition (princ-to-string condition))))
+          (check (and condition
+                      (eq (type-error-datum condition) :invalid-server-options)
+                      (not (search secret-report report)))
+                 "malformed server options use a safe datum"))
+        (let ((condition nil))
+          (handler-case
+              (cl-quic-kit::%server-copy-plist (list secret :value))
+            (type-error (caught) (setf condition caught)))
+          (let ((report (and condition (princ-to-string condition))))
+            (check (and condition
+                        (eq (type-error-datum condition) :invalid-server-option-key)
+                        (not (search secret-report report)))
+                   "invalid server option keys use safe type-error data")))))
+    (let ((condition nil))
+      (handler-case
+          (cl-quic-kit:make-quic-server
+           :max-connections 1 :max-handshakes 2)
+        (type-error (caught) (setf condition caught)))
+      (check (and condition
+                  (eq (type-error-datum condition) :invalid-handshake-limit))
+             "server admission type errors use a stable classification")))
   (server-test-server-close-send-failure-cleans-up))
 #+linux (progn
   (defun server-test-server-close-completes-after-linux-syscall-error ()
