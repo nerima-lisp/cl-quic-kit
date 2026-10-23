@@ -24,6 +24,10 @@
   transport-parameters tls-key-exchange tls-provider tls-trust-anchors
   tls-verify-signature tls-signature-algorithms client-hello-wire)
 
+(defmethod print-object ((client quic-client) stream)
+  (print-unreadable-object (client stream :type t)
+    (write-string "redacted" stream)))
+
 (declaim (ftype function client-tls-feed client-receive-datagram
                         client-flush %client-find-or-create-peer-stream
                         %client-write-stream-available

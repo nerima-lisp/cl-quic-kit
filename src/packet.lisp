@@ -29,6 +29,9 @@
   (reserved-bits 0)
   (key-phase nil)
   (retry-integrity-tag #()))
+(defmethod print-object ((header packet-header) stream)
+  (print-unreadable-object (header stream :type t)
+    (write-string "redacted" stream)))
 
 (defun %octet-vector (value)
   (cond
