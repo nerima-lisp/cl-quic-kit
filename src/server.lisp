@@ -653,7 +653,9 @@
 (defun quic-server-poll (server &optional at)
   "Process available UDP datagrams and return true when SERVER is closed."
   (when (quic-server-closed-p server)
-    (return-from quic-server-poll t))
+    (progn
+      (udp-close (quic-server-udp-socket server))
+      (return-from quic-server-poll t)))
   (let ((now (or at (%quic-real-time))))
     (%server-prune-expired-state server now)
     (dolist (server-connection (%server-routed-connections server))
@@ -695,8 +697,8 @@
 (defun quic-server-close (server &key (error-code :no-error) reason)
   "Send best-effort connection closes, then close SERVER and its UDP socket."
   (%quic-close-error-code error-code)
-  (let ((reason-octets (%quic-close-reason reason)))
-    (unless (quic-server-closed-p server)
+  (let ((reason-octets (%quic-close-reason reason)) (already-closed-p (quic-server-closed-p server)))
+    (unless already-closed-p
       (let ((connections (%server-routed-connections server))
             (first-error nil))
         (labels ((remember-error (condition)
@@ -741,7 +743,10 @@
             (if (typep first-error 'quic-error)
                 (error first-error)
                 (error 'quic-error :message (princ-to-string first-error)))))))
-  t))
+  t
+  (if already-closed-p
+      (udp-close (quic-server-udp-socket server))
+      t)))
 (progn
   (defstruct (server-connection
               (:constructor %make-server-connection))

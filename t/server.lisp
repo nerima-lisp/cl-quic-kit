@@ -3816,4 +3816,112 @@
         (unless (cl-quic-kit::udp-socket-closed-p socket)
           (cl-quic-kit:udp-close socket)))))
 
+  (defun server-test-server-close-retries-incomplete-close ()
+    (labels ((run-case (retry-function label)
+               (let* ((socket
+                        (cl-quic-kit:make-udp-socket
+                         :local-host "127.0.0.1" :local-port 0))
+                      (server
+                        (cl-quic-kit:make-quic-server
+                         :udp-socket socket :max-connections 1
+                         :retry-policy :never))
+                      (close-symbol (find-symbol "SOCKET-CLOSE" "SB-BSD-SOCKETS"))
+                      (original-close (symbol-function close-symbol))
+                      (injected-p nil)
+                      (close-attempts 0)
+                      (real-close-count 0))
+                 (unwind-protect
+                      (progn
+                        (setf (symbol-function close-symbol)
+                              (lambda (candidate-socket &key abort)
+                                (if (eq candidate-socket
+                                        (cl-quic-kit::udp-socket-socket socket))
+                                    (progn
+                                      (incf close-attempts)
+                                      (if injected-p
+                                          (progn
+                                            (incf real-close-count)
+                                            (funcall original-close candidate-socket
+                                                     :abort abort))
+                                          (progn
+                                            (setf injected-p t)
+                                            (error "injected pre-syscall close failure"))))
+                                    (funcall original-close candidate-socket
+                                             :abort abort))))
+                        (let ((close-error-p
+                                (handler-case
+                                    (progn
+                                      (cl-quic-kit:quic-server-close server)
+                                      nil)
+                                  (cl-quic-kit:quic-error () t))))
+                          (check
+                           (and close-error-p injected-p
+                                (cl-quic-kit::quic-server-closed-p server)
+                                (cl-quic-kit::udp-socket-closed-p socket)
+                                (not (cl-quic-kit::udp-socket-close-complete-p socket))
+                                (= close-attempts 1)
+                                (zerop real-close-count))
+                           (format nil "server close records a pre-syscall failure before ~A retry"
+                                   label))
+                          (check
+                           (and (funcall retry-function server)
+                                (cl-quic-kit::udp-socket-close-complete-p socket)
+                                (= close-attempts 2)
+                                (= real-close-count 1))
+                           (format nil "~A retries the incomplete UDP descriptor close" label))
+                          (let ((attempts-after-close close-attempts))
+                            (check
+                             (and (cl-quic-kit:quic-server-close server)
+                                  (= close-attempts attempts-after-close)
+                                  (= real-close-count 1))
+                             (format nil "confirmed UDP descriptor close is idempotent after ~A"
+                                     label))))
+                   (setf (symbol-function close-symbol) original-close)
+                   (unless (cl-quic-kit::udp-socket-close-complete-p socket)
+                     (ignore-errors (cl-quic-kit:quic-server-close server)))))))
+      (run-case (function cl-quic-kit:quic-server-close) "repeated close")
+      (run-case (function cl-quic-kit:quic-server-poll) "poll")))
+  (server-test-server-close-retries-incomplete-close))
   (server-test-server-close-send-failure-cleans-up))
+#+linux (progn
+  (defun server-test-server-close-completes-after-linux-syscall-error ()
+    (let* ((socket
+             (cl-quic-kit:make-udp-socket
+              :local-host "127.0.0.1" :local-port 0))
+           (server
+             (cl-quic-kit:make-quic-server
+              :udp-socket socket :max-connections 1 :retry-policy :never))
+           (close-symbol (find-symbol "SOCKET-CLOSE" "SB-BSD-SOCKETS"))
+           (original-close (symbol-function close-symbol))
+           (close-attempts 0))
+      (unwind-protect
+           (progn
+             (setf (symbol-function close-symbol)
+                   (lambda (candidate-socket &key abort)
+                     (if (eq candidate-socket
+                             (cl-quic-kit::udp-socket-socket socket))
+                         (progn
+                           (incf close-attempts)
+                           (funcall original-close candidate-socket :abort abort)
+                           (sb-bsd-sockets:socket-error "close" 5))
+                         (funcall original-close candidate-socket :abort abort))))
+             (check
+              (handler-case
+                  (progn
+                    (cl-quic-kit:quic-server-close server)
+                    nil)
+                (cl-quic-kit:quic-error () t))
+              "server close reports a Linux close error")
+             (check
+              (and (cl-quic-kit::udp-socket-close-complete-p socket)
+                   (= close-attempts 1))
+              "Linux close error records the released descriptor")
+             (let ((attempts-after-close close-attempts))
+               (check
+                (and (cl-quic-kit:quic-server-close server)
+                     (= close-attempts attempts-after-close))
+                "server close does not retry a released Linux descriptor")))
+        (setf (symbol-function close-symbol) original-close)
+        (unless (cl-quic-kit::udp-socket-close-complete-p socket)
+          (ignore-errors (cl-quic-kit:quic-server-close server))))))
+  (server-test-server-close-completes-after-linux-syscall-error))

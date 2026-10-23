@@ -4,7 +4,8 @@
   (require :sb-bsd-sockets))
 
 (defstruct (udp-socket (:constructor %make-udp-socket))
-  socket peer-address peer-port non-blocking-p closed-p)
+  socket peer-address peer-port non-blocking-p
+  (closed-p nil) (close-complete-p nil) close-error)
 
 (defun %udp-octets (value)
   (unless (typep value '(simple-array (unsigned-byte 8) (*)))
@@ -97,8 +98,23 @@ SIZE is bounded to a valid UDP receive buffer size."
           (error condition)))))
 
 (defun udp-close (socket)
-  "Close SOCKET exactly once and return T."
-  (unless (udp-socket-closed-p socket)
-    (setf (udp-socket-closed-p socket) t)
-    (sb-bsd-sockets:socket-close (udp-socket-socket socket)))
+  "Mark SOCKET closed and close its descriptor when the result is known."
+  (setf (udp-socket-closed-p socket) t)
+  (unless (udp-socket-close-complete-p socket)
+    (handler-case
+        (progn
+          (sb-bsd-sockets:socket-close (udp-socket-socket socket))
+          (setf (udp-socket-close-complete-p socket) t))
+      (sb-bsd-sockets:socket-error (condition)
+        #+linux
+        (progn
+          ;; Linux releases the descriptor before reporting close errors.
+          (setf (udp-socket-close-complete-p socket) t)
+          (sb-ext:cancel-finalization (udp-socket-socket socket))
+          (error condition))
+        #-linux
+        (progn
+          (setf (udp-socket-close-error socket) condition)
+          (sb-ext:cancel-finalization (udp-socket-socket socket))
+          (error condition)))))
   t)
