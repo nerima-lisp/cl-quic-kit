@@ -596,7 +596,49 @@
       (cl-quic-kit:client-close client :reason "client shutdown")
       (contract-check (null (cl-quic-kit:client-accept-peer-stream client))
                       "closed clients return NIL for queued peer streams"))
-    (format t "client public API contract: ~D checks~%" checks)))
+    (let* ((distinct-client (cl-quic-kit:make-quic-client
+                             :connection (cl-quic-kit:make-quic-connection)
+                             :disable-hostname-verification-p t))
+           (duplicate-client (cl-quic-kit:make-quic-client
+                              :connection (cl-quic-kit:make-quic-connection)
+                              :disable-hostname-verification-p t)))
+      (cl-quic-kit:client-receive-frames
+       distinct-client :initial 17 (list (cl-quic-kit:make-frame :padding)))
+      (cl-quic-kit:client-receive-frames
+       distinct-client :initial 19 (list (cl-quic-kit:make-frame :padding)))
+      (contract-check
+       (equal (list 19 17)
+              (cdr (assoc :initial
+                          (cl-quic-kit::quic-client-received-packets distinct-client))))
+       "batch receive records caller-supplied packet numbers")
+      (cl-quic-kit:client-receive-frames
+       duplicate-client :1-rtt 7
+       (list (cl-quic-kit:make-frame
+              :stream :stream-id 1 :data (cl-quic-kit:encode-varint 1) :fin t)
+             (cl-quic-kit:make-frame
+              :stream :stream-id 5 :data (cl-quic-kit:encode-varint 2) :fin t)))
+      (cl-quic-kit:client-receive-frames
+       duplicate-client :1-rtt 7
+       (list (cl-quic-kit:make-frame
+              :stream :stream-id 9 :data (cl-quic-kit:encode-varint 3) :fin t)))
+      (contract-check
+       (and (equal (list 7 7)
+                   (cdr (assoc :1-rtt
+                               (cl-quic-kit::quic-client-received-packets duplicate-client))))
+            (gethash 1 (cl-quic-kit::quic-client-streams duplicate-client))
+            (gethash 5 (cl-quic-kit::quic-client-streams duplicate-client))
+            (gethash 9 (cl-quic-kit::quic-client-streams duplicate-client)))
+       "batch receive reprocesses frames with a repeated packet number")
+      (contract-check
+       (handler-case
+           (progn
+             (cl-quic-kit:client-receive-frames
+              distinct-client :invalid 23
+              (list (cl-quic-kit:make-frame :padding)))
+             nil)
+         (cl-quic-kit::quic-frame-space-error () t))
+       "batch receive retains the frame-space error for an invalid level")
+      (format t "client public API contract: ~D checks~%" checks))))
 (let* ((secret (make-array 12 :element-type '(unsigned-byte 8)
                             :initial-contents '(83 69 67 82 69 84 45 68 85 77 77 89)))
        (secret-report (format nil "~{~D~^ ~}" (coerce secret 'list)))
