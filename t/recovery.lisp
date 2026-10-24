@@ -179,4 +179,65 @@
   (recovery-check (= (cl-quic-kit.recovery:recovery-state-cwnd state) 12000)
                   "PTO does not reduce the congestion window"))
 
-(format t "~D recovery tests passed.~%" *recovery-tests-run*)
+(progn
+  (let ((state (cl-quic-kit.recovery:make-recovery-state :clock (lambda () 0)))
+        (expected-rtt nil)
+        (expected-variance nil))
+    (dotimes (index 4000)
+      (let ((sample (+ 1/1000 (/ (mod index 7) 1000000))))
+        (cl-quic-kit.recovery::%rtt-update state sample 0 index)
+        (if expected-rtt
+            (setf expected-variance
+                  (+ (* 3/4 expected-variance)
+                     (* 1/4 (abs (- expected-rtt sample))))
+                  expected-rtt (+ (* 7/8 expected-rtt) (* 1/8 sample)))
+            (setf expected-rtt sample
+                  expected-variance (/ sample 2)))
+        (let ((rtt (cl-quic-kit.recovery:recovery-state-smoothed-rtt state))
+              (variance (cl-quic-kit.recovery:recovery-state-rtt-variance state)))
+          (recovery-check
+           (and (rationalp rtt) (rationalp variance)
+                (<= (denominator rtt) 1000000000)
+                (<= (denominator variance) 1000000000))
+           "repeated rational RTT samples retain bounded precision")
+          (recovery-check (< (abs (- rtt expected-rtt)) 4/1000000000)
+                          "bounded RTT smoothing stays within accumulated rounding error")
+          (recovery-check (< (abs (- variance expected-variance)) 6/1000000000)
+                          "bounded RTT variance stays within accumulated rounding error")))))
+
+  (let ((state (cl-quic-kit.recovery:make-recovery-state :clock (lambda () 0))))
+    (cl-quic-kit.recovery::%rtt-update state 1/3 0 0)
+    (recovery-check
+     (and (<= (denominator
+               (cl-quic-kit.recovery:recovery-state-smoothed-rtt state))
+              1000000000)
+          (<= (denominator
+               (cl-quic-kit.recovery:recovery-state-rtt-variance state))
+              1000000000))
+     "first rational sample bounds both stored estimates")
+    (recovery-check
+     (and (= (cl-quic-kit.recovery:recovery-state-latest-rtt state) 1/3)
+          (= (cl-quic-kit.recovery:recovery-state-min-rtt state) 1/3))
+     "rounding does not change raw latest and minimum samples"))
+
+  (dolist (type '(single-float double-float))
+    (let ((state (cl-quic-kit.recovery:make-recovery-state :clock (lambda () 0)))
+          (expected-rtt nil)
+          (expected-variance nil))
+      (dotimes (index 40)
+        (let ((sample (coerce (+ 1/1000 (/ (mod index 7) 1000000)) type)))
+          (cl-quic-kit.recovery::%rtt-update state sample 0 index)
+          (if expected-rtt
+              (setf expected-variance
+                    (+ (* 3/4 expected-variance)
+                       (* 1/4 (abs (- expected-rtt sample))))
+                    expected-rtt (+ (* 7/8 expected-rtt) (* 1/8 sample)))
+              (setf expected-rtt sample expected-variance (/ sample 2)))
+          (recovery-check
+           (and (eql expected-rtt
+                     (cl-quic-kit.recovery:recovery-state-smoothed-rtt state))
+                (eql expected-variance
+                     (cl-quic-kit.recovery:recovery-state-rtt-variance state)))
+           "floating-point RTT values and types retain the original recurrence")))))
+
+  (format t "~D recovery tests passed.~%" *recovery-tests-run*))
