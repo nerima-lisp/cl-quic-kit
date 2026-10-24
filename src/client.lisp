@@ -1662,7 +1662,16 @@
     (connection-poll (quic-client-connection client) now)))
 
 (defun client-close (client &key (error-code :no-error) reason)
-  (%client-protocol-close
-   client (if (integerp error-code) error-code (%connection-error-code error-code)) reason)
-  (when (quic-client-udp-socket client) (udp-close (quic-client-udp-socket client)))
+  (let ((primary-error nil))
+    (unwind-protect
+         (handler-case
+             (%client-protocol-close
+              client (if (integerp error-code) error-code (%connection-error-code error-code)) reason)
+           (error (condition)
+             (setf primary-error condition)
+             (error condition)))
+      (when (quic-client-udp-socket client)
+        (handler-case (udp-close (quic-client-udp-socket client))
+          (error (condition)
+            (unless primary-error (error condition)))))))
   t)
