@@ -678,9 +678,8 @@
                   (eq (type-error-datum condition) :invalid-octet-vector)
                   (not (search secret-report report)))
              "type errors retain a safe octet classification datum"))))
+(eval-when (:compile-toplevel :load-toplevel :execute) (require :sb-posix))
 (progn
-  (require :sb-posix)
-
   (defun client-close-fd-open-p (descriptor)
     (handler-case
         (progn (sb-posix:fcntl descriptor sb-posix:f-getfd) t)
