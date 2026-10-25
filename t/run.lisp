@@ -826,5 +826,7 @@
 (load (test-path "t/recovery.lisp"))
 (load (test-path "t/stream-flow-control.lisp"))
 (load (test-path "t/client.lisp"))
-(load (test-path "t/codec.lisp"))
+(progn
+  (load (test-path "t/codec.lisp"))
+  (load (test-path "t/packet-reserved-contracts.lisp")))
 (format t "~D tests passed.~%" *tests-run*)

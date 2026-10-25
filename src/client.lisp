@@ -676,18 +676,24 @@
                   (crypto-kit:aead-authentication-failure ()
                     (%client-authentication-failed client selected-key)
                     (return-from %client-unprotect-packet nil)))))
-          (when next-read-secret
-            (%client-commit-application-read-key-update
-             client next-read-secret next-read-key number)
-            (%client-rotate-application-write-key
-             client :force-p t :update-read-p nil))
+          (progn
+            (when (plusp
+                   (ldb (byte 2 (if (getf layout :long-p) 2 3)) first))
+              (%client-protocol-close
+               client #xa "non-zero QUIC reserved bits")
+              (return-from %client-unprotect-packet nil))
+            (when next-read-secret
+              (%client-commit-application-read-key-update
+               client next-read-secret next-read-key number)
+              (%client-rotate-application-write-key
+               client :force-p t :update-read-p nil)))
           (values level number
                   (make-packet-header
                    :type type :version (getf layout :version)
                    :destination-connection-id (getf layout :dcid)
                    :source-connection-id (getf layout :scid)
                    :packet-number number :packet-number-length pn-length
-                   :reserved-bits (ldb (byte 2 2) first)
+                   :reserved-bits (ldb (byte 2 (if (getf layout :long-p) 2 3)) first)
                    :key-phase key-phase
                    :payload plaintext)))))))
 
