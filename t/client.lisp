@@ -20,6 +20,35 @@
                   (= (cl-quic-kit:frame-field frame :stream-id) 0)
                   (equalp (cl-quic-kit:frame-field frame :data) payload))
              "client stream writes are encoded through the injected connection I/O"))))
+(check
+ (let* ((writes nil)
+        (local (make-array 8 :element-type '(unsigned-byte 8)
+                           :initial-element 1))
+        (destination (make-array 8 :element-type '(unsigned-byte 8)
+                                :initial-element 2))
+        (connection
+          (cl-quic-kit:make-quic-connection
+           :io-write (lambda (ignored bytes)
+                       (declare (ignore ignored))
+                       (push bytes writes))))
+        (client
+          (cl-quic-kit:make-quic-client
+           :connection connection
+           :local-connection-id local
+           :destination-connection-id destination
+           :disable-hostname-verification-p t))
+        (packet
+          (cl-quic-kit:encode-packet-header
+           (cl-quic-kit:make-packet-header
+            :type :initial :version cl-quic-kit:*quic-version-1*
+            :destination-connection-id destination
+            :source-connection-id local
+            :packet-number 0 :packet-number-length 1 :payload #()))))
+   (and (null (cl-quic-kit:client-receive-datagram client packet))
+        (not (cl-quic-kit:quic-client-closed-p client))
+        (zerop (cl-quic-kit::quic-client-authentication-failures client))
+        (null writes)))
+ "client drops an Initial too short for header protection without closing or writing")
 (progn
   (let* ((writes nil)
          (local (make-array 8 :element-type '(unsigned-byte 8)

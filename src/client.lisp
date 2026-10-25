@@ -631,7 +631,7 @@
          (packet (subseq bytes 0 (getf layout :end))))
     (unless key (return-from %client-unprotect-packet nil))
     (when (< (length packet) (+ pn-offset 20))
-      (error 'quic-encoding-error :message "packet is too short for header protection"))
+      (return-from %client-unprotect-packet nil))
     (let* ((sample (subseq packet (+ pn-offset 4) (+ pn-offset 20)))
            (unmasked4 (cl-quic-kit.protection:remove-header-protection
                        key packet sample pn-offset 4 (getf layout :long-p)))
