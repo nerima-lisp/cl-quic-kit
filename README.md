@@ -10,6 +10,11 @@ The packet, TLS, and loss-recovery code draws on these specifications:
 
 The package provides QUIC varints, packet and frame codecs, stream and flow-control state, loss recovery and
 NewReno state, connection lifecycle management, and an explicit `cl-crypto-kit` backend boundary.
+
+Rational smoothed RTT and RTT variance estimates are rounded to a nanosecond grid to bound arithmetic
+precision across repeated ACKs. Raw latest and minimum samples are retained; floating-point estimates
+keep their existing recurrence.
+
 Configure the QUIC packet-protection backend before constructing a client or processing Initial packets
 with a server. The client derives Initial secrets during construction; the server derives them when it
 handles an Initial packet. Call `cl-quic-kit.protection:configure-crypto-backend` with callbacks for
