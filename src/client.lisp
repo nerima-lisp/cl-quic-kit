@@ -980,9 +980,19 @@
       (:reset-stream
        (let ((stream (%client-find-or-create-peer-stream
                       client (frame-field frame :stream-id))))
-         (stream-reset-receive
-          stream (frame-field frame :application-protocol-error-code 0)
-          (frame-field frame :final-size 0))))
+         (multiple-value-bind (event discarded)
+             (stream-reset-receive
+              stream (frame-field frame :application-protocol-error-code 0)
+              (frame-field frame :final-size 0))
+           (declare (ignore event))
+           (when (plusp discarded)
+             (let* ((flow (quic-client-flow-control client))
+                    (limit (flow-control-connection-receive-limit flow))
+                    (maximum (min *quic-max-offset* (+ limit discarded))))
+               (when (> maximum limit)
+                 (flow-control-update-max-receive-data flow maximum)
+                 (%client-queue-frame
+                  client (make-frame :max-data :maximum maximum) :1-rtt)))))))
       (:stop-sending
        (let* ((id (frame-field frame :stream-id))
               (stream (gethash id (quic-client-streams client))))
@@ -1228,6 +1238,7 @@
 (defun client-read-stream (client stream &key timeout deadline)
   (%client-check-deadline client timeout deadline)
   (multiple-value-bind (data fin) (stream-read stream)
+    (incf (stream-receive-credit-returned stream) (length data))
     (let* ((flow (quic-client-flow-control client))
            (stream-maximum
              (min *quic-max-offset* (+ (stream-read-offset stream) 65536)))

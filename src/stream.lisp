@@ -33,6 +33,7 @@
   (receive-offset 0)
   (receive-highest-offset 0)
   (read-offset 0)
+  (receive-credit-returned 0)
   (send-final-size nil)
   (receive-final-size nil)
   (send-max-offset *quic-max-offset*)
@@ -183,7 +184,7 @@
     (error 'stream-id-error :stream-id (stream-id stream)))
   (when (and (stream-receive-reset-p stream)
              (= final-size (stream-receive-final-size stream)))
-    (return-from stream-reset-receive stream))
+    (return-from stream-reset-receive (values stream 0)))
   (when (> final-size (stream-receive-max-offset stream))
     (%raise-limit (stream-receive-max-offset stream) final-size))
   (when (and (stream-receive-final-size stream)
@@ -199,15 +200,18 @@
     (flow-control-note-received
      (stream-flow-control stream)
      (- final-size (stream-receive-highest-offset stream))))
-  (setf (stream-receive-highest-offset stream) (max final-size
-                                                    (stream-receive-highest-offset stream))
-        (stream-receive-final-size stream) final-size
-        (stream-reset-error-code stream) error-code
-        (stream-receive-reset-p stream) t
-        (stream-segments stream) nil
-        (stream-received-segments stream) nil
-        (stream-read-buffer stream) (make-array 0 :element-type '(unsigned-byte 8)))
-  (%queue-event stream :reset-stream :error-code error-code :final-size final-size))
+  (let ((discarded (- final-size (stream-receive-credit-returned stream))))
+    (setf (stream-receive-highest-offset stream) (max final-size
+                                                      (stream-receive-highest-offset stream))
+          (stream-receive-final-size stream) final-size
+          (stream-reset-error-code stream) error-code
+          (stream-receive-reset-p stream) t
+          (stream-segments stream) nil
+          (stream-received-segments stream) nil
+          (stream-read-buffer stream) (make-array 0 :element-type '(unsigned-byte 8)))
+    (values (%queue-event stream :reset-stream :error-code error-code
+                          :final-size final-size)
+            discarded)))
 
 (defun stream-stop-sending-receive (stream error-code)
   (%non-negative-integer error-code :error-code)
