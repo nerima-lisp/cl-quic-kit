@@ -385,6 +385,83 @@
   (cl-quic-kit:client-flush client)
   (check (null (cl-quic-kit::quic-client-pending-stream-writes client))
          "closing a stream drops its pending writes before a later flush"))
+(progn
+  (dolist (case '((:stream-only t nil)
+                 (:connection-only nil t)
+                 (:both t t)))
+    (destructuring-bind (name stream-blocked connection-blocked) case
+      (let* ((client (cl-quic-kit:make-quic-client
+                      :connection
+                      (cl-quic-kit:make-quic-connection)
+                      :local-connection-id
+                      (make-array 8 :element-type '(unsigned-byte 8))
+                      :destination-connection-id
+                      (make-array 8 :element-type '(unsigned-byte 8))
+                      :disable-hostname-verification-p t))
+             (stream (cl-quic-kit:client-open-stream client nil))
+             (flow (cl-quic-kit::quic-client-flow-control client))
+             (payload (make-array 10 :element-type '(unsigned-byte 8)
+                                    :initial-contents '(0 1 2 3 4 5 6 7 8 9))))
+        (setf (cl-quic-kit::stream-send-offset stream) 4
+              (cl-quic-kit::stream-send-max-offset stream)
+              (if stream-blocked 4 14)
+              (cl-quic-kit::flow-control-state-connection-sent flow) 4
+              (cl-quic-kit::flow-control-state-connection-max-data flow)
+              (if connection-blocked 4 14))
+        (labels ((assert-blocked-frames (frames copies phase)
+                   (let ((stream-frames
+                           (remove-if-not
+                            (lambda (frame)
+                              (eq (cl-quic-kit:frame-type frame)
+                                  :stream-data-blocked))
+                            frames))
+                         (connection-frames
+                           (remove-if-not
+                            (lambda (frame)
+                              (eq (cl-quic-kit:frame-type frame) :data-blocked))
+                            frames)))
+                     (check (= (length frames)
+                               (* copies (+ (if stream-blocked 1 0)
+                                            (if connection-blocked 1 0))))
+                            (format nil "~A emits frames only for exhausted credits"
+                                    phase))
+                     (check (= (length stream-frames)
+                               (if stream-blocked copies 0))
+                            (format nil "~A classifies stream credit separately" phase))
+                     (check (every
+                             (lambda (frame)
+                               (and (= (cl-quic-kit:frame-field frame :maximum) 4)
+                                    (= (cl-quic-kit:frame-field frame :stream-id)
+                                       (cl-quic-kit:stream-id stream))))
+                             stream-frames)
+                            (format nil "~A stream frame carries its stream ID and limit"
+                                    phase))
+                     (check (= (length connection-frames)
+                               (if connection-blocked copies 0))
+                            (format nil "~A classifies connection credit separately" phase))
+                     (check (every
+                             (lambda (frame)
+                               (= (cl-quic-kit:frame-field frame :maximum) 4))
+                             connection-frames)
+                            (format nil "~A connection frame carries its limit" phase))
+                     (check (= (+ (length stream-frames)
+                                  (length connection-frames))
+                               (length frames))
+                            (format nil "~A has no unrelated queued frame" phase)))))
+          (cl-quic-kit:client-write-stream client stream payload :fin-p t)
+          (assert-blocked-frames
+           (mapcar #'cdr (cl-quic-kit::quic-client-pending-frames client))
+           1 (format nil "~A write" name))
+          (cl-quic-kit::%client-drain-pending-stream-writes client)
+          (assert-blocked-frames
+           (mapcar #'cdr (cl-quic-kit::quic-client-pending-frames client))
+           2 (format nil "~A pending-write drain" name))
+          (let ((pending (cl-quic-kit::quic-client-pending-stream-writes client)))
+            (check (and (= (length pending) 1)
+                        (eq (first (first pending)) stream)
+                        (equalp (second (first pending)) payload)
+                        (third (first pending)))
+                   (format nil "~A preserves the blocked bytes and FIN" name))))))))
 
 (let* ((client (cl-quic-kit:make-quic-client
                 :connection (cl-quic-kit:make-quic-connection)

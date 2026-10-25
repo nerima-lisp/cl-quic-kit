@@ -1190,6 +1190,21 @@
   (min (- (stream-send-max-offset stream) (stream-send-offset stream))
        (- (flow-control-connection-max-data (quic-client-flow-control client))
           (flow-control-connection-sent (quic-client-flow-control client)))))
+(defun %client-queue-stream-blocked-frames (client stream)
+  (let ((flow (quic-client-flow-control client)))
+    (when (>= (stream-send-offset stream)
+              (stream-send-max-offset stream))
+      (%client-queue-frame
+       client (make-frame :stream-data-blocked
+                          :stream-id (stream-id stream)
+                          :maximum (stream-send-max-offset stream))
+       :1-rtt))
+    (when (>= (flow-control-connection-sent flow)
+              (flow-control-connection-max-data flow))
+      (%client-queue-frame
+       client (make-frame :data-blocked
+                          :maximum (flow-control-connection-max-data flow))
+       :1-rtt))))
 
 (defun %client-queue-pending-stream-write (client stream octets fin-p)
   (setf (quic-client-pending-stream-writes client)
@@ -1201,11 +1216,7 @@
          (count (min credit (length octets)))
          (data (subseq octets 0 count)))
     (when (and (zerop count) (plusp (length octets)))
-      (%client-queue-frame
-       client (make-frame :data-blocked
-                          :maximum (flow-control-connection-max-data
-                                    (quic-client-flow-control client)))
-       :1-rtt)
+      (%client-queue-stream-blocked-frames client stream)
       (%client-queue-pending-stream-write client stream octets fin-p)
       (return-from %client-write-stream-available nil))
     (let* ((result (handler-case
@@ -1236,11 +1247,7 @@
       (if (plusp (%client-stream-send-credit client stream))
           (%client-write-stream-available client stream octets fin-p)
           (progn
-            (%client-queue-frame
-             client (make-frame :data-blocked
-                                :maximum (flow-control-connection-max-data
-                                          (quic-client-flow-control client)))
-             :1-rtt)
+            (%client-queue-stream-blocked-frames client stream)
             (push entry (quic-client-pending-stream-writes client))
             (return)))))
   client)
