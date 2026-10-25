@@ -1237,6 +1237,9 @@
 
 (defun client-read-stream (client stream &key timeout deadline)
   (%client-check-deadline client timeout deadline)
+  (unless (eq (gethash (stream-id stream) (quic-client-streams client)) stream)
+    (error 'quic-error
+           :message "Cannot read from a stream that is not registered with the client"))
   (multiple-value-bind (data fin) (stream-read stream)
     (incf (stream-receive-credit-returned stream) (length data))
     (let* ((flow (quic-client-flow-control client))
