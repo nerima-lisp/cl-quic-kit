@@ -1028,87 +1028,160 @@
             (error condition)))))
 
   (defun client-close-socket-case (provided-p send-failure-p cleanup-failure-p)
-    (let* ((provided (and provided-p
-                          (cl-quic-kit:make-udp-socket :local-host "127.0.0.1")))
-           (client nil)
-           (socket nil)
-           (native nil)
-           (descriptor nil)
-           (destination
-             (make-array 8 :element-type '(unsigned-byte 8)
-                           :initial-contents '(8 7 6 5 4 3 2 1)))
-           (send-condition
-             (make-condition 'simple-error :format-control "close send failure"))
-           (cleanup-condition
-             (make-condition 'simple-error :format-control "close cleanup failure"))
-           (writes nil)
-           (native-closes 0)
-           (original-close (symbol-function 'sb-bsd-sockets:socket-close)))
-      (unwind-protect
-           (progn
-             (setf client
-                   (cl-quic-kit:make-quic-client
-                    :hostname "localhost"
-                    :udp-socket provided
-                    :server-host "127.0.0.1" :server-port 9
-                    :local-connection-id
-                    (make-array 8 :element-type '(unsigned-byte 8)
-                                  :initial-contents '(1 2 3 4 5 6 7 8))
-                    :destination-connection-id destination
-                    :io-write (lambda (connection bytes)
-                                (check
-                                 (eq connection
-                                     (cl-quic-kit::quic-client-connection client))
-                                 "close callback receives the client's connection")
-                                (push bytes writes)
-                                (when send-failure-p (error send-condition)))))
-             (setf socket (cl-quic-kit::quic-client-udp-socket client)
-                   native (cl-quic-kit::udp-socket-socket socket)
-                   descriptor (sb-bsd-sockets:socket-file-descriptor native))
-             (check (if provided-p (eq socket provided) (not (eq socket provided)))
-                    "client socket ownership matches the constructor input")
-             (check (client-close-fd-open-p descriptor)
-                    "client owns an open descriptor before close")
-             (setf (symbol-function 'sb-bsd-sockets:socket-close)
-                   (lambda (raw &rest arguments)
-                     (if (eq raw native)
-                         (progn
-                           (incf native-closes)
-                           (apply original-close raw arguments)
-                           (when cleanup-failure-p (error cleanup-condition)))
-                         (apply original-close raw arguments))))
-             (let ((caught nil) (result nil))
-               (handler-case
-                   (setf result
-                         (cl-quic-kit:client-close
-                          client :error-code 7 :reason "close"))
-                 (error (condition) (setf caught condition)))
-               (check (eq caught (cond (send-failure-p send-condition)
-                                      (cleanup-failure-p cleanup-condition)))
-                      "send errors stay primary; cleanup-only errors propagate")
-               (check (null result) "failed close does not return success"))
-             (check (not (client-close-fd-open-p descriptor))
-                    "close releases the actual UDP descriptor after errors")
-             (check (= native-closes 1)
-                    "close invokes native descriptor cleanup exactly once")
-             (check (cl-quic-kit::udp-socket-closed-p socket)
-                    "UDP ownership is closed")
-             (check (cl-quic-kit::quic-client-closed-p client)
-                    "client is closed after every outcome")
-             (check
-              (eq :closing
-                  (cl-quic-kit:connection-state
-                   (cl-quic-kit::quic-client-connection client)))
-              "the connection enters closing")
-             (check (= 1 (length writes))
-                    "close attempts one protected datagram"))
-        (setf (symbol-function 'sb-bsd-sockets:socket-close) original-close)
-        (when (and socket descriptor (client-close-fd-open-p descriptor))
-          (cl-quic-kit:udp-close socket))
-        (when (and provided (not socket))
-          (cl-quic-kit:udp-close provided))
-        (check (eq original-close (symbol-function 'sb-bsd-sockets:socket-close))
-               "native socket-close spy is restored exactly"))))
+  (labels ((octets (&rest bytes)
+             (make-array (length bytes) :element-type '(unsigned-byte 8)
+                         :initial-contents bytes))
+           (wire-frames (wire destination)
+             (let* ((key (getf (cl-quic-kit.protection:derive-initial-secrets destination)
+                               :client))
+                    (header (cl-quic-kit:decode-packet-header wire))
+                    (offset
+                      (- (length wire)
+                         (cl-quic-kit:packet-header-payload-length header)))
+                    (sample (subseq wire (+ offset 4) (+ offset 20)))
+                    (first
+                      (cl-quic-kit.protection:remove-header-protection
+                       key wire sample offset 4 t))
+                    (pn-length (1+ (logand (aref first 0) 3)))
+                    (plain
+                      (cl-quic-kit.protection:remove-header-protection
+                       key wire sample offset pn-length t))
+                    (decoded (cl-quic-kit:decode-packet-header plain)))
+               (check (eq :initial (cl-quic-kit:packet-header-type decoded))
+                      "close uses Initial protection")
+               (check (equalp destination
+                              (cl-quic-kit:packet-header-destination-connection-id decoded))
+                      "close addresses the configured peer")
+               (cl-quic-kit:decode-frames
+                (cl-quic-kit.protection:unprotect-payload
+                 key (cl-quic-kit:packet-header-packet-number decoded)
+                 (cl-quic-kit:packet-header-payload decoded)
+                 (subseq plain 0 (+ offset pn-length))))))
+    (let ((cl-quic-kit.protection::*hkdf-extract* #'crypto-kit:hkdf-extract)
+          (cl-quic-kit.protection::*hkdf-expand* #'crypto-kit:hkdf-expand)
+          (cl-quic-kit.protection::*aead-seal* #'crypto-kit:aead-seal)
+          (cl-quic-kit.protection::*aead-open* #'crypto-kit:aead-open)
+          (cl-quic-kit.protection::*aes-ecb* #'crypto-kit:aes-encrypt-block)
+          (cl-quic-kit.protection::*chacha20* #'crypto-kit:chacha20-keystream)
+          (cl-quic-kit.protection::*constant-time-equal* #'crypto-kit:constant-time-equal))
+      (let* ((listener
+               (cl-quic-kit:make-udp-socket
+                :local-host "127.0.0.1" :non-blocking-p nil))
+             (provided nil)
+             (client nil)
+             (socket nil)
+             (native nil)
+             (descriptor nil)
+             (destination (octets 8 7 6 5 4 3 2 1))
+             (send-condition
+               (make-condition 'simple-error :format-control "close send failure"))
+             (cleanup-condition
+               (make-condition 'simple-error :format-control "close cleanup failure"))
+             (writes nil)
+             (native-closes 0)
+             (original-close (symbol-function 'sb-bsd-sockets:socket-close)))
+        (unwind-protect
+             (progn
+               (when provided-p
+                 (setf provided
+                       (cl-quic-kit:make-udp-socket
+                        :remote-host "127.0.0.1"
+                        :remote-port (cl-quic-kit:udp-socket-local-port listener))))
+               (setf client
+                     (cl-quic-kit:make-quic-client
+                      :hostname "localhost"
+                      :udp-socket provided
+                      :server-host "127.0.0.1"
+                      :server-port (cl-quic-kit:udp-socket-local-port listener)
+                      :local-connection-id (octets 1 2 3 4 5 6 7 8)
+                      :destination-connection-id destination
+                      :io-write (lambda (connection bytes)
+                                  (check (eq connection
+                                             (cl-quic-kit::quic-client-connection client))
+                                         "close callback receives the client's connection")
+                                  (push bytes writes)
+                                  (when send-failure-p (error send-condition)))))
+               (setf socket (cl-quic-kit::quic-client-udp-socket client)
+                     native (cl-quic-kit::udp-socket-socket socket)
+                     descriptor (sb-bsd-sockets:socket-file-descriptor native))
+               (check (if provided-p (eq socket provided) (not (eq socket provided)))
+                      "client socket ownership matches the public constructor input")
+               (check (client-close-fd-open-p descriptor)
+                      "client owns an open descriptor before close")
+               (check (= 3 (cl-quic-kit:udp-send socket (octets 7 8 9)))
+                      "the real socket can send before close")
+               (multiple-value-bind (bytes length peer)
+                   (cl-quic-kit:udp-receive listener :wait-p t)
+                 (check (equalp bytes #(7 8 9))
+                        "loopback receives the actual socket's bytes")
+                 (check (= length 3) "loopback reports the actual datagram length")
+                 (check (equalp peer #(127 0 0 1))
+                        "loopback receives from localhost")
+                 (check (plusp (cl-quic-kit:udp-socket-local-port socket))
+                        "the client socket has a real bound port"))
+               (setf (symbol-function 'sb-bsd-sockets:socket-close)
+                     (lambda (raw &rest arguments)
+                       (if (eq raw native)
+                           (progn
+                             (incf native-closes)
+                             (apply original-close raw arguments)
+                             (when cleanup-failure-p (error cleanup-condition)))
+                           (apply original-close raw arguments))))
+               (let ((caught nil) (result nil))
+                 (handler-case
+                     (setf result
+                           (cl-quic-kit:client-close
+                            client :error-code 7 :reason "close"))
+                   (error (condition) (setf caught condition)))
+                 (check (eq caught (cond (send-failure-p send-condition)
+                                         (cleanup-failure-p cleanup-condition)))
+                        "original send error takes precedence; cleanup-only failure propagates")
+                 (check (eq result (not (or send-failure-p cleanup-failure-p)))
+                        "only a successful close returns T"))
+               (check (not (client-close-fd-open-p descriptor))
+                      "first close releases the actual descriptor")
+               (check (= native-closes 1)
+                      "first close invokes native cleanup exactly once")
+               (check (cl-quic-kit::udp-socket-closed-p socket)
+                      "UDP ownership is closed")
+               (check (cl-quic-kit:quic-client-closed-p client)
+                      "client is closed after every outcome")
+               (check (eq :closing
+                          (cl-quic-kit:connection-state
+                           (cl-quic-kit::quic-client-connection client)))
+                      "the connection enters closing")
+               (check (= 1 (length writes))
+                      "close attempts one protected datagram")
+               (let* ((frames (wire-frames (first writes) destination))
+                      (close (find :connection-close frames
+                                   :key #'cl-quic-kit:frame-type)))
+                 (check (= 1 (count :connection-close frames
+                                    :key #'cl-quic-kit:frame-type))
+                        "wire contains exactly one transport close")
+                 (check (= 7 (cl-quic-kit:frame-field close :error-code))
+                        "wire retains the requested error code")
+                 (check (= 0 (cl-quic-kit:frame-field close :frame-type))
+                        "wire close has no triggering frame")
+                 (check (equalp #(99 108 111 115 101)
+                                (cl-quic-kit:frame-field close :reason))
+                        "wire retains the close reason"))
+               (check (cl-quic-kit:client-close client)
+                      "repeated close succeeds without retrying errors")
+               (check (= native-closes 1)
+                      "repeated close does not repeat native cleanup")
+               (check (= 1 (length writes))
+                      "repeated close does not repeat the send")
+               (check (not (client-close-fd-open-p descriptor))
+                      "repeated close keeps the descriptor closed"))
+          (setf (symbol-function 'sb-bsd-sockets:socket-close) original-close)
+          (when (and native descriptor (client-close-fd-open-p descriptor))
+            (funcall original-close native))
+          (when (and provided (not socket))
+            (cl-quic-kit:udp-close provided))
+          (cl-quic-kit:udp-close listener))
+        (check (eq original-close
+                   (symbol-function 'sb-bsd-sockets:socket-close))
+               "native socket-close spy is restored exactly"))))))
 
   (defun client-close-provided-send-error ()
     (client-close-socket-case t t nil))
@@ -1153,7 +1226,14 @@
   (client-close-internal-send-error)
   (client-close-cleanup-error)
   (client-close-dual-error)
-  (client-default-clock-ack-rtt-bounded))
+  (progn
+  (defun client-close-provided-control ()
+    (client-close-socket-case t nil nil))
+  (defun client-close-internal-control ()
+    (client-close-socket-case nil nil nil))
+  (client-default-clock-ack-rtt-bounded)
+  (client-close-provided-control)
+  (client-close-internal-control)))
 (progn
   (defun auth-drop-octets (&rest bytes)
     (make-array (length bytes) :element-type '(unsigned-byte 8)
