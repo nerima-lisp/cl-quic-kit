@@ -834,7 +834,9 @@
       (%client-queue-frame client frame (%client-space-level (getf record :level))))))
 
 (defun %client-pto-probe-budget (client space)
-  (cdr (assoc space (quic-client-pto-probe-budgets client))))
+  (or (cdr (assoc space
+                  (quic-client-pto-probe-budgets client)))
+      0))
 
 (defun (setf %client-pto-probe-budget) (value client space)
   (let ((entry (assoc space (quic-client-pto-probe-budgets client))))

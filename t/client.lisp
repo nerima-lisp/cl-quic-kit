@@ -20,6 +20,26 @@
                   (= (cl-quic-kit:frame-field frame :stream-id) 0)
                   (equalp (cl-quic-kit:frame-field frame :data) payload))
              "client stream writes are encoded through the injected connection I/O"))))
+(let* ((writes nil)
+       (connection (cl-quic-kit:make-quic-connection
+                    :io-write (lambda (ignored bytes)
+                                (declare (ignore ignored))
+                                (push bytes writes))))
+       (local (make-array 8 :element-type (quote (unsigned-byte 8))))
+       (destination (make-array 8 :element-type (quote (unsigned-byte 8))))
+       (client (cl-quic-kit:make-quic-client
+                :connection connection
+                :local-connection-id local
+                :destination-connection-id destination
+                :disable-hostname-verification-p t)))
+  (cl-quic-kit::%client-requeue-record
+   client
+   (list :level :initial
+         :frames (list (cl-quic-kit:make-frame :ping))))
+  (cl-quic-kit:client-flush client)
+  (check (and (= (length writes) 1)
+              (= (cl-quic-kit::%client-pto-probe-budget client :initial) 0))
+         "loss-requeued frames send with an unset PTO probe budget"))
 (check
  (let* ((writes nil)
         (local (make-array 8 :element-type '(unsigned-byte 8)
