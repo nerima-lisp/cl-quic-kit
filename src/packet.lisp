@@ -226,8 +226,6 @@
                       (validate-connection-id scid)
                       (if (eq type :retry)
                           (progn
-                            (when (not (zerop (logand first #x0f)))
-                              (%packet-error "Retry reserved bits must be zero"))
                             (when (< (- (length b) at) 16)
                               (%packet-error "Truncated Retry integrity tag"))
                             (values

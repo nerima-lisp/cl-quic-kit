@@ -1123,18 +1123,42 @@
       (check (and initial-wire (>= (length initial-wire) 1200))
              "mismatched-CID Initial fixture is protected and parseable")
       (cl-quic-kit:client-receive-datagram mismatched initial-wire)
-      (check (and (not (cl-quic-kit:quic-client-closed-p mismatched))
-                  (not (eq (cl-quic-kit:connection-state
-                            (cl-quic-kit::quic-client-connection mismatched))
-                           :closing))
-                  (equalp remote-before
-                          (cl-quic-kit::quic-client-remote-connection-id mismatched))
-                  (equal numbers-before
-                         (cl-quic-kit::quic-client-packet-numbers mismatched))
-                  (equal received-before
-                         (cl-quic-kit::quic-client-received-packets mismatched))
+      (progn
+  (check (and (not (cl-quic-kit:quic-client-closed-p mismatched))
+              (not (eq (cl-quic-kit:connection-state
+                        (cl-quic-kit::quic-client-connection mismatched))
+                       :closing))
+              (equalp remote-before
+                      (cl-quic-kit::quic-client-remote-connection-id mismatched))
+              (equal numbers-before
+                     (cl-quic-kit::quic-client-packet-numbers mismatched))
+              (equal received-before
+                     (cl-quic-kit::quic-client-received-packets mismatched))
+              (null close-wire))
+         "client discards a protected Initial with a mismatched destination CID")
+  (let* ((pseudo (subseq retry 0 (- (length retry) 16)))
+         (nonzero-pseudo (copy-seq pseudo)))
+    (setf (aref nonzero-pseudo 0)
+          (logior (aref nonzero-pseudo 0) #x01))
+    (let* ((tag
+             (cl-quic-kit:retry-integrity-tag
+              nonzero-pseudo
+              :original-destination-connection-id destination))
+           (wire
+             (concatenate '(vector (unsigned-byte 8))
+                          nonzero-pseudo tag)))
+      (setf close-wire nil)
+      (check (null (cl-quic-kit:client-receive-datagram mismatched wire))
+             "client receives a Retry with nonzero Unused bits")
+      (check (and (cl-quic-kit::quic-client-retry-received-p mismatched)
+                  (equalp (cl-quic-kit::quic-client-retry-token mismatched)
+                          retry-token)
+                  (equalp
+                   (cl-quic-kit::quic-client-remote-connection-id mismatched)
+                   retry-scid)
+                  (not (cl-quic-kit:quic-client-closed-p mismatched))
                   (null close-wire))
-             "client discards a protected Initial with a mismatched destination CID"))))))
+             "client accepts valid Retry with nonzero Unused bits through public API")))))))))
 (load (test-path "t/server.lisp"))
 (let* ((original-dcid (%client-test-octets '(90 91 92 93 94 95 96 97)))
        (local-cid (%client-test-octets '(100 101 102 103 104 105 106 107)))
