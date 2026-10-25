@@ -1427,14 +1427,19 @@
     (setf (quic-client-retry-received-p client) t)))
 
 (defun %client-handle-version-negotiation (client bytes)
+  (when (or (quic-client-retry-received-p client)
+            (some (lambda (entry) (cdr entry))
+                  (quic-client-received-packets client)))
+    (return-from %client-handle-version-negotiation nil))
   (let ((decoded (decode-version-negotiation bytes)))
+    (when (member *quic-version-1* (getf decoded :versions))
+      (return-from %client-handle-version-negotiation nil))
     (unless (and (equalp (getf decoded :destination-connection-id)
                          (quic-client-local-connection-id client))
                  (equalp (getf decoded :source-connection-id)
                          (quic-client-initial-destination-connection-id client)))
-      (error 'quic-encoding-error :message "Version Negotiation connection ID mismatch"))
-    (unless (member *quic-version-1* (getf decoded :versions))
-      (error 'quic-encoding-error :message "peer does not support QUIC v1"))))
+      (return-from %client-handle-version-negotiation nil))
+    (error 'quic-encoding-error :message "peer does not support QUIC v1")))
 
 (defun client-receive-datagram (client bytes &key (short-header-dcid-length 8))
   "Decrypt and dispatch all packets in one UDP datagram."

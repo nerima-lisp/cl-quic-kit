@@ -745,10 +745,30 @@
              "idle timeout emits a protected CONNECTION_CLOSE")))
 
   (let* ((vn (cl-quic-kit:encode-version-negotiation
-              sender-id destination (list cl-quic-kit:*quic-version-1* #x6b3343cf)))
-         (bad (make-array 1 :element-type '(unsigned-byte 8) :initial-element #xff)))
+              sender-id destination (list #x6b3343cf)))
+         (bad (make-array 1 :element-type '(unsigned-byte 8) :initial-element #xff))
+         (received-packets-before
+           (copy-tree (cl-quic-kit::quic-client-received-packets sender)))
+         (packet-numbers-before
+           (copy-tree (cl-quic-kit::quic-client-packet-numbers sender)))
+         (connection-state-before
+           (cl-quic-kit:connection-state
+            (cl-quic-kit::quic-client-connection sender))))
+    (check (some (lambda (entry) (cdr entry)) received-packets-before)
+           "late Version Negotiation test has processed a prior packet")
+    (setf wire nil)
     (check (null (cl-quic-kit:client-receive-datagram sender vn))
-           "client accepts Version Negotiation advertising QUIC v1")
+           "client discards Version Negotiation after processing a packet")
+    (check (and (not (cl-quic-kit::quic-client-closed-p sender))
+                (eq connection-state-before
+                    (cl-quic-kit:connection-state
+                     (cl-quic-kit::quic-client-connection sender)))
+                (equal received-packets-before
+                       (cl-quic-kit::quic-client-received-packets sender))
+                (equal packet-numbers-before
+                       (cl-quic-kit::quic-client-packet-numbers sender))
+                (null wire))
+           "late Version Negotiation preserves state and emits no close")
     (setf ack-wire nil)
     (check (and (null (cl-quic-kit:client-receive-datagram receiver bad))
                 (not (cl-quic-kit::quic-client-closed-p receiver))
@@ -758,16 +778,37 @@
                 (null ack-wire))
            "malformed unauthenticated packet is discarded"))
 
-  (let ((mismatched (cl-quic-kit:make-quic-client
+  (let ((wire nil)
+        (mismatched (cl-quic-kit:make-quic-client
                      :local-connection-id sender-id
                      :destination-connection-id destination
-                     :disable-hostname-verification-p t)))
+                     :disable-hostname-verification-p t
+                     :io-write (lambda (connection bytes)
+                                 (declare (ignore connection))
+                                 (setf wire bytes)))))
     (cl-quic-kit:client-receive-datagram
      mismatched
      (cl-quic-kit:encode-version-negotiation
-      receiver-id destination (list cl-quic-kit:*quic-version-1*)))
-    (check (cl-quic-kit:quic-client-closed-p mismatched)
-           "Version Negotiation for another connection is rejected"))
+      receiver-id destination (list #x6b3343cf)))
+    (check (and (not (cl-quic-kit::quic-client-closed-p mismatched))
+                (null wire))
+           "client silently discards Version Negotiation for another connection")
+    (setf wire nil)
+    (let ((selected-version
+            (cl-quic-kit:make-quic-client
+             :local-connection-id sender-id
+             :destination-connection-id destination
+             :disable-hostname-verification-p t
+             :io-write (lambda (connection bytes)
+                         (declare (ignore connection))
+                         (setf wire bytes)))))
+      (cl-quic-kit:client-receive-datagram
+       selected-version
+       (cl-quic-kit:encode-version-negotiation
+        sender-id destination (list cl-quic-kit:*quic-version-1*)))
+      (check (and (not (cl-quic-kit::quic-client-closed-p selected-version))
+                  (null wire))
+             "client discards Version Negotiation listing its selected version")))
 
   (let* ((retry-token (%client-test-octets '(6 7)))
          (retry-scid (%client-test-octets '(80 81 82 83 84 85 86 87)))
@@ -864,11 +905,58 @@
                        (cl-quic-kit::quic-client-remote-connection-id retry-client)
                        retry-scid))
                  "Retry replaces the token and remote connection ID")
-          (check (= initial-number-before-retry
-                    (cl-quic-kit::%client-level-value
-                     (cl-quic-kit::quic-client-packet-numbers retry-client)
-                     :initial))
-                 "valid Retry preserves the Initial packet number")
+          (progn
+            (check (= initial-number-before-retry
+                      (cl-quic-kit::%client-level-value
+                       (cl-quic-kit::quic-client-packet-numbers retry-client)
+                       :initial))
+                   "valid Retry preserves the Initial packet number")
+            (let* ((vn (cl-quic-kit:encode-version-negotiation
+                        sender-id destination (list #x6b3343cf)))
+                   (received-packets-before
+                     (copy-tree
+                      (cl-quic-kit::quic-client-received-packets retry-client)))
+                   (packet-numbers-before
+                     (copy-tree
+                      (cl-quic-kit::quic-client-packet-numbers retry-client)))
+                   (token-before
+                     (copy-seq
+                      (cl-quic-kit::quic-client-retry-token retry-client)))
+                   (remote-id-before
+                     (copy-seq
+                      (cl-quic-kit::quic-client-remote-connection-id retry-client)))
+                   (write-key-before
+                     (cl-quic-kit::%client-key retry-client :initial :write))
+                   (pending-frames-before
+                     (copy-list
+                      (cl-quic-kit::quic-client-pending-frames retry-client)))
+                   (connection-state-before
+                     (cl-quic-kit:connection-state
+                      (cl-quic-kit::quic-client-connection retry-client))))
+              (check (and (cl-quic-kit::quic-client-retry-received-p retry-client)
+                          (null received-packets-before))
+                     "VN-after-Retry test has a processed Retry and no protected packets")
+              (setf retry-wire nil)
+              (cl-quic-kit:client-receive-datagram retry-client vn)
+              (check (and (not (cl-quic-kit::quic-client-closed-p retry-client))
+                          (null retry-wire))
+                     "client silently discards Version Negotiation after Retry")
+              (check (and (equal received-packets-before
+                                  (cl-quic-kit::quic-client-received-packets retry-client))
+                          (equal packet-numbers-before
+                                 (cl-quic-kit::quic-client-packet-numbers retry-client))
+                          (equalp token-before
+                                  (cl-quic-kit::quic-client-retry-token retry-client))
+                          (equalp remote-id-before
+                                  (cl-quic-kit::quic-client-remote-connection-id retry-client))
+                          (eq write-key-before
+                              (cl-quic-kit::%client-key retry-client :initial :write))
+                          (equal pending-frames-before
+                                 (cl-quic-kit::quic-client-pending-frames retry-client))
+                          (eq connection-state-before
+                              (cl-quic-kit:connection-state
+                               (cl-quic-kit::quic-client-connection retry-client))))
+                     "Version Negotiation after Retry preserves client state")))
           (let ((token-before
                   (copy-seq
                    (cl-quic-kit::quic-client-retry-token retry-client)))
