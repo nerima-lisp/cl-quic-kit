@@ -790,23 +790,136 @@
              :destination-connection-id sender-id
              :source-connection-id retry-scid :token retry-token
              :retry-integrity-tag tag))))
-    (setf (cl-quic-kit::quic-client-closed-p sender) nil)
-    (check (null (cl-quic-kit:client-receive-datagram sender retry))
-           "client processes a valid Retry packet")
-    (check (and (equalp (cl-quic-kit::quic-client-retry-token sender) retry-token)
-                (equalp (cl-quic-kit::quic-client-remote-connection-id sender)
-                        retry-scid))
-           "Retry replaces the token and remote connection ID")
-    (check (zerop (or (cl-quic-kit::%client-level-value
-                       (cl-quic-kit::quic-client-packet-numbers sender) :initial)
-                      0))
-           "Retry resets the Initial packet number space")
-    (setf wire nil)
-    (cl-quic-kit:client-flush sender)
-    (check (and wire
-                (equalp (getf (cl-quic-kit::%client-layout wire) :token)
-                        retry-token))
-           "Retry retransmits ClientHello with the Retry token")
+    (check (cl-quic-kit::%client-level-value
+            (cl-quic-kit::quic-client-received-packets sender) :initial)
+           "client has processed a server Initial before Retry")
+    (check (not (cl-quic-kit::quic-client-closed-p sender))
+           "client remains open before the server Initial Retry check")
+    (let ((token-before (copy-seq (cl-quic-kit::quic-client-retry-token sender)))
+          (remote-id-before
+            (copy-seq (cl-quic-kit::quic-client-remote-connection-id sender)))
+          (packet-numbers-before
+            (copy-tree (cl-quic-kit::quic-client-packet-numbers sender)))
+          (received-packets-before
+            (copy-tree (cl-quic-kit::quic-client-received-packets sender)))
+          (read-key-before (cl-quic-kit::%client-key sender :initial :read))
+          (write-key-before (cl-quic-kit::%client-key sender :initial :write))
+          (pending-frames-before
+            (copy-list (cl-quic-kit::quic-client-pending-frames sender)))
+          (connection-state-before
+            (cl-quic-kit:connection-state
+             (cl-quic-kit::quic-client-connection sender))))
+      (check (null (cl-quic-kit:client-receive-datagram sender retry))
+             "client discards Retry after a processed server Initial")
+      (check (and (equalp token-before
+                          (cl-quic-kit::quic-client-retry-token sender))
+                  (equalp remote-id-before
+                          (cl-quic-kit::quic-client-remote-connection-id sender))
+                  (equal packet-numbers-before
+                         (cl-quic-kit::quic-client-packet-numbers sender))
+                  (equal received-packets-before
+                         (cl-quic-kit::quic-client-received-packets sender))
+                  (eq read-key-before
+                      (cl-quic-kit::%client-key sender :initial :read))
+                  (eq write-key-before
+                      (cl-quic-kit::%client-key sender :initial :write))
+                  (equal pending-frames-before
+                         (cl-quic-kit::quic-client-pending-frames sender))
+                  (eq connection-state-before
+                      (cl-quic-kit:connection-state
+                       (cl-quic-kit::quic-client-connection sender)))
+                  (not (cl-quic-kit::quic-client-closed-p sender))
+                  (not (eq (cl-quic-kit:connection-state
+                            (cl-quic-kit::quic-client-connection sender))
+                           :closing)))
+             "Retry after a processed Initial leaves client state unchanged"))
+    (let ((retry-wire nil))
+      (let ((retry-client
+              (cl-quic-kit:make-quic-client
+               :local-connection-id sender-id
+               :destination-connection-id destination
+               :hostname "localhost"
+               :io-write (lambda (connection bytes)
+                           (declare (ignore connection))
+                           (setf retry-wire bytes))
+               :now-fn (lambda () 0))))
+        (cl-quic-kit:client-start retry-client)
+        (let ((initial-number-before-retry
+                (or (cl-quic-kit::%client-level-value
+                     (cl-quic-kit::quic-client-packet-numbers retry-client)
+                     :initial)
+                    0)))
+          (check (plusp initial-number-before-retry)
+                 "Retry test starts after an Initial packet was sent")
+          (check (null (cl-quic-kit::%client-level-value
+                        (cl-quic-kit::quic-client-received-packets retry-client)
+                        :initial))
+                 "fresh client has not processed a server Initial before Retry")
+          (check (null (cl-quic-kit:client-receive-datagram retry-client retry))
+                 "client processes a valid Retry packet")
+          (check (and (equalp
+                       (cl-quic-kit::quic-client-retry-token retry-client)
+                       retry-token)
+                      (equalp
+                       (cl-quic-kit::quic-client-remote-connection-id retry-client)
+                       retry-scid))
+                 "Retry replaces the token and remote connection ID")
+          (check (= initial-number-before-retry
+                    (cl-quic-kit::%client-level-value
+                     (cl-quic-kit::quic-client-packet-numbers retry-client)
+                     :initial))
+                 "valid Retry preserves the Initial packet number")
+          (let ((token-before
+                  (copy-seq
+                   (cl-quic-kit::quic-client-retry-token retry-client)))
+                (remote-id-before
+                  (copy-seq
+                   (cl-quic-kit::quic-client-remote-connection-id retry-client)))
+                (packet-numbers-before
+                  (copy-tree
+                   (cl-quic-kit::quic-client-packet-numbers retry-client)))
+                (write-key-before
+                  (cl-quic-kit::%client-key retry-client :initial :write))
+                (pending-frames-before
+                  (copy-list
+                   (cl-quic-kit::quic-client-pending-frames retry-client)))
+                (connection-state-before
+                  (cl-quic-kit:connection-state
+                   (cl-quic-kit::quic-client-connection retry-client))))
+            (check (null
+                    (cl-quic-kit:client-receive-datagram retry-client retry))
+                   "client discards a repeated valid Retry")
+            (check (and
+                    (equalp token-before
+                            (cl-quic-kit::quic-client-retry-token retry-client))
+                    (equalp remote-id-before
+                            (cl-quic-kit::quic-client-remote-connection-id
+                             retry-client))
+                    (equal packet-numbers-before
+                           (cl-quic-kit::quic-client-packet-numbers retry-client))
+                    (eq write-key-before
+                        (cl-quic-kit::%client-key retry-client :initial :write))
+                    (equal pending-frames-before
+                           (cl-quic-kit::quic-client-pending-frames retry-client))
+                    (eq connection-state-before
+                        (cl-quic-kit:connection-state
+                         (cl-quic-kit::quic-client-connection retry-client)))
+                    (not (cl-quic-kit::quic-client-closed-p retry-client))
+                    (not (eq (cl-quic-kit:connection-state
+                              (cl-quic-kit::quic-client-connection retry-client))
+                             :closing)))
+                   "replayed Retry leaves client state unchanged and does not close the connection"))
+          (setf retry-wire nil)
+          (cl-quic-kit:client-flush retry-client)
+          (check (and retry-wire
+                      (equalp (getf (cl-quic-kit::%client-layout retry-wire) :token)
+                              retry-token))
+                 "Retry retransmits ClientHello with the Retry token")
+          (check (> (cl-quic-kit::%client-level-value
+                     (cl-quic-kit::quic-client-packet-numbers retry-client)
+                     :initial)
+                    initial-number-before-retry)
+                 "Retry ClientHello uses a fresh Initial packet number"))))
     (let ((mismatched (cl-quic-kit:make-quic-client
                        :local-connection-id sender-id
                        :destination-connection-id destination

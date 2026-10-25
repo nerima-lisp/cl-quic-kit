@@ -9,7 +9,7 @@
   pending-frames pending-stream-writes crypto-send-offsets
   peer-transport-parameters closed-p started-p
   flow-control
-  initial-destination-connection-id remote-connection-id retry-token
+  initial-destination-connection-id remote-connection-id retry-token retry-received-p
   packet-numbers received-packets keys recovery sent-packets clock
   pto-probe-budgets pto-probe-frames
   (authentication-failures 0)
@@ -871,17 +871,6 @@
                   (delete record (quic-client-sent-packets client)
                           :test #'eq))))))))
 
-(defun %client-reset-space (client space)
-  (setf (quic-client-packet-numbers client)
-        (%client-set-level-value (quic-client-packet-numbers client) space 0)
-        (quic-client-received-packets client)
-        (%client-set-level-value (quic-client-received-packets client) space nil)
-        (quic-client-sent-packets client)
-        (delete-if (lambda (record) (eq (getf record :level) space))
-                   (quic-client-sent-packets client)))
-  (cl-quic-kit.recovery:reset-packet-number-space
-   (quic-client-recovery client) space))
-
 (defun %client-send-frames (client level frames)
   (let* ((wire-level (if (eq level :application) :1-rtt level))
          (space (%client-level-space wire-level))
@@ -1406,6 +1395,10 @@
     (declare (ignore end)) header))
 
 (defun %client-handle-retry (client bytes)
+  (when (or (quic-client-retry-received-p client)
+            (%client-level-value
+             (quic-client-received-packets client) :initial))
+    (return-from %client-handle-retry nil))
   (let* ((header (%client-retry-header bytes))
          (tag (packet-header-retry-integrity-tag header))
          (pseudo (subseq bytes 0 (- (length bytes) 16))))
@@ -1423,11 +1416,11 @@
                     (quic-client-remote-connection-id client))))
       (%client-set-key client :initial :write (getf initial :client))
       (%client-set-key client :initial :read (getf initial :server)))
-    (%client-reset-space client :initial)
     (when (quic-client-client-hello-wire client)
       (%client-queue-frame
        client (make-frame :crypto :offset 0
-                          :data (quic-client-client-hello-wire client)) :initial))))
+                          :data (quic-client-client-hello-wire client)) :initial))
+    (setf (quic-client-retry-received-p client) t)))
 
 (defun %client-handle-version-negotiation (client bytes)
   (let ((decoded (decode-version-negotiation bytes)))
