@@ -1056,7 +1056,7 @@
                 (cl-quic-kit.protection:unprotect-payload
                  key (cl-quic-kit:packet-header-packet-number decoded)
                  (cl-quic-kit:packet-header-payload decoded)
-                 (subseq plain 0 (+ offset pn-length))))))
+                 (subseq plain 0 (+ offset pn-length)))))))
     (let ((cl-quic-kit.protection::*hkdf-extract* #'crypto-kit:hkdf-extract)
           (cl-quic-kit.protection::*hkdf-expand* #'crypto-kit:hkdf-expand)
           (cl-quic-kit.protection::*aead-seal* #'crypto-kit:aead-seal)
@@ -1181,7 +1181,7 @@
           (cl-quic-kit:udp-close listener))
         (check (eq original-close
                    (symbol-function 'sb-bsd-sockets:socket-close))
-               "native socket-close spy is restored exactly"))))))
+               "native socket-close spy is restored exactly")))))
 
   (defun client-close-provided-send-error ()
     (client-close-socket-case t t nil))
