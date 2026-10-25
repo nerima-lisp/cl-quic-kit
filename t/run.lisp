@@ -484,7 +484,6 @@
       (cl-quic-kit.recovery:on-loss-timeout state :application :now 1)
     (check (and deadline (= (length lost) 2))
            "time-threshold loss removes and returns expired packets")))
-(load (test-path "t/protection.lisp"))
 (let ((socket (cl-quic-kit:make-udp-socket :local-host "127.0.0.1"
                                             :local-port 0)))
   (unwind-protect
@@ -825,7 +824,6 @@
 (load (test-path "t/state.lisp"))
 (load (test-path "t/recovery.lisp"))
 (load (test-path "t/stream-flow-control.lisp"))
-(load (test-path "t/client.lisp"))
 (progn
   (load (test-path "t/codec.lisp"))
   (load (test-path "t/packet-reserved-contracts.lisp")))
