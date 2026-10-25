@@ -749,13 +749,14 @@
          (bad (make-array 1 :element-type '(unsigned-byte 8) :initial-element #xff)))
     (check (null (cl-quic-kit:client-receive-datagram sender vn))
            "client accepts Version Negotiation advertising QUIC v1")
-    (cl-quic-kit:client-receive-datagram receiver bad)
-    (check (and (cl-quic-kit::quic-client-closed-p receiver)
-                (eq (cl-quic-kit:connection-state
-                     (cl-quic-kit::quic-client-connection receiver))
-                    :closing)
-                ack-wire)
-           "malformed packet transitions the client to protocol close"))
+    (setf ack-wire nil)
+    (check (and (null (cl-quic-kit:client-receive-datagram receiver bad))
+                (not (cl-quic-kit::quic-client-closed-p receiver))
+                (not (eq (cl-quic-kit:connection-state
+                          (cl-quic-kit::quic-client-connection receiver))
+                         :closing))
+                (null ack-wire))
+           "malformed unauthenticated packet is discarded"))
 
   (let ((mismatched (cl-quic-kit:make-quic-client
                      :local-connection-id sender-id
