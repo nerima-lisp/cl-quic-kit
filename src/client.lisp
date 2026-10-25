@@ -9,9 +9,13 @@
   pending-frames pending-stream-writes crypto-send-offsets
   peer-transport-parameters closed-p started-p
   flow-control
-  initial-destination-connection-id remote-connection-id retry-token
+  initial-destination-connection-id remote-connection-id
+  server-initial-source-connection-id server-initial-source-connection-id-set-p
+  retry-token retry-received-p
   packet-numbers received-packets keys recovery sent-packets clock
   pto-probe-budgets pto-probe-frames
+  (authentication-failures 0)
+  (authentication-cipher nil)
   (application-read-key-phase 0)
   application-read-old-key application-read-next-key application-read-next-secret
   application-read-secret application-read-key-update-packet-number
@@ -131,41 +135,47 @@
   (if (member (frame-type frame) '(:ack :ack-ecn))
       (%client-split-ack-frame frame)
       (if (not (member (frame-type frame) '(:stream :crypto)))
-      (list frame)
-      (let* ((data (%client-frame-data frame))
-             (length (length data))
-             (chunks nil)
-             (at 0))
-        (if (zerop length)
-            (list frame)
-            (progn
-              (loop while (< at length) do
-              (let* ((remaining (- length at)) (low 1) (high remaining) (best 0))
-                (loop while (<= low high) do
-                  (let* ((middle (floor (+ low high) 2))
-                         (fields (copy-list (frame-fields frame))))
-                    (setf (getf fields :data) (subseq data at (+ at middle))
-                          (getf fields :offset)
-                          (+ (or (getf fields :offset) 0) at)
-                          (getf fields :fin)
-                          (and (getf fields :fin) (= (+ at middle) length)))
-                    (if (<= (length (encode-frame
-                                     (apply #'make-frame (frame-type frame) fields)))
-                            *client-packet-payload-limit*)
-                        (setf best middle low (1+ middle))
-                        (setf high (1- middle)))))
-                (when (zerop best)
-                  (error 'quic-encoding-error
-                         :message "Frame cannot fit in a QUIC packet"))
-                (let ((fields (copy-list (frame-fields frame))))
-                  (setf (getf fields :data) (subseq data at (+ at best))
-                        (getf fields :offset)
-                        (+ (or (getf fields :offset) 0) at)
-                        (getf fields :fin)
-                        (and (getf fields :fin) (= (+ at best) length)))
-                  (push (apply #'make-frame (frame-type frame) fields) chunks))
-                (incf at best)))
-              (nreverse chunks)))))))
+          (list frame)
+          (let* ((data (%client-frame-data frame))
+                 (length (length data))
+                 (chunks nil)
+                 (at 0))
+            (if (or (zerop length)
+                    (and (<= length *client-packet-payload-limit*)
+                         (<= (length (encode-frame frame))
+                             *client-packet-payload-limit*)))
+                (list frame)
+                (progn
+                  (loop while (< at length) do
+                    (let* ((remaining (- length at))
+                           (low 1)
+                           (high (min remaining *client-packet-payload-limit*))
+                           (best 0))
+                      (loop while (<= low high) do
+                        (let* ((middle (floor (+ low high) 2))
+                               (fields (copy-list (frame-fields frame))))
+                          (setf (getf fields :data) (subseq data at (+ at middle))
+                                (getf fields :offset)
+                                (+ (or (getf fields :offset) 0) at)
+                                (getf fields :fin)
+                                (and (getf fields :fin) (= (+ at middle) length)))
+                          (if (<= (length (encode-frame
+                                           (apply #'make-frame (frame-type frame) fields)))
+                                  *client-packet-payload-limit*)
+                              (setf best middle low (1+ middle))
+                              (setf high (1- middle)))))
+                      (when (zerop best)
+                        (error 'quic-encoding-error
+                               :message "Frame cannot fit in a QUIC packet"))
+                      (let ((fields (copy-list (frame-fields frame))))
+                        (setf (getf fields :data) (subseq data at (+ at best))
+                              (getf fields :offset)
+                              (+ (or (getf fields :offset) 0) at)
+                              (getf fields :fin)
+                              (and (getf fields :fin) (= (+ at best) length)))
+                        (push (apply #'make-frame (frame-type frame) fields) chunks))
+                      (incf at best)))
+                  (nreverse chunks)))))))
 
 (defun %client-frame-packet-groups (frames)
   (let ((groups nil) (current nil) (size 0))
@@ -348,10 +358,15 @@
 (defun %client-install-secret (client level direction secret &key replace-p preserve-hp)
   (let ((wire-level (%client-space-level level)))
     (when (or replace-p (not (%client-key client wire-level direction)))
-      (let* ((old-key (%client-key client wire-level direction))
+      (let* ((cipher (%client-driver-suite-cipher
+                      (quic-client-tls-driver client)))
+             (old-key (%client-key client wire-level direction))
              (new-key (cl-quic-kit.protection:make-key-set
-                       secret :cipher (%client-driver-suite-cipher
-                                       (quic-client-tls-driver client)))))
+                       secret :cipher cipher)))
+        (progn
+          (%client-set-authentication-cipher client cipher)
+          (when (quic-client-closed-p client)
+            (return-from %client-install-secret nil)))
         (when (and preserve-hp old-key)
           (setf (cl-quic-kit.protection:key-set-hp new-key)
                 (cl-quic-kit.protection:key-set-hp old-key)))
@@ -596,8 +611,27 @@
   (let ((number 0))
     (dotimes (index length number)
       (setf number (+ (ash number 8) (aref bytes (+ at index)))))))
+(defun %client-authentication-limit (cipher)
+  (ecase cipher
+    ((:aes-128-gcm :aes-256-gcm) (expt 2 52))
+    (:chacha20-poly1305 (expt 2 36))))
+(defun %client-set-authentication-cipher (client cipher)
+  (setf (quic-client-authentication-cipher client) cipher)
+  (when (> (quic-client-authentication-failures client)
+           (%client-authentication-limit cipher))
+    (%client-protocol-close client #xf "QUIC AEAD integrity limit reached"))
+  cipher)
+(defun %client-authentication-failed (client key)
+  ;; RFC 9001 section 6.6 counts failures across all connection keys.
+  (let* ((cipher (or (quic-client-authentication-cipher client)
+                     (cl-quic-kit.protection:key-set-cipher key)))
+         (failures (incf (quic-client-authentication-failures client)))
+         (limit (%client-authentication-limit cipher)))
+    (when (> failures limit)
+      (%client-protocol-close client #xf "QUIC AEAD integrity limit reached"))))
 
-(defun %client-unprotect-packet (client bytes layout)
+(defun %client-unprotect-packet
+    (client bytes layout &key expected-source-connection-id)
   (let* ((type (getf layout :type))
          (level (case type (:initial :initial) (:handshake :handshake)
                  (:0-rtt :0-rtt) (:short :1-rtt)))
@@ -606,7 +640,7 @@
          (packet (subseq bytes 0 (getf layout :end))))
     (unless key (return-from %client-unprotect-packet nil))
     (when (< (length packet) (+ pn-offset 20))
-      (error 'quic-encoding-error :message "packet is too short for header protection"))
+      (return-from %client-unprotect-packet nil))
     (let* ((sample (subseq packet (+ pn-offset 4) (+ pn-offset 20)))
            (unmasked4 (cl-quic-kit.protection:remove-header-protection
                        key packet sample pn-offset 4 (getf layout :long-p)))
@@ -637,18 +671,29 @@
                            client)))
                   (setf selected-key
                         (quic-client-application-read-old-key client))
-                  (progn
-                    (let ((secret (quic-client-application-read-next-secret client))
-                          (next-key (quic-client-application-read-next-key client)))
-                      (unless (and secret next-key)
-                        (error 'quic-crypto-error
-                               :message "application key phase update unavailable"))
-                      (setf selected-key next-key)
-                      (setf next-read-secret secret
-                            next-read-key next-key)))))))
+                  (let ((secret (quic-client-application-read-next-secret client))
+                        (next-key (quic-client-application-read-next-key client)))
+                    (unless (and secret next-key)
+                      (return-from %client-unprotect-packet nil))
+                    (setf selected-key next-key
+                          next-read-secret secret
+                          next-read-key next-key))))))
         (let ((plaintext
-                (cl-quic-kit.protection:unprotect-payload
-                 selected-key number ciphertext associated)))
+                (handler-case
+                    (cl-quic-kit.protection:unprotect-payload
+                     selected-key number ciphertext associated)
+                  (crypto-kit:aead-authentication-failure ()
+                    (%client-authentication-failed client selected-key)
+                    (return-from %client-unprotect-packet nil)))))
+          (when (and expected-source-connection-id
+                     (not (equalp expected-source-connection-id
+                                   (getf layout :scid))))
+            (return-from %client-unprotect-packet (values nil nil nil)))
+          (when (plusp
+                 (ldb (byte 2 (if (getf layout :long-p) 2 3)) first))
+            (%client-protocol-close
+             client #xa "non-zero QUIC reserved bits")
+            (return-from %client-unprotect-packet nil))
           (when next-read-secret
             (%client-commit-application-read-key-update
              client next-read-secret next-read-key number)
@@ -660,7 +705,7 @@
                    :destination-connection-id (getf layout :dcid)
                    :source-connection-id (getf layout :scid)
                    :packet-number number :packet-number-length pn-length
-                   :reserved-bits (ldb (byte 2 2) first)
+                   :reserved-bits (ldb (byte 2 (if (getf layout :long-p) 2 3)) first)
                    :key-phase key-phase
                    :payload plaintext)))))))
 
@@ -795,7 +840,9 @@
       (%client-queue-frame client frame (%client-space-level (getf record :level))))))
 
 (defun %client-pto-probe-budget (client space)
-  (cdr (assoc space (quic-client-pto-probe-budgets client))))
+  (or (cdr (assoc space
+                  (quic-client-pto-probe-budgets client)))
+      0))
 
 (defun (setf %client-pto-probe-budget) (value client space)
   (let ((entry (assoc space (quic-client-pto-probe-budgets client))))
@@ -831,17 +878,6 @@
             (setf (quic-client-sent-packets client)
                   (delete record (quic-client-sent-packets client)
                           :test #'eq))))))))
-
-(defun %client-reset-space (client space)
-  (setf (quic-client-packet-numbers client)
-        (%client-set-level-value (quic-client-packet-numbers client) space 0)
-        (quic-client-received-packets client)
-        (%client-set-level-value (quic-client-received-packets client) space nil)
-        (quic-client-sent-packets client)
-        (delete-if (lambda (record) (eq (getf record :level) space))
-                   (quic-client-sent-packets client)))
-  (cl-quic-kit.recovery:reset-packet-number-space
-   (quic-client-recovery client) space))
 
 (defun %client-send-frames (client level frames)
   (let* ((wire-level (if (eq level :application) :1-rtt level))
@@ -980,9 +1016,19 @@
       (:reset-stream
        (let ((stream (%client-find-or-create-peer-stream
                       client (frame-field frame :stream-id))))
-         (stream-reset-receive
-          stream (frame-field frame :application-protocol-error-code 0)
-          (frame-field frame :final-size 0))))
+         (multiple-value-bind (event discarded)
+             (stream-reset-receive
+              stream (frame-field frame :application-protocol-error-code 0)
+              (frame-field frame :final-size 0))
+           (declare (ignore event))
+           (when (plusp discarded)
+             (let* ((flow (quic-client-flow-control client))
+                    (limit (flow-control-connection-receive-limit flow))
+                    (maximum (min *quic-max-offset* (+ limit discarded))))
+               (when (> maximum limit)
+                 (flow-control-update-max-receive-data flow maximum)
+                 (%client-queue-frame
+                  client (make-frame :max-data :maximum maximum) :1-rtt)))))))
       (:stop-sending
        (let* ((id (frame-field frame :stream-id))
               (stream (gethash id (quic-client-streams client))))
@@ -1147,6 +1193,21 @@
   (min (- (stream-send-max-offset stream) (stream-send-offset stream))
        (- (flow-control-connection-max-data (quic-client-flow-control client))
           (flow-control-connection-sent (quic-client-flow-control client)))))
+(defun %client-queue-stream-blocked-frames (client stream)
+  (let ((flow (quic-client-flow-control client)))
+    (when (>= (stream-send-offset stream)
+              (stream-send-max-offset stream))
+      (%client-queue-frame
+       client (make-frame :stream-data-blocked
+                          :stream-id (stream-id stream)
+                          :maximum (stream-send-max-offset stream))
+       :1-rtt))
+    (when (>= (flow-control-connection-sent flow)
+              (flow-control-connection-max-data flow))
+      (%client-queue-frame
+       client (make-frame :data-blocked
+                          :maximum (flow-control-connection-max-data flow))
+       :1-rtt))))
 
 (defun %client-queue-pending-stream-write (client stream octets fin-p)
   (setf (quic-client-pending-stream-writes client)
@@ -1158,11 +1219,7 @@
          (count (min credit (length octets)))
          (data (subseq octets 0 count)))
     (when (and (zerop count) (plusp (length octets)))
-      (%client-queue-frame
-       client (make-frame :data-blocked
-                          :maximum (flow-control-connection-max-data
-                                    (quic-client-flow-control client)))
-       :1-rtt)
+      (%client-queue-stream-blocked-frames client stream)
       (%client-queue-pending-stream-write client stream octets fin-p)
       (return-from %client-write-stream-available nil))
     (let* ((result (handler-case
@@ -1193,11 +1250,7 @@
       (if (plusp (%client-stream-send-credit client stream))
           (%client-write-stream-available client stream octets fin-p)
           (progn
-            (%client-queue-frame
-             client (make-frame :data-blocked
-                                :maximum (flow-control-connection-max-data
-                                          (quic-client-flow-control client)))
-             :1-rtt)
+            (%client-queue-stream-blocked-frames client stream)
             (push entry (quic-client-pending-stream-writes client))
             (return)))))
   client)
@@ -1227,10 +1280,15 @@
 
 (defun client-read-stream (client stream &key timeout deadline)
   (%client-check-deadline client timeout deadline)
+  (unless (eq (gethash (stream-id stream) (quic-client-streams client)) stream)
+    (error 'quic-error
+           :message "Cannot read from a stream that is not registered with the client"))
   (multiple-value-bind (data fin) (stream-read stream)
+    (incf (stream-receive-credit-returned stream) (length data))
     (let* ((flow (quic-client-flow-control client))
            (stream-maximum
-             (min *quic-max-offset* (+ (stream-read-offset stream) 65536)))
+             (min *quic-max-offset*
+                  (+ (stream-receive-max-offset stream) (length data))))
            (connection-maximum
              (min *quic-max-offset*
                   (+ (flow-control-connection-receive-limit flow)
@@ -1298,9 +1356,11 @@
           (let ((result (%client-send-frames client (car group) packet-frames)))
             (cond
               ((eq result :blocked)
-               (dolist (unsent remaining)
-                 (dolist (frame unsent)
-                   (%client-queue-frame client frame (car group))))
+               (setf (quic-client-pending-frames client)
+                     (nconc (quic-client-pending-frames client)
+                            (loop for unsent in remaining
+                                  nconc (loop for frame in unsent
+                                              collect (cons (car group) frame)))))
                (return))
               ((null result)
                (dolist (frame packet-frames)
@@ -1343,38 +1403,53 @@
     (declare (ignore end)) header))
 
 (defun %client-handle-retry (client bytes)
+  (when (or (quic-client-retry-received-p client)
+            (%client-level-value
+             (quic-client-received-packets client) :initial))
+    (return-from %client-handle-retry nil))
   (let* ((header (%client-retry-header bytes))
          (tag (packet-header-retry-integrity-tag header))
          (pseudo (subseq bytes 0 (- (length bytes) 16))))
-    (unless (and (equalp (packet-header-destination-connection-id header)
-                         (quic-client-local-connection-id client)))
-      (error 'quic-encoding-error :message "Retry connection ID mismatch"))
     (unless (verify-retry-integrity
              pseudo tag :original-destination-connection-id
              (quic-client-initial-destination-connection-id client))
-      (error 'quic-encoding-error :message "Retry integrity tag mismatch"))
+      (return-from %client-handle-retry nil))
+    (unless (and (equalp (packet-header-destination-connection-id header)
+                         (quic-client-local-connection-id client)))
+      (error 'quic-encoding-error :message "Retry connection ID mismatch"))
+    (when (or (zerop (length (packet-header-token header)))
+              (equalp (packet-header-source-connection-id header)
+                      (quic-client-initial-destination-connection-id client)))
+      (return-from %client-handle-retry nil))
     (setf (quic-client-retry-token client) (packet-header-token header)
           (quic-client-remote-connection-id client)
-          (packet-header-source-connection-id header))
+          (packet-header-source-connection-id header)
+          (quic-client-server-initial-source-connection-id client) nil
+          (quic-client-server-initial-source-connection-id-set-p client) nil)
     (let ((initial (cl-quic-kit.protection:derive-initial-secrets
                     (quic-client-remote-connection-id client))))
       (%client-set-key client :initial :write (getf initial :client))
       (%client-set-key client :initial :read (getf initial :server)))
-    (%client-reset-space client :initial)
     (when (quic-client-client-hello-wire client)
       (%client-queue-frame
        client (make-frame :crypto :offset 0
-                          :data (quic-client-client-hello-wire client)) :initial))))
+                          :data (quic-client-client-hello-wire client)) :initial))
+    (setf (quic-client-retry-received-p client) t)))
 
 (defun %client-handle-version-negotiation (client bytes)
+  (when (or (quic-client-retry-received-p client)
+            (some (lambda (entry) (cdr entry))
+                  (quic-client-received-packets client)))
+    (return-from %client-handle-version-negotiation nil))
   (let ((decoded (decode-version-negotiation bytes)))
+    (when (member *quic-version-1* (getf decoded :versions))
+      (return-from %client-handle-version-negotiation nil))
     (unless (and (equalp (getf decoded :destination-connection-id)
                          (quic-client-local-connection-id client))
                  (equalp (getf decoded :source-connection-id)
                          (quic-client-initial-destination-connection-id client)))
-      (error 'quic-encoding-error :message "Version Negotiation connection ID mismatch"))
-    (unless (member *quic-version-1* (getf decoded :versions))
-      (error 'quic-encoding-error :message "peer does not support QUIC v1"))))
+      (return-from %client-handle-version-negotiation nil))
+    (error 'quic-encoding-error :message "peer does not support QUIC v1")))
 
 (defun client-receive-datagram (client bytes &key (short-header-dcid-length 8))
   "Decrypt and dispatch all packets in one UDP datagram."
@@ -1387,33 +1462,60 @@
                  :message "QUIC datagram exceeds the maximum UDP payload size"))
         (loop while (< at (length bytes)) do
           (let* ((slice (subseq bytes at))
-                 (layout (%client-layout
-                           slice :short-header-dcid-length short-header-dcid-length)))
+                 (layout (handler-case
+                             (%client-layout
+                              slice :short-header-dcid-length short-header-dcid-length)
+                           (quic-encoding-error ()
+                             (return-from client-receive-datagram last-header)))))
+            (unless (connection-id-known-p
+                     (quic-client-connection client) (getf layout :dcid))
+              (return-from client-receive-datagram last-header))
             (case (getf layout :type)
               (:version-negotiation (%client-handle-version-negotiation client slice)
                                     (return))
               (:retry (%client-handle-retry client slice) (return)))
             (multiple-value-bind (level number header)
-                (%client-unprotect-packet client slice layout)
+                (%client-unprotect-packet
+                 client slice layout
+                 :expected-source-connection-id
+                 (and (getf layout :long-p)
+                      (quic-client-server-initial-source-connection-id-set-p
+                       client)
+                      (quic-client-server-initial-source-connection-id client)))
+              (when (quic-client-closed-p client)
+                (return-from client-receive-datagram nil))
               (when header
-                (when (and (member level '(:initial :handshake))
-                           (plusp (length (packet-header-source-connection-id header))))
-                  (setf (quic-client-remote-connection-id client)
-                        (packet-header-source-connection-id header)))
-                (let ((frames (decode-frames (packet-header-payload header))))
-                  (%client-receive-frames client level number frames)
-                  (setf last-header header)))
-              (setf at (+ at (getf layout :end)))
-              (when (not (getf layout :long-p)) (return)))))
+                (unless (and (getf layout :long-p)
+                             (quic-client-server-initial-source-connection-id-set-p client)
+                             (not (equalp
+                                   (packet-header-source-connection-id header)
+                                   (quic-client-server-initial-source-connection-id
+                                    client))))
+                  (when (eq level :initial)
+                    (unless (quic-client-server-initial-source-connection-id-set-p
+                             client)
+                      (setf (quic-client-server-initial-source-connection-id client)
+                            (packet-header-source-connection-id header)
+                            (quic-client-server-initial-source-connection-id-set-p
+                             client)
+                            t))
+                    (setf (quic-client-remote-connection-id client)
+                          (quic-client-server-initial-source-connection-id client)))
+                  (let ((frames (decode-frames (packet-header-payload header))))
+                    (%client-receive-frames client level number frames)
+                    (when (quic-client-closed-p client)
+                      (return-from client-receive-datagram nil))
+                    (setf last-header header)))))
+            (setf at (+ at (getf layout :end)))
+            (when (not (getf layout :long-p)) (return))))
         last-header)
     (quic-error (condition)
       (%client-protocol-close
        client (if (typep condition 'quic-frame-space-error) 10 7)
-       (if (typep condition 'quic-crypto-error)
-           (quic-crypto-error-message condition)
-         (quic-error-message condition))) nil)
+       "invalid packet") nil)
     (error (condition)
-      (%client-protocol-close client 7 (princ-to-string condition)) nil)))
+      (%client-protocol-close client (if (typep condition 'final-size-error) 6 7)
+                              "invalid packet") nil)))
 
 (defun make-client-tls-boundary (client &key transport-parameters)
   "Attach cl-tls-kit's QUIC CRYPTO boundary."

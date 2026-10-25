@@ -978,20 +978,22 @@
                          "Client initial_source_connection_id does not match the Initial source connection ID")))
                     parameters)
                 (quic-encoding-error (condition)
-                                     (let* ((connection
-                                             (server-connection-connection server-connection))
-                                            (engine (server-connection-engine server-connection))
-                                            (frame
-                                             (%connection-prepare-close
-                                              connection :transport-parameter-error
-                                              (quic-error-message condition))))
-                                       (when frame
-                                         (setf (quic-client-closed-p engine) t)
-                                         (%client-queue-frame
-                                          engine frame
-                                          (if (%client-key engine :1-rtt :write) :1-rtt :initial))
-                                         (client-flush engine)))
-                                     (return-from %server-complete-connection server-connection))))
+                  (declare (ignore condition))
+                  (let* ((connection
+                           (server-connection-connection server-connection))
+                         (engine (server-connection-engine server-connection))
+                         (frame
+                           (%connection-prepare-close
+                            connection :transport-parameter-error
+                            "invalid peer transport parameters")))
+                    (when frame
+                      (setf (quic-client-closed-p engine) t)
+                      (%client-queue-frame
+                       engine frame
+                       (if (%client-key engine :1-rtt :write) :1-rtt :initial))
+                      (client-flush engine)))
+                  (return-from %server-complete-connection
+                    server-connection))))
              (connection (server-connection-connection server-connection))
              (local-idle-timeout (quic-connection-idle-timeout connection))
              (peer-idle-timeout (cdr (assoc 1 peer-parameters))))
@@ -1045,14 +1047,18 @@
               (octets-copy (second event)))
         (case (getf event :type)
           (:cipher-suite
-           (let ((suite (getf event :suite))
-                 (emit (%client-function
-                        "CL-TLS-KIT"
-                        "QUIC-TLS-BOUNDARY-EMIT-CIPHER-SUITE")))
+           (let* ((suite (getf event :suite))
+                  (engine (server-connection-engine server-connection))
+                  (emit (%client-function
+                         "CL-TLS-KIT"
+                         "QUIC-TLS-BOUNDARY-EMIT-CIPHER-SUITE")))
+             (setf (server-connection-cipher-suite server-connection) suite)
+             (%client-set-authentication-cipher engine (%server-suite-cipher suite))
+             (when (quic-client-closed-p engine)
+               (return-from %server-handle-tls-events server-connection))
              (when emit
                (funcall emit (server-connection-tls-boundary server-connection)
-                        suite))
-             (setf (server-connection-cipher-suite server-connection) suite)))
+                        suite))))
           (:send
            (unless (eq (getf event :content-type) :alert)
              (%server-queue-crypto server-connection
@@ -1318,6 +1324,9 @@
                         (%client-unprotect-packet engine slice layout)
                       (crypto-kit:aead-authentication-failure ()
                                                               (values nil nil nil)))
+                  (when (member (connection-state connection)
+                            '(:closing :draining :closed))
+                    (return-from %server-process-protected-datagram server-connection))
                   (when header
                     (let* ((frames (handler-case
                                        (decode-frames (packet-header-payload header))
@@ -1354,8 +1363,10 @@
                                                 (declare (ignore condition))
                                                 (%server-close-on-frame-error server-connection 4))
                             (flow-control-error (condition)
-                                                (declare (ignore condition))
-                                                (%server-close-on-frame-error server-connection 3))
+                                                (%server-close-on-frame-error
+                                                 server-connection
+                                                 (if (typep condition 'final-size-error)
+                                                     6 3)))
                             (stream-id-error (condition)
                                              (declare (ignore condition))
                                              (%server-close-on-frame-error server-connection 5))

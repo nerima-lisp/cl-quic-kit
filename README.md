@@ -10,15 +10,25 @@ The packet, TLS, and loss-recovery code draws on these specifications:
 
 The package provides QUIC varints, packet and frame codecs, stream and flow-control state, loss recovery and
 NewReno state, connection lifecycle management, and an explicit `cl-crypto-kit` backend boundary.
+
+Rational smoothed RTT and RTT variance estimates are rounded to a nanosecond grid to bound arithmetic
+precision across repeated ACKs. Raw latest and minimum samples are retained; floating-point estimates
+keep their existing recurrence.
+
 Configure the QUIC packet-protection backend before constructing a client or processing Initial packets
 with a server. The client derives Initial secrets during construction; the server derives them when it
 handles an Initial packet. Call `cl-quic-kit.protection:configure-crypto-backend` with callbacks for
 `:hkdf-extract`,
 `:hkdf-expand`, `:aead-seal`, `:aead-open`, and `:constant-time-equal`. Provide `:aes-ecb` for AES cipher
-suites and `:chacha20` for the ChaCha20-Poly1305 suite. This packet-protection backend is separate from TLS
+suites and `:chacha20` for the ChaCha20-Poly1305 suite. `:hkdf-extract` receives `(algorithm salt ikm)`;
+`:hkdf-expand` receives `(algorithm prk info length)`. `:aead-seal` and `:aead-open` receive
+`(algorithm key nonce data aad)`. `:aes-ecb` receives `(key block16)`, and `:chacha20` receives
+`(key counter nonce length)`. Byte-producing callbacks return simple `(unsigned-byte 8)` vectors;
+header-protection callbacks return at least five octets. `:constant-time-equal` receives two octet vectors and
+returns true when they match. `t/run.lisp` shows how the test
+runner connects these callbacks to `cl-crypto-kit`. This packet-protection backend is separate from TLS
 provider selection. The client accepts a cl-tls-kit provider object as `:tls-provider`; set the server
-provider as `:provider` within `:tls-server-options`. `t/run.lisp` shows how the test runner connects these
-callbacks to `cl-crypto-kit`.
+provider as `:provider` within `:tls-server-options`.
 
 ## Client API
 
@@ -45,6 +55,7 @@ The optional `:idle-timeout` value uses seconds and defaults to 30; the client a
 After the handshake, `(cl-quic-kit:client-open-stream client nil)` opens a locally initiated bidirectional
 stream. Its second argument is currently unused. Pass the returned stream to
 `cl-quic-kit:client-write-stream` or `cl-quic-kit:client-read-stream`.
+Both operations require a stream registered with that client.
 
 - `cl-quic-kit:client-accept-peer-stream (client)` returns one available peer stream. Call
   `(cl-quic-kit:client-poll client)` to send queued frames and process available UDP datagrams, then call
@@ -84,6 +95,20 @@ stream. Its second argument is currently unused. Pass the returned stream to
   For a client, read it with
   `(cl-quic-kit:quic-connection-closed-reason (cl-quic-kit:quic-client-connection client))`. The optional
   `:reason` passed to `cl-quic-kit:client-close` is sent to the peer but does not populate this field.
+
+The client checks reserved bits after payload authentication. Nonzero reserved bits close the connection
+with `PROTOCOL_VIOLATION` (`#x0a`). AEAD authentication failures are counted across connection keys;
+successful packets do not reset the counter. Exceeding the selected cipher's integrity limit closes the
+connection with `AEAD_LIMIT_REACHED` (`#x0f`): `2^52` for AES-128/256-GCM or `2^36` for
+ChaCha20-Poly1305. Malformed packets caught by `client-receive-datagram` use the fixed reason
+`invalid packet`. A frame received in a packet-number space where QUIC forbids it closes with
+`PROTOCOL_VIOLATION` (`#x0a`). The client does not send provider diagnostics to the peer.
+
+When called on an open client, `cl-quic-kit:client-close` attempts to send `CONNECTION_CLOSE`. It closes
+the UDP socket even if sending fails, including a supplied socket. Call it when finished, including after a
+protocol close, to ensure socket cleanup. If sending and socket cleanup both fail, the send error is
+re-signaled. A cleanup-only error also propagates. Repeated calls do not send another close or repeat socket
+cleanup.
 
 ## Server API
 
@@ -138,7 +163,9 @@ constructor. Within that plist, `:alpn-protocols` defaults to `("h3")` and `:cip
 `#(#x1301 #x1302 #x1303)`. The server creates a cl-crypto-kit provider when `:provider` is omitted and sets
 the driver's `:quic-transport-parameters` option from the encoded server parameters. The server buffers peer
 QUIC transport parameters as opaque bytes and decodes and validates them only after cl-tls-kit verifies the
-client's Finished and emits `:handshake-complete`.
+client's Finished and emits `:handshake-complete`. Invalid parameters cause a
+`TRANSPORT_PARAMETER_ERROR`; the server does not return that connection from
+`cl-quic-kit:quic-server-accept-connection`.
 
 The `crypto-kit:` package is provided by the `cl-crypto-kit` system. For a P-256 key, pass a 32-octet private
 scalar to
@@ -157,7 +184,8 @@ returns one handshake-complete `cl-quic-kit:quic-connection`, and each connectio
 
 For graceful shutdown, call `cl-quic-kit:quic-server-shutdown`. It stops admitting new connections while
 existing connections remain usable, so the application can finish work and close connections with
-`cl-quic-kit:quic-connection-close`. The default grace period is 30 seconds. The first call sets the shutdown
+`cl-quic-kit:quic-connection-close`. The default grace period is 30 seconds. Pass `:grace-period` to
+`cl-quic-kit:quic-server-shutdown` to choose another nonnegative duration. The first call sets the shutdown
 deadline; repeated calls do not change it. Continue polling until `cl-quic-kit:quic-server-poll` returns true.
 The server closes sooner if all routed connections have ended, or at the deadline it attempts to send
 CONNECTION_CLOSE to remaining active connections and closes its socket.
@@ -180,8 +208,8 @@ The connection-level stream functions below take a `cl-quic-kit:quic-connection`
 connection returned by `cl-quic-kit:quic-server-accept-connection` and a client connection returned by
 `cl-quic-kit:quic-client-connection`; client code can also use the client-specific helpers described above.
 `cl-quic-kit:quic-connection-accept-stream` returns the next peer-initiated stream, or `NIL` when none is
-available. Pass `:type :bidirectional` or `:unidirectional` to filter the queue; the default `:any` accepts
-either direction. Each peer stream is returned once. `NIL` only means that no matching stream is available
+available. Pass `:type :bidirectional` or `:type :unidirectional` to filter the queue; the default `:any`
+accepts either direction. Each peer stream is returned once. `NIL` only means that no matching stream is available
 from that call. Use `(cl-quic-kit:connection-state connection)` to inspect whether the connection is
 established, closing, draining, or closed.
 
@@ -195,8 +223,8 @@ credit arrives. For server connections, `cl-quic-kit:quic-server-poll` packetize
 stream data with available credit, then sends pending datagrams. For client connections, use
 `cl-quic-kit:client-poll`; polling alone is sufficient after writes.
 `cl-quic-kit:quic-connection-flush` attempts to packetize queued writes and send resulting datagrams
-immediately. Data beyond current flow-control credit remains in the write queue; congestion control can leave
-frames queued, and a server's amplification limit can defer datagrams. Polling retries packetization and
+immediately. Congestion control can leave frames queued, and a server's amplification limit can defer
+datagrams. Polling retries packetization and
 sending. Call flush between polls when an immediate send attempt is needed.
 A locally opened unidirectional stream is
 send-only, while a peer-initiated unidirectional stream is receive-only. Reading from a send-only stream or
@@ -225,7 +253,7 @@ configuration file, replacing each placeholder path with its checkout directory:
 
 After configuring the registry, applications can load the system with `(asdf:load-system "cl-quic-kit")`.
 
-The Nix development shell and test command are defined for x86_64-linux. Run the suite from the repository
+The Nix development shell and test command are defined only for x86_64-linux. Run the suite from the repository
 root; the shell sets the
 ASDF source registry for those dependencies and provides OpenSSL for the loopback TLS test, which creates
 temporary credentials:

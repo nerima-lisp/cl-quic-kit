@@ -77,9 +77,67 @@
       (progn (funcall function) nil)
     (type-error () t)))
 
-(check (server-test-type-error-p
-        (lambda () (cl-quic-kit:make-quic-server)))
-       "server requires a positive max-connections value")
+(progn (check (server-test-type-error-p (lambda () (cl-quic-kit:make-quic-server))) "server requires a positive max-connections value") )
+(check
+ (let* ((destination
+          (make-array 8 :element-type '(unsigned-byte 8)
+                        :initial-contents '(1 2 3 4 5 6 7 8)))
+        (source
+          (make-array 8 :element-type '(unsigned-byte 8)
+                        :initial-contents '(8 7 6 5 4 3 2 1)))
+        (sender
+          (cl-quic-kit:make-quic-client
+           :local-connection-id source
+           :destination-connection-id destination
+           :disable-hostname-verification-p t))
+        (connection
+          (cl-quic-kit:make-quic-connection
+           :role :server :local-connection-id destination
+           :io-write (lambda (ignored bytes)
+                       (declare (ignore ignored bytes)))))
+        (engine
+          (cl-quic-kit:make-quic-client
+           :connection connection
+           :local-connection-id destination
+           :destination-connection-id source
+           :disable-hostname-verification-p t))
+        (server-connection
+          (cl-quic-kit::%make-server-connection
+           :connection connection :engine engine
+           :local-connection-id destination))
+        (initial
+          (cl-quic-kit.protection:derive-initial-secrets destination))
+        (limit (expt 2 36)))
+   (cl-quic-kit::%client-set-key engine :initial :read
+                                 (getf initial :client))
+   (cl-quic-kit::%client-set-key engine :initial :write
+                                 (getf initial :server))
+   (cl-quic-kit::%client-set-authentication-cipher
+    engine :chacha20-poly1305)
+   (setf (cl-quic-kit::quic-client-authentication-failures engine)
+         (1- limit))
+   (labels ((packet ()
+              (cl-quic-kit::%client-build-packet
+               sender :initial
+               (list (cl-quic-kit:make-frame :ping))))
+            (damaged-packet ()
+              (let ((wire (packet)))
+                (setf (aref wire (1- (length wire)))
+                      (logxor 1 (aref wire (1- (length wire)))))
+                wire)))
+     (cl-quic-kit::%server-process-protected-datagram
+      server-connection
+      (concatenate '(vector (unsigned-byte 8))
+                   (damaged-packet) (damaged-packet) (packet))
+      0)
+     (and (= (cl-quic-kit::quic-client-authentication-failures engine)
+             (1+ limit))
+          (cl-quic-kit:quic-client-closed-p engine)
+          (eq :closing (cl-quic-kit:connection-state connection))
+          (null
+           (cl-quic-kit::%client-level-value
+            (cl-quic-kit::quic-client-received-packets engine) :initial)))))
+ "server enforces the selected AEAD limit across Initial keys and stops coalesced packets after close")
 (progn
   (check
    (let* ((server
@@ -607,7 +665,9 @@
     (let ((response (server-test-receive socket)))
       (check (<= (length response) (* 3 (length packet)))
              "the protected Retry-token error response stays within three times its input size")
-      (cl-quic-kit:client-receive-datagram client response)))
+      (progn
+        (cl-quic-kit:client-receive-datagram client response)
+        (cl-quic-kit:decode-packet-header response))))
 
   (defun server-test-retry-policy-never ()
     (let* ((directory (server-test-make-temp-directory))
@@ -971,10 +1031,13 @@
                             header)
                            wrong-client-cid))
                      "a token with a mismatched client CID receives a close to that CID")
-              (check (= (cl-quic-kit::quic-connection-closed-error
-                         (cl-quic-kit:quic-client-connection client))
-                        #x0b)
-                     "a token with a mismatched client CID receives INVALID_TOKEN"))))
+              (check (and
+                      (eq (cl-quic-kit:connection-state
+                           (cl-quic-kit:quic-client-connection client))
+                          :handshaking)
+                      (null (cl-quic-kit::quic-connection-closed-error
+                             (cl-quic-kit:quic-client-connection client))))
+                     "client drops an INVALID_TOKEN close addressed to a different CID"))))
       (cl-quic-kit:client-close client)
       (cl-quic-kit:quic-server-close server))))
 (defun server-test-run-openssl (&rest arguments)
@@ -1132,7 +1195,7 @@
                                      value))
              (integer-parameter (id value)
                (parameter id (cl-quic-kit:encode-varint value)))
-             (run-case (description parameter-bytes)
+             (run-case (description parameter-bytes &optional error-marker)
                (let* ((socket
                        (cl-quic-kit:make-udp-socket :local-host
                                                     "127.0.0.1"
@@ -1151,7 +1214,11 @@
                                                      :tls-server-options
                                                      (append server-tls-options (list :alpn-protocols (list "h3")))))
                       (client nil)
-                      (server-connection nil))
+                      (server-connection nil)
+                      (original-decoder
+                       (symbol-function
+                        (find-symbol "DECODE-TRANSPORT-PARAMETERS"
+                                     "CL-QUIC-KIT"))))
                  (unwind-protect
                      (progn
                        (progn
@@ -1165,7 +1232,18 @@
                                        :alpn (list "h3")
                                        client-tls-options))
                          (setf (cl-quic-kit::quic-client-transport-parameters client)
-                               parameter-bytes))
+                               parameter-bytes)
+                         (when error-marker
+                           (setf (symbol-function
+                                  (find-symbol "DECODE-TRANSPORT-PARAMETERS"
+                                               "CL-QUIC-KIT"))
+                                 (lambda (bytes &rest options)
+                                   (if (equalp bytes parameter-bytes)
+                                       (error
+                                        (find-symbol "QUIC-ENCODING-ERROR"
+                                                     "CL-QUIC-KIT")
+                                        :message error-marker)
+                                       (apply original-decoder bytes options))))))
                        (setf server-connection (loop repeat 2000
                                                      do (cl-quic-kit:client-poll
                                                          client) (cl-quic-kit:quic-server-poll
@@ -1206,7 +1284,23 @@
                         (format nil
                                 "~A produces a server TRANSPORT_PARAMETER_ERROR close"
                                 description))
-                       (cl-quic-kit:client-poll client)
+                       (progn
+                         (cl-quic-kit:client-poll client)
+                         (when error-marker
+                           (let ((reason
+                                   (cl-quic-kit:quic-connection-closed-reason
+                                    (cl-quic-kit:quic-client-connection client))))
+                             (check
+                              (and
+                               (equalp
+                                reason
+                                (cl-quic-kit::%quic-close-reason
+                                 "invalid peer transport parameters"))
+                               (not
+                                (equalp reason
+                                        (cl-quic-kit::%quic-close-reason
+                                         error-marker))))
+                              "server transport-parameter close reason is fixed and excludes the peer marker"))))
                        (check
                         (and
                          (=
@@ -1226,8 +1320,13 @@
                         (format nil
                                 "~A is never accepted by the server"
                                 description)))
-                   (when client
-                     (cl-quic-kit:client-close client))
+                   (unwind-protect
+                       (when client
+                         (cl-quic-kit:client-close client))
+                     (setf (symbol-function
+                            (find-symbol "DECODE-TRANSPORT-PARAMETERS"
+                                         "CL-QUIC-KIT"))
+                           original-decoder))
                    (cl-quic-kit:quic-server-close server)))))
       (dolist
           (case (list
@@ -1290,8 +1389,11 @@
                                       18
                                       19
                                       20
-                                      21)))))
-        (run-case (first case) (second case))))))
+                                      21)))
+                 (list "peer-controlled transport-parameter diagnostic"
+                       #(#xc0)
+                       "PEER_TP_DIAGNOSTIC_7F3A")))
+        (run-case (first case) (second case) (third case))))))
 (progn
   (defun server-test-remove-temp-directory (directory)
     (dolist (name (list "server.crt" "server.key" "server.der"))
@@ -1752,6 +1854,66 @@
              server fresh-token address fresh-cid source-cid 0)
           (check (eq status :valid)
                  "a newly admitted Retry token remains valid"))))))
+(check
+   (let* ((directory (server-test-make-temp-directory))
+          (socket nil)
+          (server nil)
+          (client nil))
+     (unwind-protect
+         (multiple-value-bind (server-tls-options client-tls-options)
+             (server-test-tls-settings directory)
+           (setf socket
+                 (cl-quic-kit:make-udp-socket
+                  :local-host "127.0.0.1" :local-port 0))
+           (setf server
+                 (cl-quic-kit:make-quic-server
+                  :udp-socket socket
+                  :max-connections 1
+                  :retry-policy :never
+                  :tls-server-options
+                  (append server-tls-options
+                          (list :alpn-protocols (list "h3")))))
+           (setf client
+                 (apply (function cl-quic-kit:make-quic-client)
+                        :server-host "127.0.0.1"
+                        :server-port
+                        (cl-quic-kit:udp-socket-local-port socket)
+                        :idle-timeout 60
+                        :hostname "localhost"
+                        :alpn (list "h3")
+                        client-tls-options))
+           (let* ((server-connection
+                    (server-test-loopback-handshake server client))
+                  (connection
+                    server-connection)
+                  (packet
+                    (cl-quic-kit::%client-build-packet
+                     client :application
+                     (list (cl-quic-kit:make-frame
+                            :stream :stream-id 0 :offset 0 :data #(1) :fin t)
+                           (cl-quic-kit:make-frame
+                            :stream :stream-id 0 :offset 0 :data #() :fin t)))))
+             (and (= (cl-quic-kit:udp-send
+                      (cl-quic-kit::quic-client-udp-socket client)
+                      packet)
+                     (length packet))
+                  (server-test-poll-until-datagram-received
+                   server socket packet)
+                  (eq (cl-quic-kit:connection-state connection) :closing)
+                  (= (cl-quic-kit::quic-connection-closed-error connection) 6)
+                  (loop repeat 1000 do (cl-quic-kit:client-poll client) when (eq (cl-quic-kit:connection-state (cl-quic-kit:quic-client-connection client)) :draining) return t do (sleep 0.001))
+                  (eq (cl-quic-kit:connection-state
+                       (cl-quic-kit:quic-client-connection client))
+                      :draining)
+                  (= (cl-quic-kit::quic-connection-closed-error
+                      (cl-quic-kit:quic-client-connection client))
+                     6))))
+       (when client (cl-quic-kit:client-close client))
+       (if server
+           (cl-quic-kit:quic-server-close server)
+         (when socket (cl-quic-kit:udp-close socket)))
+       (server-test-remove-temp-directory directory)))
+   "server reports FINAL_SIZE_ERROR to peer through quic-server-poll for inconsistent stream final size")
 (progn
   (let* ((directory (server-test-make-temp-directory))
          (socket nil)
@@ -3194,18 +3356,33 @@
               (cl-quic-kit:quic-connection-flush server-connection)
               (cl-quic-kit:quic-server-poll server)
               (cl-quic-kit:client-poll client)
-              (check
-               (not (cl-quic-kit:client-stream-write-pending-p client client-stream))
-               "server read credit releases the queued client write")
+              (progn
+                (check
+                 (cl-quic-kit:client-stream-write-pending-p client client-stream)
+                 "client write remains queued after returning one receive window")
+                (cl-quic-kit:quic-server-poll server)
+                (multiple-value-bind (next-data next-fin)
+                    (cl-quic-kit:quic-connection-read-stream
+                     server-connection server-stream)
+                  (check
+                   (and (equalp next-data (subseq payload 2 4))
+                        (not next-fin))
+                   "server stream read returns the next receive window"))
+                (cl-quic-kit:quic-connection-flush server-connection)
+                (cl-quic-kit:quic-server-poll server)
+                (cl-quic-kit:client-poll client)
+                (check
+                 (not (cl-quic-kit:client-stream-write-pending-p client client-stream))
+                 "second server read credit releases the remaining client write"))
               (cl-quic-kit:quic-server-poll server)
               (progn
                 (multiple-value-bind (remaining-data fin-p)
                     (cl-quic-kit:quic-connection-read-stream
                      server-connection server-stream)
                   (check
-                   (and (equalp remaining-data (subseq payload 2))
+                   (and (equalp remaining-data (subseq payload 4))
                         fin-p)
-                   "server stream read returns remaining octets and FIN"))
+                   "server stream read returns the final octets and FIN"))
                 (let* ((uni-stream
                          (cl-quic-kit:quic-connection-open-stream
                           server-connection :type :unidirectional))

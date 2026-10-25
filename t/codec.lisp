@@ -122,19 +122,24 @@
                   (cl-quic-kit:decode-packet-header bytes
                                                     :short-header-dcid-length 1))))
              "short headers require the fixed bit")
-(codec-check (codec-rejects-p
-              (lambda ()
-                (let ((bytes (codec-copy
-                              (cl-quic-kit:encode-packet-header
-                               (cl-quic-kit:make-packet-header
-                                :type :retry :version 1
-                                :destination-connection-id #(1)
-                                :source-connection-id #(2)
-                                :token #() :retry-integrity-tag
-                                (make-array 16 :element-type '(unsigned-byte 8)))))))
-                  (setf (aref bytes 0) (logior (aref bytes 0) 1))
-                  (cl-quic-kit:decode-packet-header bytes))))
-             "Retry rejects nonzero unused bits")
+(codec-check
+ (let* ((bytes
+          (codec-copy
+           (cl-quic-kit:encode-packet-header
+            (cl-quic-kit:make-packet-header
+             :type :retry :version 1
+             :destination-connection-id #(1)
+             :source-connection-id #(2)
+             :token #() :retry-integrity-tag
+             (make-array 16 :element-type '(unsigned-byte 8))))))
+        (header nil)
+        (end nil))
+   (setf (aref bytes 0) (logior (aref bytes 0) 1))
+   (multiple-value-setq (header end)
+     (cl-quic-kit:decode-packet-header bytes))
+   (and (= end (length bytes))
+        (eq (cl-quic-kit:packet-header-type header) :retry)))
+ "Retry ignores nonzero Unused bits")
 
 (let* ((dcid (make-array 24 :element-type '(unsigned-byte 8)
                               :initial-element #x31))

@@ -45,7 +45,7 @@
    #:flow-control-note-received #:flow-control-update-max-data
    #:flow-control-update-max-receive-data
    #:flow-control-update-max-streams #:flow-control-data-blocked-p
-   #:flow-control-streams-blocked-p #:flow-control-error
+   #:flow-control-streams-blocked-p #:flow-control-error #:final-size-error
    #:flow-control-limit-error #:stream-id-error
    #:flow-control-error-limit #:flow-control-error-attempted
    #:flow-control-mark-data-blocked #:flow-control-mark-streams-blocked

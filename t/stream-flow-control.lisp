@@ -40,7 +40,7 @@
     (stream-flow-check rejected "conflicting overlapping data is rejected"))
   (let ((rejected nil))
     (handler-case (cl-quic-kit:stream-receive-data stream 0 (octets 1 2 3) :fin t)
-      (cl-quic-kit:flow-control-error () (setf rejected t)))
+      (cl-quic-kit:final-size-error () (setf rejected t)))
     (stream-flow-check rejected "a FIN below an already received end is rejected")))
 
 (let ((stream (cl-quic-kit:make-stream 0 :local-initiator :client)))
@@ -49,7 +49,7 @@
                      "received RESET_STREAM changes stream state")
   (let ((rejected nil))
     (handler-case (cl-quic-kit:stream-reset-receive stream 42 1)
-      (cl-quic-kit:flow-control-error () (setf rejected t)))
+      (cl-quic-kit:final-size-error () (setf rejected t)))
     (stream-flow-check rejected "RESET_STREAM final size is immutable")))
 
 (let ((stream (cl-quic-kit:make-stream 1 :local-initiator :client)))

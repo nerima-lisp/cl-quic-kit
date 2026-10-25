@@ -186,7 +186,7 @@
         (let* ((pn-length (packet-header-packet-number-length header))
                (pn (%packet-number-octets
                     (packet-header-packet-number header) pn-length))
-               (first (logior #x40 (ash reserved 4)
+               (first (logior #x40 (ash reserved 3)
                               (if (packet-header-key-phase header) 4 0)
                               (1- pn-length))))
           (%octets (%byte first) dcid pn (if include-payload payload #())))))))
@@ -226,8 +226,6 @@
                       (validate-connection-id scid)
                       (if (eq type :retry)
                           (progn
-                            (when (not (zerop (logand first #x0f)))
-                              (%packet-error "Retry reserved bits must be zero"))
                             (when (< (- (length b) at) 16)
                               (%packet-error "Truncated Retry integrity tag"))
                             (values
@@ -292,7 +290,7 @@
                     :type :short :destination-connection-id dcid
                     :packet-number-length pn-length
                     :packet-number (%packet-number-from-octets pn-bytes)
-                    :reserved-bits (ldb (byte 2 4) first)
+                    :reserved-bits (ldb (byte 2 3) first)
                     :key-phase (logbitp 2 first)
                     :payload (subseq b at))
                    (length b))))))))))

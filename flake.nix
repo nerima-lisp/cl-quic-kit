@@ -100,6 +100,7 @@
             expected="$1"
             port="$2"
             unknown_length="''${3:-0}"
+            mutation_mode="''${4:-0}"
             log="$TMPDIR/receiver-$expected-$port-$unknown_length.log"
             "$TMPDIR/http-receiver" "$expected" 18080 > "$log" 2>&1 &
             receiver_pid=$!
@@ -114,6 +115,8 @@
               CADDY_ROOT="$TMPDIR/self.crt" QUIC_PORT="$port" \
               QUIC_BODY_SIZE="$expected" \
               QUIC_UNKNOWN_LENGTH="$unknown_length" \
+              QUIC_MUTATION_MODE="$mutation_mode" \
+              QUIC_MUTATION_LOG="''${mutation_log:-}" \
               sbcl --non-interactive --load t/http3-loopback.lisp; then
               cat "$log" "$TMPDIR/caddy.log"
               return 1
@@ -167,14 +170,11 @@
               fi
               sleep 0.05
             done
-            if ! HOME="$TMPDIR" XDG_CACHE_HOME="$XDG_CACHE_HOME" \
-              CADDY_ROOT="$TMPDIR/self.crt" QUIC_PORT="$mutation_port" \
-              EXPECT_CONNECTION_CLOSE=1 \
-              sbcl --non-interactive --load t/http3-loopback.lisp; then
+            if ! run_post_case 1048576 "$mutation_port" 0 "$mutation"; then
               cat "$TMPDIR/caddy.log" "$mutation_log"
               exit 1
             fi
-            grep -q "udp-proxy mutated server 1-rtt packet mode=$mutation" \
+            grep -Eq "udp-proxy mutated server 1-rtt packet mode=$mutation \\([0-9]+ bytes\\)" \
               "$mutation_log"
             kill "$proxy_pid" 2>/dev/null || true
             wait "$proxy_pid" 2>/dev/null || true

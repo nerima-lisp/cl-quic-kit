@@ -33,7 +33,9 @@
 (defparameter *quic-max-offset* (1- (expt 2 62)))
 (defparameter *quic-max-streams* (expt 2 60))
 
-(define-condition flow-control-error (error) ())
+(progn
+  (define-condition flow-control-error (error) ())
+  (define-condition final-size-error (flow-control-error) ()))
 (define-condition flow-control-limit-error (flow-control-error)
   ((limit :initarg :limit :reader flow-control-error-limit)
    (attempted :initarg :attempted :reader flow-control-error-attempted)))
