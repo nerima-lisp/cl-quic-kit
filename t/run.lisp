@@ -806,9 +806,36 @@
        selected-version
        (cl-quic-kit:encode-version-negotiation
         sender-id destination (list cl-quic-kit:*quic-version-1*)))
-      (check (and (not (cl-quic-kit::quic-client-closed-p selected-version))
-                  (null wire))
-             "client discards Version Negotiation listing its selected version")))
+      (progn
+        (check (and (not (cl-quic-kit::quic-client-closed-p selected-version))
+                    (null wire))
+               "client discards Version Negotiation listing its selected version")
+        (let* ((attempt-wire nil)
+               (attempt-client
+                 (cl-quic-kit:make-quic-client
+                  :local-connection-id sender-id
+                  :destination-connection-id destination
+                  :disable-hostname-verification-p t
+                  :io-write (lambda (connection bytes)
+                              (declare (ignore connection))
+                              (setf attempt-wire bytes))
+                  :now-fn (lambda () 0))))
+          (cl-quic-kit:client-start attempt-client)
+          (setf attempt-wire nil)
+          (check (and (null (cl-quic-kit::quic-client-received-packets attempt-client))
+                      (not (cl-quic-kit::quic-client-retry-received-p attempt-client)))
+                 "first Version Negotiation test has no processed peer packet")
+          (check (null (cl-quic-kit:client-receive-datagram
+                        attempt-client
+                        (cl-quic-kit:encode-version-negotiation
+                         sender-id destination (list #x6b3343cf))))
+                 "client receives a peer Version Negotiation that omits v1")
+          (check (and (cl-quic-kit::quic-client-closed-p attempt-client)
+                      (eq :closing
+                          (cl-quic-kit:connection-state
+                           (cl-quic-kit::quic-client-connection attempt-client)))
+                      attempt-wire)
+                 "client abandons connection attempt when first Version Negotiation omits v1")))))
 
   (let* ((retry-token (%client-test-octets '(6 7)))
          (retry-scid (%client-test-octets '(80 81 82 83 84 85 86 87)))
