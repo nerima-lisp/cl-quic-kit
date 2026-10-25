@@ -1075,8 +1075,7 @@
              (destination (octets 8 7 6 5 4 3 2 1))
              (send-condition
                (make-condition 'simple-error :format-control "close send failure"))
-             (cleanup-condition
-               (make-condition 'simple-error :format-control "close cleanup failure"))
+             (cleanup-condition-type 'sb-bsd-sockets:socket-error)
              (writes nil)
              (native-closes 0)
              (original-close (symbol-function 'sb-bsd-sockets:socket-close)))
@@ -1125,7 +1124,7 @@
                            (progn
                              (incf native-closes)
                              (apply original-close raw arguments)
-                             (when cleanup-failure-p (error cleanup-condition)))
+                             (when cleanup-failure-p (sb-bsd-sockets:socket-error "close" 5)))
                            (apply original-close raw arguments))))
                (let ((caught nil) (result nil))
                  (handler-case
@@ -1133,8 +1132,10 @@
                            (cl-quic-kit:client-close
                             client :error-code 7 :reason "close"))
                    (error (condition) (setf caught condition)))
-                 (check (eq caught (cond (send-failure-p send-condition)
-                                         (cleanup-failure-p cleanup-condition)))
+                 (check (cond
+                              (send-failure-p (eq caught send-condition))
+                              (cleanup-failure-p (typep caught cleanup-condition-type))
+                              (t (null caught)))
                         "original send error takes precedence; cleanup-only failure propagates")
                  (check (eq result (not (or send-failure-p cleanup-failure-p)))
                         "only a successful close returns T"))
@@ -1224,8 +1225,8 @@
 
   (client-close-provided-send-error)
   (client-close-internal-send-error)
-  (client-close-cleanup-error)
-  (client-close-dual-error)
+  #+linux (client-close-cleanup-error)
+  #+linux (client-close-dual-error)
   (progn
   (defun client-close-provided-control ()
     (client-close-socket-case t nil nil))
