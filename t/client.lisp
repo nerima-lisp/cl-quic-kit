@@ -560,8 +560,18 @@
           (fin-count 0)
           (fin-end 0))
       (dolist (frame frames)
-        (check (<= (length (cl-quic-kit:encode-frame frame)) 1100)
-               "large stream fragments fit the packet payload budget")
+        (progn
+          (check (<= (length (cl-quic-kit:encode-frame frame)) 1100)
+                 "large stream fragments fit the packet payload budget")
+          (when (and (= size 65526) (eq frame (first frames)))
+            (let* ((small-frame
+                     (cl-quic-kit:make-frame
+                      :stream :stream-id 0
+                      :data (make-array 3 :element-type '(unsigned-byte 8)
+                                        :initial-contents '(1 2 3))))
+                   (parts (cl-quic-kit::%client-split-frame small-frame)))
+              (check (and (= (length parts) 1) (eq (first parts) small-frame))
+                     "fitting stream frame is returned unchanged by packet splitting fast path"))))
         (let ((data (cl-quic-kit:frame-field frame :data))
               (offset (cl-quic-kit:frame-field frame :offset 0)))
           (replace received data :start1 offset)
@@ -631,8 +641,30 @@
                (cl-quic-kit.recovery:recovery-state-cwnd
                 (cl-quic-kit::quic-client-recovery client)))
            "client flush does not exceed the congestion window")
-    (check (cl-quic-kit::quic-client-pending-frames client)
-           "congestion-window blocked stream packets remain queued")
+    (progn
+      (check (cl-quic-kit::quic-client-pending-frames client)
+             "congestion-window blocked stream packets remain queued")
+      (let* ((pending (cl-quic-kit::quic-client-pending-frames client))
+             (frames (mapcar #'cdr pending)))
+        (check (and pending
+                    (every (lambda (entry) (eq (car entry) :1-rtt)) pending)
+                    (every (lambda (frame)
+                             (and (eq (cl-quic-kit:frame-type frame) :stream)
+                                  (= (cl-quic-kit:frame-field frame :stream-id)
+                                     (cl-quic-kit::stream-id stream))))
+                           frames)
+                    (loop for left in frames
+                          for right in (cdr frames)
+                          always
+                          (= (+ (cl-quic-kit:frame-field left :offset 0)
+                                (length (cl-quic-kit:frame-field left :data)))
+                             (cl-quic-kit:frame-field right :offset 0)))
+                    (= (+ (cl-quic-kit:frame-field (first frames) :offset 0)
+                          (loop for frame in frames
+                                sum (length (cl-quic-kit:frame-field frame :data))))
+                       (length payload))
+                    (cl-quic-kit:frame-field (car (last frames)) :fin nil))
+               "blocked stream packet suffix preserves order and encryption level")))
     (check (cl-quic-kit:client-stream-write-pending-p client stream)
            "congestion-window blocked stream frames are reported as pending")
     (let ((writes-before-ack (length writes)))
