@@ -12,6 +12,8 @@
   initial-destination-connection-id remote-connection-id retry-token
   packet-numbers received-packets keys recovery sent-packets clock
   pto-probe-budgets pto-probe-frames
+  (authentication-failures 0)
+  (authentication-cipher nil)
   (application-read-key-phase 0)
   application-read-old-key application-read-next-key application-read-next-secret
   application-read-secret application-read-key-update-packet-number
@@ -348,10 +350,15 @@
 (defun %client-install-secret (client level direction secret &key replace-p preserve-hp)
   (let ((wire-level (%client-space-level level)))
     (when (or replace-p (not (%client-key client wire-level direction)))
-      (let* ((old-key (%client-key client wire-level direction))
+      (let* ((cipher (%client-driver-suite-cipher
+                      (quic-client-tls-driver client)))
+             (old-key (%client-key client wire-level direction))
              (new-key (cl-quic-kit.protection:make-key-set
-                       secret :cipher (%client-driver-suite-cipher
-                                       (quic-client-tls-driver client)))))
+                       secret :cipher cipher)))
+        (progn
+          (%client-set-authentication-cipher client cipher)
+          (when (quic-client-closed-p client)
+            (return-from %client-install-secret nil)))
         (when (and preserve-hp old-key)
           (setf (cl-quic-kit.protection:key-set-hp new-key)
                 (cl-quic-kit.protection:key-set-hp old-key)))
@@ -596,6 +603,24 @@
   (let ((number 0))
     (dotimes (index length number)
       (setf number (+ (ash number 8) (aref bytes (+ at index)))))))
+(defun %client-authentication-limit (cipher)
+  (ecase cipher
+    ((:aes-128-gcm :aes-256-gcm) (expt 2 52))
+    (:chacha20-poly1305 (expt 2 36))))
+(defun %client-set-authentication-cipher (client cipher)
+  (setf (quic-client-authentication-cipher client) cipher)
+  (when (> (quic-client-authentication-failures client)
+           (%client-authentication-limit cipher))
+    (%client-protocol-close client #xf "QUIC AEAD integrity limit reached"))
+  cipher)
+(defun %client-authentication-failed (client key)
+  ;; RFC 9001 section 6.6 counts failures across all connection keys.
+  (let* ((cipher (or (quic-client-authentication-cipher client)
+                     (cl-quic-kit.protection:key-set-cipher key)))
+         (failures (incf (quic-client-authentication-failures client)))
+         (limit (%client-authentication-limit cipher)))
+    (when (> failures limit)
+      (%client-protocol-close client #xf "QUIC AEAD integrity limit reached"))))
 
 (defun %client-unprotect-packet (client bytes layout)
   (let* ((type (getf layout :type))
@@ -637,18 +662,20 @@
                            client)))
                   (setf selected-key
                         (quic-client-application-read-old-key client))
-                  (progn
-                    (let ((secret (quic-client-application-read-next-secret client))
-                          (next-key (quic-client-application-read-next-key client)))
-                      (unless (and secret next-key)
-                        (error 'quic-crypto-error
-                               :message "application key phase update unavailable"))
-                      (setf selected-key next-key)
-                      (setf next-read-secret secret
-                            next-read-key next-key)))))))
+                  (let ((secret (quic-client-application-read-next-secret client))
+                        (next-key (quic-client-application-read-next-key client)))
+                    (unless (and secret next-key)
+                      (return-from %client-unprotect-packet nil))
+                    (setf selected-key next-key
+                          next-read-secret secret
+                          next-read-key next-key))))))
         (let ((plaintext
-                (cl-quic-kit.protection:unprotect-payload
-                 selected-key number ciphertext associated)))
+                (handler-case
+                    (cl-quic-kit.protection:unprotect-payload
+                     selected-key number ciphertext associated)
+                  (crypto-kit:aead-authentication-failure ()
+                    (%client-authentication-failed client selected-key)
+                    (return-from %client-unprotect-packet nil)))))
           (when next-read-secret
             (%client-commit-application-read-key-update
              client next-read-secret next-read-key number)
@@ -1409,6 +1436,8 @@
               (:retry (%client-handle-retry client slice) (return)))
             (multiple-value-bind (level number header)
                 (%client-unprotect-packet client slice layout)
+              (when (quic-client-closed-p client)
+                (return-from client-receive-datagram nil))
               (when header
                 (when (and (member level '(:initial :handshake))
                            (plusp (length (packet-header-source-connection-id header))))
@@ -1416,6 +1445,8 @@
                         (packet-header-source-connection-id header)))
                 (let ((frames (decode-frames (packet-header-payload header))))
                   (%client-receive-frames client level number frames)
+                  (when (quic-client-closed-p client)
+                    (return-from client-receive-datagram nil))
                   (setf last-header header)))
               (setf at (+ at (getf layout :end)))
               (when (not (getf layout :long-p)) (return)))))

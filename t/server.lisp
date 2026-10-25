@@ -80,6 +80,66 @@
 (check (server-test-type-error-p
         (lambda () (cl-quic-kit:make-quic-server)))
        "server requires a positive max-connections value")
+(check
+ (let* ((destination
+          (make-array 8 :element-type '(unsigned-byte 8)
+                        :initial-contents '(1 2 3 4 5 6 7 8)))
+        (source
+          (make-array 8 :element-type '(unsigned-byte 8)
+                        :initial-contents '(8 7 6 5 4 3 2 1)))
+        (sender
+          (cl-quic-kit:make-quic-client
+           :local-connection-id source
+           :destination-connection-id destination
+           :disable-hostname-verification-p t))
+        (connection
+          (cl-quic-kit:make-quic-connection
+           :role :server :local-connection-id destination
+           :io-write (lambda (ignored bytes)
+                       (declare (ignore ignored bytes)))))
+        (engine
+          (cl-quic-kit:make-quic-client
+           :connection connection
+           :local-connection-id destination
+           :destination-connection-id source
+           :disable-hostname-verification-p t))
+        (server-connection
+          (cl-quic-kit::%make-server-connection
+           :connection connection :engine engine
+           :local-connection-id destination))
+        (initial
+          (cl-quic-kit.protection:derive-initial-secrets destination))
+        (limit (expt 2 36)))
+   (cl-quic-kit::%client-set-key engine :initial :read
+                                 (getf initial :client))
+   (cl-quic-kit::%client-set-key engine :initial :write
+                                 (getf initial :server))
+   (cl-quic-kit::%client-set-authentication-cipher
+    engine :chacha20-poly1305)
+   (setf (cl-quic-kit::quic-client-authentication-failures engine)
+         (1- limit))
+   (labels ((packet ()
+              (cl-quic-kit::%client-build-packet
+               sender :initial
+               (list (cl-quic-kit:make-frame :ping))))
+            (damaged-packet ()
+              (let ((wire (packet)))
+                (setf (aref wire (1- (length wire)))
+                      (logxor 1 (aref wire (1- (length wire)))))
+                wire)))
+     (cl-quic-kit::%server-process-protected-datagram
+      server-connection
+      (concatenate '(vector (unsigned-byte 8))
+                   (damaged-packet) (damaged-packet) (packet))
+      0)
+     (and (= (cl-quic-kit::quic-client-authentication-failures engine)
+             (1+ limit))
+          (cl-quic-kit:quic-client-closed-p engine)
+          (eq :closing (cl-quic-kit:connection-state connection))
+          (null
+           (cl-quic-kit::%client-level-value
+            (cl-quic-kit::quic-client-received-packets engine) :initial)))))
+ "server enforces the selected AEAD limit across Initial keys and stops coalesced packets after close")
 (progn
   (check
    (let* ((server

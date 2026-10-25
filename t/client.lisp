@@ -20,6 +20,99 @@
                   (= (cl-quic-kit:frame-field frame :stream-id) 0)
                   (equalp (cl-quic-kit:frame-field frame :data) payload))
              "client stream writes are encoded through the injected connection I/O"))))
+(progn
+  (let* ((writes nil)
+         (local (make-array 8 :element-type '(unsigned-byte 8)
+                            :initial-contents '(1 2 3 4 5 6 7 8)))
+         (destination (make-array 8 :element-type '(unsigned-byte 8)
+                                  :initial-contents '(8 7 6 5 4 3 2 1)))
+         (secret (make-array 32 :element-type '(unsigned-byte 8)
+                             :initial-element 17))
+         (key (cl-quic-kit.protection:make-key-set secret))
+         (client (cl-quic-kit:make-quic-client
+                  :local-connection-id local
+                  :destination-connection-id destination
+                  :disable-hostname-verification-p t
+                  :io-write (lambda (ignored bytes)
+                              (declare (ignore ignored))
+                              (push bytes writes))))
+         (limit (expt 2 52)))
+    (dolist (direction '(:read :write))
+      (cl-quic-kit::%client-set-key client :1-rtt direction key))
+    (labels ((packet ()
+               (cl-quic-kit::%client-build-packet
+                client :application (list (cl-quic-kit:make-frame :ping))))
+             (damaged-packet ()
+               (let ((wire (packet)))
+                 (setf (aref wire (1- (length wire)))
+                       (logxor 1 (aref wire (1- (length wire)))))
+                 wire)))
+      (check (null (cl-quic-kit:client-receive-datagram client (damaged-packet)))
+             "unauthenticated application packet is discarded")
+      (check (= (cl-quic-kit::quic-client-authentication-failures client) 1)
+             "AEAD authentication failure increments the connection counter")
+      (check (not (cl-quic-kit:quic-client-closed-p client))
+             "an authentication failure below the limit leaves the client open")
+      (check (null writes) "an authentication drop sends neither ACK nor close")
+      (check (cl-quic-kit:client-receive-datagram client (packet))
+             "a valid packet remains usable after authentication failure")
+      (check (= (cl-quic-kit::quic-client-authentication-failures client) 1)
+             "successful authentication does not reset the counter")
+      (setf (cl-quic-kit::quic-client-authentication-failures client) (- limit 2))
+      (check (null (cl-quic-kit:client-receive-datagram client (damaged-packet)))
+             "the failure immediately below the AEAD limit is discarded")
+      (check (and (= (cl-quic-kit::quic-client-authentication-failures client)
+                     (1- limit))
+                  (not (cl-quic-kit:quic-client-closed-p client)))
+             "the client remains open below the AEAD limit")
+      (check (null (cl-quic-kit:client-receive-datagram client (damaged-packet)))
+             "the failure at the AEAD limit is discarded")
+      (check (and (= (cl-quic-kit::quic-client-authentication-failures client) limit)
+                  (not (cl-quic-kit:quic-client-closed-p client)))
+             "the client remains open at the AEAD limit")
+      (check (null (cl-quic-kit:client-receive-datagram client (damaged-packet)))
+             "the first failure over the AEAD limit is discarded")
+      (check (and (= (cl-quic-kit::quic-client-authentication-failures client)
+                     (1+ limit))
+                  (cl-quic-kit:quic-client-closed-p client)
+                  (eq :closing
+                      (cl-quic-kit:connection-state
+                       (cl-quic-kit::quic-client-connection client)))
+                  writes)
+             "exceeding the AEAD limit closes and emits a CONNECTION_CLOSE")))
+  (progn
+    (dolist (cipher (quote (:aes-128-gcm :aes-256-gcm :chacha20-poly1305)))
+      (let* ((limit (if (eq cipher :chacha20-poly1305) (expt 2 36) (expt 2 52)))
+             (initial-key (cl-quic-kit.protection:make-key-set
+                           (make-array 32 :element-type (quote (unsigned-byte 8))
+                                       :initial-element 19)))
+             (client (cl-quic-kit:make-quic-client
+                      :disable-hostname-verification-p t
+                      :io-write (lambda (ignored bytes)
+                                  (declare (ignore ignored bytes))))))
+        (cl-quic-kit::%client-set-authentication-cipher client cipher)
+        (setf (cl-quic-kit::quic-client-authentication-failures client) (1- limit))
+        (cl-quic-kit::%client-authentication-failed client initial-key)
+        (check (and (= (cl-quic-kit::quic-client-authentication-failures client) limit)
+                    (not (cl-quic-kit:quic-client-closed-p client)))
+               "the selected AEAD accepts failures through its limit across keys")
+        (cl-quic-kit::%client-authentication-failed client initial-key)
+        (check (and (= (cl-quic-kit::quic-client-authentication-failures client)
+                       (1+ limit))
+                    (cl-quic-kit:quic-client-closed-p client))
+               "the selected AEAD closes only after its integrity limit is exceeded")))
+    (let* ((limit (expt 2 36))
+           (client (cl-quic-kit:make-quic-client
+                    :disable-hostname-verification-p t
+                    :io-write (lambda (ignored bytes)
+                                (declare (ignore ignored bytes))))))
+      (setf (cl-quic-kit::quic-client-authentication-failures client) (1+ limit))
+      (cl-quic-kit::%client-set-authentication-cipher client :chacha20-poly1305)
+      (check (and (cl-quic-kit:quic-client-closed-p client)
+                  (eq :closing
+                      (cl-quic-kit:connection-state
+                       (cl-quic-kit::quic-client-connection client))))
+             "selecting ChaCha enforces its limit on failures counted before suite selection"))))
 (let* ((client (cl-quic-kit:make-quic-client
                 :connection (cl-quic-kit:make-quic-connection)
                 :local-connection-id (make-array 8 :element-type '(unsigned-byte 8))
@@ -566,9 +659,11 @@
                              late :application
                              (list (cl-quic-kit:make-frame :ping))))))
             (check (null (cl-quic-kit:client-receive-datagram receiver high-old))
-                   "client rejects an old-key packet at or after the update boundary"))
-          (check (cl-quic-kit::quic-client-closed-p receiver)
-                 "an invalid key phase closes the connection")))))))
+                   "old-key packet rejected by the next key is discarded")
+            (check (= (cl-quic-kit::quic-client-authentication-failures receiver) 1)
+                   "failed next-key authentication increments the lifetime counter"))
+          (check (not (cl-quic-kit::quic-client-closed-p receiver))
+                 "invalid key phase below the limit leaves the connection open")))))))
 
 (let ((server (cl-quic-kit:make-udp-socket :local-host "127.0.0.1"
                                            :local-port 0

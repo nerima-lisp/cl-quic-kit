@@ -1045,14 +1045,18 @@
               (octets-copy (second event)))
         (case (getf event :type)
           (:cipher-suite
-           (let ((suite (getf event :suite))
-                 (emit (%client-function
-                        "CL-TLS-KIT"
-                        "QUIC-TLS-BOUNDARY-EMIT-CIPHER-SUITE")))
+           (let* ((suite (getf event :suite))
+                  (engine (server-connection-engine server-connection))
+                  (emit (%client-function
+                         "CL-TLS-KIT"
+                         "QUIC-TLS-BOUNDARY-EMIT-CIPHER-SUITE")))
+             (setf (server-connection-cipher-suite server-connection) suite)
+             (%client-set-authentication-cipher engine (%server-suite-cipher suite))
+             (when (quic-client-closed-p engine)
+               (return-from %server-handle-tls-events server-connection))
              (when emit
                (funcall emit (server-connection-tls-boundary server-connection)
-                        suite))
-             (setf (server-connection-cipher-suite server-connection) suite)))
+                        suite))))
           (:send
            (unless (eq (getf event :content-type) :alert)
              (%server-queue-crypto server-connection
@@ -1318,6 +1322,9 @@
                         (%client-unprotect-packet engine slice layout)
                       (crypto-kit:aead-authentication-failure ()
                                                               (values nil nil nil)))
+                  (when (member (connection-state connection)
+                            '(:closing :draining :closed))
+                    (return-from %server-process-protected-datagram server-connection))
                   (when header
                     (let* ((frames (handler-case
                                        (decode-frames (packet-header-payload header))
