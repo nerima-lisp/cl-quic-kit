@@ -920,10 +920,25 @@
                      :initial)
                     initial-number-before-retry)
                  "Retry ClientHello uses a fresh Initial packet number"))))
-    (let ((mismatched (cl-quic-kit:make-quic-client
-                       :local-connection-id sender-id
-                       :destination-connection-id destination
-                       :disable-hostname-verification-p t)))
+    (let* ((mismatched
+             (cl-quic-kit:make-quic-client
+              :local-connection-id sender-id
+              :destination-connection-id destination
+              :disable-hostname-verification-p t))
+            (mismatched-without-tag
+              (cl-quic-kit:encode-packet-header
+               (cl-quic-kit:make-packet-header
+                :type :retry :version cl-quic-kit:*quic-version-1*
+                :destination-connection-id receiver-id
+                :source-connection-id retry-scid :token retry-token
+                :retry-integrity-tag zero-tag)))
+            (mismatched-pseudo
+              (subseq mismatched-without-tag 0
+                      (- (length mismatched-without-tag) 16)))
+            (mismatched-tag
+              (cl-quic-kit:retry-integrity-tag
+               mismatched-pseudo
+               :original-destination-connection-id destination)))
       (cl-quic-kit:client-receive-datagram
        mismatched
        (cl-quic-kit:encode-packet-header
@@ -931,10 +946,89 @@
          :type :retry :version cl-quic-kit:*quic-version-1*
          :destination-connection-id receiver-id
          :source-connection-id retry-scid :token retry-token
-         :retry-integrity-tag tag)))
+         :retry-integrity-tag mismatched-tag)))
       (check (cl-quic-kit:quic-client-closed-p mismatched)
              "Retry for another connection is rejected"))))
 (load (test-path "t/server.lisp"))
+(let* ((original-dcid (%client-test-octets '(90 91 92 93 94 95 96 97)))
+       (local-cid (%client-test-octets '(100 101 102 103 104 105 106 107)))
+       (mismatched-cid (%client-test-octets '(130 131 132 133 134 135 136 137)))
+       (retry-scid (%client-test-octets '(110 111 112 113 114 115 116 117)))
+       (retry-token (%client-test-octets '(120 121))))
+  (labels ((make-retry-wire (destination-cid source-cid token corrupt-tag-p)
+             (let* ((zero-tag (make-array 16 :element-type '(unsigned-byte 8)
+                                          :initial-element 0))
+                    (without-tag
+                      (cl-quic-kit:encode-packet-header
+                       (cl-quic-kit:make-packet-header
+                        :type :retry :version cl-quic-kit:*quic-version-1*
+                        :destination-connection-id destination-cid
+                        :source-connection-id source-cid :token token
+                        :retry-integrity-tag zero-tag)))
+                    (pseudo (subseq without-tag 0 (- (length without-tag) 16)))
+                    (tag (copy-seq
+                          (cl-quic-kit:retry-integrity-tag
+                           pseudo :original-destination-connection-id
+                           original-dcid))))
+               (when corrupt-tag-p
+                 (setf (aref tag 0) (logxor (aref tag 0) 1)))
+               (cl-quic-kit:encode-packet-header
+                (cl-quic-kit:make-packet-header
+                 :type :retry :version cl-quic-kit:*quic-version-1*
+                 :destination-connection-id destination-cid
+                 :source-connection-id source-cid :token token
+                 :retry-integrity-tag tag))))
+           (retry-state (client)
+             (list (copy-seq (cl-quic-kit::quic-client-retry-token client))
+                   (copy-seq
+                    (cl-quic-kit::quic-client-remote-connection-id client))
+                   (copy-seq
+                    (cl-quic-kit::quic-client-initial-destination-connection-id
+                     client))
+                   (copy-tree (cl-quic-kit::quic-client-packet-numbers client))
+                   (copy-tree (cl-quic-kit::quic-client-received-packets client))
+                   (cl-quic-kit::%client-key client :initial :read)
+                   (cl-quic-kit::%client-key client :initial :write)
+                   (copy-list
+                    (cl-quic-kit::quic-client-pending-frames client))
+                   (cl-quic-kit::quic-client-retry-received-p client)
+                   (cl-quic-kit:connection-state
+                    (cl-quic-kit::quic-client-connection client))
+                   (cl-quic-kit::quic-client-closed-p client)))
+           (check-retry-drop (wire description)
+             (let* ((outbound-wires nil)
+                    (client
+                      (cl-quic-kit:make-quic-client
+                       :local-connection-id local-cid
+                       :destination-connection-id original-dcid
+                       :hostname "localhost"
+                       :io-write (lambda (connection bytes)
+                                   (declare (ignore connection))
+                                   (push (copy-seq bytes) outbound-wires))
+                       :now-fn (lambda () 0))))
+               (cl-quic-kit:client-start client)
+               (setf outbound-wires nil)
+               (let ((state-before (retry-state client)))
+                 (check (null (cl-quic-kit:client-receive-datagram client wire))
+                        (format nil "~A is silently discarded" description))
+                 (check
+                  (and (equalp state-before (retry-state client))
+                       (not (cl-quic-kit::quic-client-closed-p client))
+                       (not (eq (cl-quic-kit:connection-state
+                                 (cl-quic-kit::quic-client-connection client))
+                                :closing))
+                       (null outbound-wires))
+                  (format nil "~A preserves client state and emits no close"
+                          description)))))
+    (check-retry-drop
+     (make-retry-wire mismatched-cid retry-scid retry-token t)
+     "Retry with an invalid integrity tag and mismatched destination CID")
+    (check-retry-drop
+     (make-retry-wire local-cid retry-scid #() nil)
+     "Retry with an empty token")
+    (check-retry-drop
+     (make-retry-wire local-cid original-dcid retry-token nil)
+     "Retry with SCID equal to the original DCID"))))
 (load (test-path "t/state.lisp"))
 (load (test-path "t/recovery.lisp"))
 (load (test-path "t/stream-flow-control.lisp"))
