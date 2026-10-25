@@ -1115,7 +1115,7 @@
                  (check (equalp bytes #(7 8 9))
                         "loopback receives the actual socket's bytes")
                  (check (= length 3) "loopback reports the actual datagram length")
-                 (check (equalp peer #(127 0 0 1))
+                 (check (equalp (first peer) #(127 0 0 1))
                         "loopback receives from localhost")
                  (check (plusp (cl-quic-kit:udp-socket-local-port socket))
                         "the client socket has a real bound port"))
