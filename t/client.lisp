@@ -1154,3 +1154,161 @@
   (client-close-cleanup-error)
   (client-close-dual-error)
   (client-default-clock-ack-rtt-bounded))
+(progn
+  (defun auth-drop-octets (&rest bytes)
+    (make-array (length bytes) :element-type '(unsigned-byte 8)
+                :initial-contents bytes))
+
+  (defun auth-drop-bare-packet ()
+    (cl-quic-kit:encode-packet-header
+     (cl-quic-kit:make-packet-header
+      :type :initial :version 1
+      :destination-connection-id (auth-drop-octets 1 2 3 4 5 6 7 8)
+      :source-connection-id (auth-drop-octets 8 7 6 5 4 3 2 1)
+      :packet-number 0 :packet-number-length 4 :payload (auth-drop-octets))))
+
+  (defun auth-drop-fixture (function)
+    (let ((cl-quic-kit.protection::*hkdf-extract* #'crypto-kit:hkdf-extract)
+          (cl-quic-kit.protection::*hkdf-expand* #'crypto-kit:hkdf-expand)
+          (cl-quic-kit.protection::*aead-seal* #'crypto-kit:aead-seal)
+          (cl-quic-kit.protection::*aead-open* #'crypto-kit:aead-open)
+          (cl-quic-kit.protection::*aes-ecb* #'crypto-kit:aes-encrypt-block)
+          (cl-quic-kit.protection::*chacha20* #'crypto-kit:chacha20-keystream)
+          (cl-quic-kit.protection::*constant-time-equal*
+            #'crypto-kit:constant-time-equal))
+      (let* ((local (auth-drop-octets 1 2 3 4 5 6 7 8))
+             (peer (auth-drop-octets 8 7 6 5 4 3 2 1))
+             (keys (cl-quic-kit.protection:derive-initial-secrets peer))
+             (writes nil)
+             (client (cl-quic-kit:make-quic-client
+                      :local-connection-id local
+                      :destination-connection-id peer
+                      :disable-hostname-verification-p t
+                      :io-write (lambda (ignored bytes)
+                                  (declare (ignore ignored))
+                                  (push bytes writes)))))
+        (labels ((packet (number &optional (payload (auth-drop-octets 1 0 0 0 0 0 0 0)))
+                   (let* ((wire
+                            (cl-quic-kit:encode-packet-header
+                             (cl-quic-kit:make-packet-header
+                              :type :initial :version 1
+                              :destination-connection-id local
+                              :source-connection-id peer
+                              :packet-number number :packet-number-length 4
+                              :payload
+                              (make-array (+ 16 (length payload))
+                                          :element-type '(unsigned-byte 8)))))
+                          (offset (- (length wire) (length payload) 20))
+                          (key (getf keys :server)))
+                     (replace wire
+                              (cl-quic-kit.protection:protect-payload
+                               key number payload (subseq wire 0 (+ offset 4)))
+                              :start1 (+ offset 4))
+                     (cl-quic-kit.protection:apply-header-protection
+                      key wire (subseq wire (+ offset 4) (+ offset 20)) offset 4 t)))
+                 (frames ()
+                   (loop for wire in (reverse writes) append
+                     (let* ((header (cl-quic-kit:decode-packet-header wire))
+                            (offset
+                              (- (length wire)
+                                 (cl-quic-kit:packet-header-payload-length header)))
+                            (key (getf keys :client))
+                            (sample (subseq wire (+ offset 4) (+ offset 20)))
+                            (first
+                              (cl-quic-kit.protection:remove-header-protection
+                               key wire sample offset 4 t))
+                            (pn-length (1+ (logand (aref first 0) 3)))
+                            (plain
+                              (cl-quic-kit.protection:remove-header-protection
+                               key wire sample offset pn-length t))
+                            (decoded (cl-quic-kit:decode-packet-header plain)))
+                       (cl-quic-kit:decode-frames
+                        (cl-quic-kit.protection:unprotect-payload
+                         key (cl-quic-kit:packet-header-packet-number decoded)
+                         (cl-quic-kit:packet-header-payload decoded)
+                         (subseq plain 0 (+ offset pn-length))))))))
+          (unwind-protect
+               (funcall function client #'packet #'frames
+                        (lambda () (reverse writes)))
+            (cl-quic-kit:client-close client)
+            (check (cl-quic-kit::quic-client-closed-p client)
+                   "fixture cleanup closes the client")
+            (check (null (cl-quic-kit::quic-client-udp-socket client))
+                   "fixture owns no UDP socket"))))))
+
+  (defun auth-drop-damaged-packet (packet number)
+    (let ((bytes (funcall packet number)))
+      (setf (aref bytes (1- (length bytes)))
+            (logxor 1 (aref bytes (1- (length bytes)))))
+      bytes))
+
+  (defun auth-drop-check-ack (frames number)
+    (let ((ack (find :ack frames :key #'cl-quic-kit:frame-type)))
+      (check ack "authenticated control produces an ACK")
+      (check (= number (cl-quic-kit:frame-field ack :largest-acknowledged))
+             "only authenticated packet numbers are acknowledged")
+      (check (equal (list (cons number 0))
+                    (cl-quic-kit:frame-field ack :ranges))
+             "discarded packets do not enter ACK ranges")
+      (check (not (find :connection-close frames
+                        :key #'cl-quic-kit:frame-type))
+             "drop does not emit CONNECTION_CLOSE")))
+
+  (defun auth-drop-prefix-and-sample ()
+    (auth-drop-fixture
+     (lambda (client packet frames writes)
+       (dolist (bytes
+                (list (auth-drop-octets 255)
+                      (auth-drop-octets 192)
+                      (auth-drop-octets 0)
+                      (auth-drop-bare-packet)))
+         (check (null (cl-quic-kit:client-receive-datagram client bytes))
+                "unauthenticated truncated input is discarded")
+         (check (not (cl-quic-kit::quic-client-closed-p client))
+                "drop stays open")
+         (check (null (funcall writes)) "drop performs no writes")
+         (check (zerop (cl-quic-kit::quic-client-authentication-failures client))
+                "header truncation is not an AEAD failure"))
+       (check (cl-quic-kit:client-receive-datagram client (funcall packet 4))
+              "authenticated control after truncated input is accepted")
+       (cl-quic-kit:client-poll client)
+       (auth-drop-check-ack (funcall frames) 4))))
+
+  (defun auth-drop-coalesced ()
+    (auth-drop-fixture
+     (lambda (client packet frames writes)
+       (declare (ignore writes))
+       (let ((header
+               (cl-quic-kit:client-receive-datagram
+                client
+                (concatenate '(vector (unsigned-byte 8))
+                             (auth-drop-damaged-packet packet 0)
+                             (funcall packet 1)))))
+         (check (and header
+                     (= 1 (cl-quic-kit:packet-header-packet-number header)))
+                "a later authenticated coalesced packet is processed"))
+       (check (= 1 (cl-quic-kit::quic-client-authentication-failures client))
+              "coalesced failure counted once")
+       (check (not (cl-quic-kit::quic-client-closed-p client))
+              "coalesced drop stays open")
+       (cl-quic-kit:client-poll client)
+       (auth-drop-check-ack (funcall frames) 1)))
+    (auth-drop-fixture
+     (lambda (client packet frames writes)
+       (declare (ignore writes))
+       (let ((header
+               (cl-quic-kit:client-receive-datagram
+                client
+                (concatenate '(vector (unsigned-byte 8))
+                             (funcall packet 2)
+                             (auth-drop-octets 255)))))
+         (check (and header
+                     (= 2 (cl-quic-kit:packet-header-packet-number header)))
+                "truncated tail preserves the authenticated preceding packet"))
+       (check (not (cl-quic-kit::quic-client-closed-p client))
+              "truncated tail stays open")
+       (cl-quic-kit:client-poll client)
+       (auth-drop-check-ack (funcall frames) 2))))
+
+  (auth-drop-prefix-and-sample)
+  (auth-drop-coalesced))

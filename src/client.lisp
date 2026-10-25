@@ -1441,8 +1441,11 @@
                  :message "QUIC datagram exceeds the maximum UDP payload size"))
         (loop while (< at (length bytes)) do
           (let* ((slice (subseq bytes at))
-                 (layout (%client-layout
-                           slice :short-header-dcid-length short-header-dcid-length)))
+                 (layout (handler-case
+                           (%client-layout
+                            slice :short-header-dcid-length short-header-dcid-length)
+                         (quic-encoding-error ()
+                           (return-from client-receive-datagram last-header)))))
             (case (getf layout :type)
               (:version-negotiation (%client-handle-version-negotiation client slice)
                                     (return))
