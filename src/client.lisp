@@ -1488,8 +1488,9 @@
        client (if (typep condition 'quic-frame-space-error) 10 7)
        "invalid packet") nil)
     (error (condition)
-      (declare (ignore condition))
-      (%client-protocol-close client 7 "invalid packet") nil)))
+      (%client-protocol-close
+       client (if (typep condition 'final-size-error) 6 7)
+       "invalid packet") nil)))
 
 (defun make-client-tls-boundary (client &key transport-parameters)
   "Attach cl-tls-kit's QUIC CRYPTO boundary."

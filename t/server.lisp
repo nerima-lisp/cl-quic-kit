@@ -77,9 +77,67 @@
       (progn (funcall function) nil)
     (type-error () t)))
 
-(check (server-test-type-error-p
-        (lambda () (cl-quic-kit:make-quic-server)))
-       "server requires a positive max-connections value")
+(progn
+  (check (server-test-type-error-p
+          (lambda () (cl-quic-kit:make-quic-server)))
+         "server requires a positive max-connections value")
+  (check
+   (let* ((client-id
+          (make-array 8 :element-type '(unsigned-byte 8)
+                        :initial-contents '(1 2 3 4 5 6 7 8)))
+          (server-id
+          (make-array 8 :element-type '(unsigned-byte 8)
+                        :initial-contents '(8 7 6 5 4 3 2 1)))
+          (server-wire nil)
+          (key
+            (cl-quic-kit.protection:make-key-set
+             (make-array 32 :element-type '(unsigned-byte 8)
+                         :initial-element #x55)))
+          (peer
+            (cl-quic-kit:make-quic-client
+             :local-connection-id client-id
+             :destination-connection-id server-id
+             :disable-hostname-verification-p t))
+          (connection
+            (cl-quic-kit:make-quic-connection
+             :role :server :local-connection-id server-id
+             :io-write (lambda (ignored bytes)
+                         (declare (ignore ignored))
+                         (setf server-wire bytes))))
+          (engine
+            (cl-quic-kit:make-quic-client
+             :connection connection
+             :local-connection-id server-id
+             :destination-connection-id client-id
+             :disable-hostname-verification-p t))
+          (server-connection
+            (cl-quic-kit::%make-server-connection
+             :connection connection :engine engine
+             :local-connection-id server-id
+             :handshake-complete-p t)))
+     (dolist (direction '(:read :write))
+       (cl-quic-kit::%client-set-key engine :1-rtt direction key)
+       (cl-quic-kit::%client-set-key peer :1-rtt direction key))
+     (let ((packet
+             (cl-quic-kit::%client-build-packet
+              peer :application
+              (list (cl-quic-kit:make-frame
+                     :stream :stream-id 0 :offset 0 :data #(1) :fin t)
+                    (cl-quic-kit:make-frame
+                     :stream :stream-id 0 :offset 0 :data #() :fin t)))))
+       (cl-quic-kit::%server-process-protected-datagram
+        server-connection packet 0)
+       (and (eq (cl-quic-kit:connection-state connection) :closing)
+            (= (cl-quic-kit::quic-connection-closed-error connection) 6)
+            server-wire
+            (cl-quic-kit:client-receive-datagram peer server-wire)
+            (eq (cl-quic-kit:connection-state
+                 (cl-quic-kit:quic-client-connection peer))
+                :draining)
+            (= (cl-quic-kit::quic-connection-closed-error
+                (cl-quic-kit:quic-client-connection peer))
+               6))))
+   "server reports FINAL_SIZE_ERROR to peer for inconsistent stream final size"))
 (check
  (let* ((destination
           (make-array 8 :element-type '(unsigned-byte 8)

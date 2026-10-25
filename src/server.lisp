@@ -1363,8 +1363,10 @@
                                                 (declare (ignore condition))
                                                 (%server-close-on-frame-error server-connection 4))
                             (flow-control-error (condition)
-                                                (declare (ignore condition))
-                                                (%server-close-on-frame-error server-connection 3))
+                                                (%server-close-on-frame-error
+                                                 server-connection
+                                                 (if (typep condition 'final-size-error)
+                                                     6 3)))
                             (stream-id-error (condition)
                                              (declare (ignore condition))
                                              (%server-close-on-frame-error server-connection 5))

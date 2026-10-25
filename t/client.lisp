@@ -1458,4 +1458,51 @@
        (auth-drop-check-ack (funcall frames) 2))))
 
   (auth-drop-prefix-and-sample)
-  (auth-drop-coalesced))
+  (progn
+  (auth-drop-coalesced)
+  (let* ((client-id (auth-drop-octets 1 2 3 4 5 6 7 8))
+         (server-id (auth-drop-octets 8 7 6 5 4 3 2 1))
+         (close-wire nil)
+         (key
+           (cl-quic-kit.protection:make-key-set
+            (make-array 32 :element-type '(unsigned-byte 8)
+                        :initial-element #x55)))
+         (client
+           (cl-quic-kit:make-quic-client
+            :local-connection-id client-id
+            :destination-connection-id server-id
+            :disable-hostname-verification-p t
+            :io-write (lambda (connection bytes)
+                        (declare (ignore connection))
+                        (setf close-wire bytes))))
+         (peer
+           (cl-quic-kit:make-quic-client
+            :connection
+            (cl-quic-kit:make-quic-connection
+             :role :server :local-connection-id server-id)
+            :local-connection-id server-id
+            :destination-connection-id client-id
+            :disable-hostname-verification-p t)))
+    (dolist (direction '(:read :write))
+      (cl-quic-kit::%client-set-key client :1-rtt direction key)
+      (cl-quic-kit::%client-set-key peer :1-rtt direction key))
+    (let ((packet
+            (cl-quic-kit::%client-build-packet
+             peer :application
+             (list (cl-quic-kit:make-frame
+                    :stream :stream-id 1 :offset 0 :data #(1) :fin t)
+                   (cl-quic-kit:make-frame
+                    :stream :stream-id 1 :offset 0 :data #() :fin t)))))
+      (check (and packet
+                  (null (cl-quic-kit:client-receive-datagram client packet))
+                  close-wire)
+             "client emits a close for inconsistent stream final size")
+      (check
+       (and (cl-quic-kit:client-receive-datagram peer close-wire)
+            (eq (cl-quic-kit:connection-state
+                 (cl-quic-kit:quic-client-connection peer))
+                :draining)
+            (= (cl-quic-kit::quic-connection-closed-error
+                (cl-quic-kit:quic-client-connection peer))
+               6))
+       "client reports FINAL_SIZE_ERROR to peer for inconsistent stream final size")))))
