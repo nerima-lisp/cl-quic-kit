@@ -95,6 +95,11 @@
     (cond
      ((null key) :no-read-key)
      ((< (length bytes) (+ pn-offset 20)) :short-hp-sample)
+     ((and (not (logbitp 7 (aref bytes 0)))
+           (not (cl-quic-kit::connection-id-known-p
+                 (cl-quic-kit:quic-client-connection client)
+                 (subseq bytes 1 pn-offset))))
+      :unknown-destination-connection-id)
      (t
       (let* ((sample (subseq bytes (+ pn-offset 4) (+ pn-offset 20)))
              (header (cl-quic-kit.protection:remove-header-protection

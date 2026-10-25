@@ -109,8 +109,8 @@
   (let* ((writes nil)
          (local (make-array 8 :element-type '(unsigned-byte 8)
                             :initial-contents '(1 2 3 4 5 6 7 8)))
-         (destination (make-array 8 :element-type '(unsigned-byte 8)
-                                  :initial-contents '(8 7 6 5 4 3 2 1)))
+         ;; The packet helper loops protected packets through this client's receive path.
+         (destination local)
          (secret (make-array 32 :element-type '(unsigned-byte 8)
                              :initial-element 17))
          (key (cl-quic-kit.protection:make-key-set secret))
@@ -752,13 +752,13 @@
                     '(0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15
                       16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31)))
        (make-test-client
-         (lambda (local)
+         (lambda (local remote)
            (cl-quic-kit:make-quic-client
             :local-connection-id local
-            :destination-connection-id destination
+            :destination-connection-id remote
             :disable-hostname-verification-p t))))
-  (let* ((sender (funcall make-test-client (test-octets '(1 2 3 4 5 6 7 8))))
-         (receiver (funcall make-test-client (test-octets '(11 12 13 14 15 16 17 18))))
+  (let* ((sender (funcall make-test-client (test-octets '(1 2 3 4 5 6 7 8)) destination))
+         (receiver (funcall make-test-client destination (test-octets '(1 2 3 4 5 6 7 8))))
          (old-key (cl-quic-kit.protection:make-key-set old-secret)))
     (dolist (direction '(:read :write))
       (cl-quic-kit::%client-set-key receiver :1-rtt direction old-key))
@@ -779,7 +779,8 @@
                  "client starts an application key update")
       (let ((delayed-peer-old
               (let ((late (funcall make-test-client
-                                   (test-octets '(21 22 23 24 25 26 27 28)))))
+                                    (test-octets '(21 22 23 24 25 26 27 28))
+                                    (test-octets '(1 2 3 4 5 6 7 8)))))
                 (cl-quic-kit::%client-set-key late :1-rtt :write old-key)
                 (setf (cl-quic-kit::quic-client-application-write-secret late)
                       old-secret
@@ -810,8 +811,8 @@
                   1)
                "client records the first packet number of the new read generation")
         (let ((delayed-old (let ((late (funcall make-test-client
-                                                (test-octets
-                                                 '(1 2 3 4 5 6 7 8)))))
+                                                (test-octets '(1 2 3 4 5 6 7 8))
+                                                destination)))
                              (cl-quic-kit::%client-set-key late :1-rtt :write old-key)
                              (setf (cl-quic-kit::quic-client-application-write-secret late)
                                    old-secret)
@@ -855,8 +856,8 @@
                  receiver)
                 t)
           (let ((high-old (let ((late (funcall make-test-client
-                                                (test-octets
-                                                '(1 2 3 4 5 6 7 8)))))
+                                                (test-octets '(1 2 3 4 5 6 7 8))
+                                                destination)))
                             (cl-quic-kit::%client-set-key late :1-rtt :write old-key)
                             (setf (cl-quic-kit::quic-client-application-write-secret late)
                                   old-secret

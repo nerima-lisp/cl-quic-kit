@@ -667,7 +667,9 @@
     (let ((response (server-test-receive socket)))
       (check (<= (length response) (* 3 (length packet)))
              "the protected Retry-token error response stays within three times its input size")
-      (cl-quic-kit:client-receive-datagram client response)))
+      (progn
+        (cl-quic-kit:client-receive-datagram client response)
+        (cl-quic-kit:decode-packet-header response))))
 
   (defun server-test-retry-policy-never ()
     (let* ((directory (server-test-make-temp-directory))
@@ -1031,10 +1033,13 @@
                             header)
                            wrong-client-cid))
                      "a token with a mismatched client CID receives a close to that CID")
-              (check (= (cl-quic-kit::quic-connection-closed-error
-                         (cl-quic-kit:quic-client-connection client))
-                        #x0b)
-                     "a token with a mismatched client CID receives INVALID_TOKEN"))))
+              (check (and
+                      (eq (cl-quic-kit:connection-state
+                           (cl-quic-kit:quic-client-connection client))
+                          :handshaking)
+                      (null (cl-quic-kit::quic-connection-closed-error
+                             (cl-quic-kit:quic-client-connection client))))
+                     "client drops an INVALID_TOKEN close addressed to a different CID"))))
       (cl-quic-kit:client-close client)
       (cl-quic-kit:quic-server-close server))))
 (defun server-test-run-openssl (&rest arguments)

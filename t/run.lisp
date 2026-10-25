@@ -635,7 +635,7 @@
        (ack-wire nil)
        (sender (cl-quic-kit:make-quic-client
                 :local-connection-id sender-id
-                :destination-connection-id destination
+                :destination-connection-id receiver-id
                 :hostname "localhost"
                 :io-write (lambda (connection bytes)
                             (declare (ignore connection))
@@ -651,7 +651,7 @@
                                (setf ack-wire bytes))
                    :now-fn (lambda () 0))
                   :local-connection-id receiver-id
-                  :destination-connection-id destination
+                  :destination-connection-id sender-id
                   :disable-hostname-verification-p t
                   :now-fn (lambda () 0))))
   (cl-quic-kit:client-start sender)
@@ -1035,35 +1035,106 @@
                      :initial)
                     initial-number-before-retry)
                  "Retry ClientHello uses a fresh Initial packet number"))))
-    (let* ((mismatched
-             (cl-quic-kit:make-quic-client
-              :local-connection-id sender-id
-              :destination-connection-id destination
-              :disable-hostname-verification-p t))
-            (mismatched-without-tag
-              (cl-quic-kit:encode-packet-header
-               (cl-quic-kit:make-packet-header
-                :type :retry :version cl-quic-kit:*quic-version-1*
-                :destination-connection-id receiver-id
-                :source-connection-id retry-scid :token retry-token
-                :retry-integrity-tag zero-tag)))
-            (mismatched-pseudo
-              (subseq mismatched-without-tag 0
-                      (- (length mismatched-without-tag) 16)))
-            (mismatched-tag
-              (cl-quic-kit:retry-integrity-tag
-               mismatched-pseudo
-               :original-destination-connection-id destination)))
-      (cl-quic-kit:client-receive-datagram
-       mismatched
-       (cl-quic-kit:encode-packet-header
-        (cl-quic-kit:make-packet-header
-         :type :retry :version cl-quic-kit:*quic-version-1*
-         :destination-connection-id receiver-id
-         :source-connection-id retry-scid :token retry-token
-         :retry-integrity-tag mismatched-tag)))
-      (check (cl-quic-kit:quic-client-closed-p mismatched)
-             "Retry for another connection is rejected"))))
+    (let* ((close-wire nil)
+       (mismatched
+         (cl-quic-kit:make-quic-client
+          :local-connection-id sender-id
+          :destination-connection-id destination
+          :disable-hostname-verification-p t
+          :io-write (lambda (connection bytes)
+                      (declare (ignore connection))
+                      (setf close-wire bytes))))
+       (mismatched-without-tag
+         (cl-quic-kit:encode-packet-header
+          (cl-quic-kit:make-packet-header
+           :type :retry :version cl-quic-kit:*quic-version-1*
+           :destination-connection-id receiver-id
+           :source-connection-id retry-scid :token retry-token
+           :retry-integrity-tag zero-tag)))
+       (mismatched-pseudo
+         (subseq mismatched-without-tag
+                 0 (- (length mismatched-without-tag) 16)))
+       (mismatched-tag
+         (cl-quic-kit:retry-integrity-tag
+          mismatched-pseudo
+          :original-destination-connection-id destination))
+       (state-before
+         (cl-quic-kit:connection-state
+          (cl-quic-kit::quic-client-connection mismatched)))
+       (remote-id-before
+         (copy-seq (cl-quic-kit::quic-client-remote-connection-id mismatched)))
+       (packet-numbers-before
+         (copy-tree (cl-quic-kit::quic-client-packet-numbers mismatched)))
+       (received-packets-before
+         (copy-tree (cl-quic-kit::quic-client-received-packets mismatched)))
+       (pending-frames-before
+         (copy-list (cl-quic-kit::quic-client-pending-frames mismatched))))
+  (check (null
+          (cl-quic-kit:client-receive-datagram
+           mismatched
+           (cl-quic-kit:encode-packet-header
+            (cl-quic-kit:make-packet-header
+             :type :retry :version cl-quic-kit:*quic-version-1*
+             :destination-connection-id receiver-id
+             :source-connection-id retry-scid :token retry-token
+             :retry-integrity-tag mismatched-tag))))
+         "client discards Retry for another connection")
+  (check (and (not (cl-quic-kit:quic-client-closed-p mismatched))
+              (not (eq (cl-quic-kit:connection-state
+                        (cl-quic-kit::quic-client-connection mismatched))
+                       :closing))
+              (eq state-before
+                  (cl-quic-kit:connection-state
+                   (cl-quic-kit::quic-client-connection mismatched)))
+              (equalp remote-id-before
+                      (cl-quic-kit::quic-client-remote-connection-id mismatched))
+              (equal packet-numbers-before
+                     (cl-quic-kit::quic-client-packet-numbers mismatched))
+              (equal received-packets-before
+                     (cl-quic-kit::quic-client-received-packets mismatched))
+              (equal pending-frames-before
+                     (cl-quic-kit::quic-client-pending-frames mismatched))
+              (zerop (length (cl-quic-kit::quic-client-retry-token mismatched)))
+              (not (cl-quic-kit::quic-client-retry-received-p mismatched))
+              (null close-wire))
+         "mismatched Retry leaves client state unchanged and sends no close")
+  (let* ((secrets (cl-quic-kit.protection:derive-initial-secrets destination))
+         (peer
+           (cl-quic-kit:make-quic-client
+            :local-connection-id retry-scid
+            :destination-connection-id receiver-id
+            :disable-hostname-verification-p t)))
+    (cl-quic-kit::%client-set-key peer :initial :write (getf secrets :server))
+    (cl-quic-kit::%client-set-key mismatched :initial :read (getf secrets :server))
+    (cl-quic-kit::%client-set-key mismatched :initial :write (getf secrets :client))
+    (let* ((initial-wire
+             (cl-quic-kit::%client-build-packet
+              peer :initial (list (cl-quic-kit:make-frame :ping))))
+           (remote-before
+             (copy-seq
+              (cl-quic-kit::quic-client-remote-connection-id mismatched)))
+           (numbers-before
+             (copy-tree
+              (cl-quic-kit::quic-client-packet-numbers mismatched)))
+           (received-before
+             (copy-tree
+              (cl-quic-kit::quic-client-received-packets mismatched))))
+      (setf close-wire nil)
+      (check (and initial-wire (>= (length initial-wire) 1200))
+             "mismatched-CID Initial fixture is protected and parseable")
+      (cl-quic-kit:client-receive-datagram mismatched initial-wire)
+      (check (and (not (cl-quic-kit:quic-client-closed-p mismatched))
+                  (not (eq (cl-quic-kit:connection-state
+                            (cl-quic-kit::quic-client-connection mismatched))
+                           :closing))
+                  (equalp remote-before
+                          (cl-quic-kit::quic-client-remote-connection-id mismatched))
+                  (equal numbers-before
+                         (cl-quic-kit::quic-client-packet-numbers mismatched))
+                  (equal received-before
+                         (cl-quic-kit::quic-client-received-packets mismatched))
+                  (null close-wire))
+             "client discards a protected Initial with a mismatched destination CID"))))))
 (load (test-path "t/server.lisp"))
 (let* ((original-dcid (%client-test-octets '(90 91 92 93 94 95 96 97)))
        (local-cid (%client-test-octets '(100 101 102 103 104 105 106 107)))
