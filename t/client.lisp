@@ -282,7 +282,9 @@
          "RESET_STREAM returns only credit not returned by earlier reads"))
 (let* ((client (cl-quic-kit:make-quic-client
                 :connection (cl-quic-kit:make-quic-connection)
-                :disable-hostname-verification-p t))
+                :disable-hostname-verification-p t
+                :transport-parameters (list (cons 4 1048576)
+                                            (cons 6 32768))))
        (flow (cl-quic-kit::quic-client-flow-control client))
        (window-size 4096)
        (window-count 40)
@@ -313,7 +315,17 @@
       (multiple-value-bind (data fin)
           (cl-quic-kit:client-read-stream client stream)
         (check (and (equalp data payload) (not fin))
-               "client reads return the received stream window"))
+               "client reads return the received stream window")
+        (when (zerop window)
+          (check (= (cl-quic-kit::stream-receive-max-offset stream) 36864)
+                 "client read advances the configured stream receive window")
+          (let* ((frames (mapcar (function cdr)
+                                 (cl-quic-kit::quic-client-pending-frames client)))
+                 (maximum (find :max-stream-data frames
+                                :key (function cl-quic-kit:frame-type))))
+            (check (and maximum
+                        (= (cl-quic-kit:frame-field maximum :maximum) 36864))
+                   "client read advertises the configured receive window with MAX_STREAM_DATA"))))
       (check (and (null (cl-quic-kit::stream-received-segments stream))
                   (null (cl-quic-kit::stream-segments stream))
                   (zerop (cl-quic-kit:stream-readable-bytes stream)))
@@ -339,7 +351,7 @@
             (+ initial-connection-limit (* window-size window-count)))
          "client reads regrant connection receive credit for returned bytes")
   (check (= (cl-quic-kit::stream-receive-max-offset stream)
-            (+ (* window-size window-count) 65536))
+            (+ (* window-size window-count) 32768))
          "client reads regrant stream receive credit")
   (check (= (cl-quic-kit:flow-control-connection-received flow)
             (* window-size window-count))

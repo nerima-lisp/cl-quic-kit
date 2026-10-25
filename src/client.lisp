@@ -1284,7 +1284,8 @@
     (incf (stream-receive-credit-returned stream) (length data))
     (let* ((flow (quic-client-flow-control client))
            (stream-maximum
-             (min *quic-max-offset* (+ (stream-read-offset stream) 65536)))
+             (min *quic-max-offset*
+                  (+ (stream-receive-max-offset stream) (length data))))
            (connection-maximum
              (min *quic-max-offset*
                   (+ (flow-control-connection-receive-limit flow)
