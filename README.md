@@ -50,6 +50,7 @@ The optional `:idle-timeout` value uses seconds and defaults to 30; the client a
 After the handshake, `(cl-quic-kit:client-open-stream client nil)` opens a locally initiated bidirectional
 stream. Its second argument is currently unused. Pass the returned stream to
 `cl-quic-kit:client-write-stream` or `cl-quic-kit:client-read-stream`.
+Both operations require a stream registered with that client.
 
 - `cl-quic-kit:client-accept-peer-stream (client)` returns one available peer stream. Call
   `(cl-quic-kit:client-poll client)` to send queued frames and process available UDP datagrams, then call
@@ -89,6 +90,20 @@ stream. Its second argument is currently unused. Pass the returned stream to
   For a client, read it with
   `(cl-quic-kit:quic-connection-closed-reason (cl-quic-kit:quic-client-connection client))`. The optional
   `:reason` passed to `cl-quic-kit:client-close` is sent to the peer but does not populate this field.
+
+The client checks reserved bits after payload authentication. Nonzero reserved bits close the connection
+with `PROTOCOL_VIOLATION` (`#x0a`). AEAD authentication failures are counted across connection keys;
+successful packets do not reset the counter. Exceeding the selected cipher's integrity limit closes the
+connection with `AEAD_LIMIT_REACHED` (`#x0f`): `2^52` for AES-128/256-GCM or `2^36` for
+ChaCha20-Poly1305. Malformed packets caught by `client-receive-datagram` use the fixed reason
+`invalid packet`; frame-space errors retain close code 10. The client does not send provider diagnostics to
+the peer.
+
+When called on an open client, `cl-quic-kit:client-close` attempts to send `CONNECTION_CLOSE`. It closes
+the UDP socket even if sending fails, including a supplied socket. Call it when finished, including after a
+protocol close, to ensure socket cleanup. If sending and socket cleanup both fail, the send error is
+re-signaled. A cleanup-only error also propagates. Repeated calls do not send another close or repeat socket
+cleanup.
 
 ## Server API
 
