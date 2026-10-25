@@ -284,7 +284,8 @@
                 :connection (cl-quic-kit:make-quic-connection)
                 :disable-hostname-verification-p t
                 :transport-parameters (list (cons 4 1048576)
-                                            (cons 6 32768))))
+                                            (cons 6 32768)
+                                            (cons 8 1))))
        (flow (cl-quic-kit::quic-client-flow-control client))
        (window-size 4096)
        (window-count 40)
