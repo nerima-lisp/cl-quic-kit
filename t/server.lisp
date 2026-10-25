@@ -77,67 +77,7 @@
       (progn (funcall function) nil)
     (type-error () t)))
 
-(progn
-  (check (server-test-type-error-p
-          (lambda () (cl-quic-kit:make-quic-server)))
-         "server requires a positive max-connections value")
-  (check
-   (let* ((client-id
-          (make-array 8 :element-type '(unsigned-byte 8)
-                        :initial-contents '(1 2 3 4 5 6 7 8)))
-          (server-id
-          (make-array 8 :element-type '(unsigned-byte 8)
-                        :initial-contents '(8 7 6 5 4 3 2 1)))
-          (server-wire nil)
-          (key
-            (cl-quic-kit.protection:make-key-set
-             (make-array 32 :element-type '(unsigned-byte 8)
-                         :initial-element #x55)))
-          (peer
-            (cl-quic-kit:make-quic-client
-             :local-connection-id client-id
-             :destination-connection-id server-id
-             :disable-hostname-verification-p t))
-          (connection
-            (cl-quic-kit:make-quic-connection
-             :role :server :local-connection-id server-id
-             :io-write (lambda (ignored bytes)
-                         (declare (ignore ignored))
-                         (setf server-wire bytes))))
-          (engine
-            (cl-quic-kit:make-quic-client
-             :connection connection
-             :local-connection-id server-id
-             :destination-connection-id client-id
-             :disable-hostname-verification-p t))
-          (server-connection
-            (cl-quic-kit::%make-server-connection
-             :connection connection :engine engine
-             :local-connection-id server-id
-             :handshake-complete-p t)))
-     (dolist (direction '(:read :write))
-       (cl-quic-kit::%client-set-key engine :1-rtt direction key)
-       (cl-quic-kit::%client-set-key peer :1-rtt direction key))
-     (let ((packet
-             (cl-quic-kit::%client-build-packet
-              peer :application
-              (list (cl-quic-kit:make-frame
-                     :stream :stream-id 0 :offset 0 :data #(1) :fin t)
-                    (cl-quic-kit:make-frame
-                     :stream :stream-id 0 :offset 0 :data #() :fin t)))))
-       (cl-quic-kit::%server-process-protected-datagram
-        server-connection packet 0)
-       (and (eq (cl-quic-kit:connection-state connection) :closing)
-            (= (cl-quic-kit::quic-connection-closed-error connection) 6)
-            server-wire
-            (cl-quic-kit:client-receive-datagram peer server-wire)
-            (eq (cl-quic-kit:connection-state
-                 (cl-quic-kit:quic-client-connection peer))
-                :draining)
-            (= (cl-quic-kit::quic-connection-closed-error
-                (cl-quic-kit:quic-client-connection peer))
-               6))))
-   "server reports FINAL_SIZE_ERROR to peer for inconsistent stream final size"))
+(progn (check (server-test-type-error-p (lambda () (cl-quic-kit:make-quic-server))) "server requires a positive max-connections value") )
 (check
  (let* ((destination
           (make-array 8 :element-type '(unsigned-byte 8)
@@ -1914,6 +1854,66 @@
              server fresh-token address fresh-cid source-cid 0)
           (check (eq status :valid)
                  "a newly admitted Retry token remains valid"))))))
+(check
+   (let* ((directory (server-test-make-temp-directory))
+          (socket nil)
+          (server nil)
+          (client nil))
+     (unwind-protect
+         (multiple-value-bind (server-tls-options client-tls-options)
+             (server-test-tls-settings directory)
+           (setf socket
+                 (cl-quic-kit:make-udp-socket
+                  :local-host "127.0.0.1" :local-port 0))
+           (setf server
+                 (cl-quic-kit:make-quic-server
+                  :udp-socket socket
+                  :max-connections 1
+                  :retry-policy :never
+                  :tls-server-options
+                  (append server-tls-options
+                          (list :alpn-protocols (list "h3")))))
+           (setf client
+                 (apply (function cl-quic-kit:make-quic-client)
+                        :server-host "127.0.0.1"
+                        :server-port
+                        (cl-quic-kit:udp-socket-local-port socket)
+                        :idle-timeout 60
+                        :hostname "localhost"
+                        :alpn (list "h3")
+                        client-tls-options))
+           (let* ((server-connection
+                    (server-test-loopback-handshake server client))
+                  (connection
+                    server-connection)
+                  (packet
+                    (cl-quic-kit::%client-build-packet
+                     client :application
+                     (list (cl-quic-kit:make-frame
+                            :stream :stream-id 0 :offset 0 :data #(1) :fin t)
+                           (cl-quic-kit:make-frame
+                            :stream :stream-id 0 :offset 0 :data #() :fin t)))))
+             (and (= (cl-quic-kit:udp-send
+                      (cl-quic-kit::quic-client-udp-socket client)
+                      packet)
+                     (length packet))
+                  (server-test-poll-until-datagram-received
+                   server socket packet)
+                  (eq (cl-quic-kit:connection-state connection) :closing)
+                  (= (cl-quic-kit::quic-connection-closed-error connection) 6)
+                  (loop repeat 1000 do (cl-quic-kit:client-poll client) when (eq (cl-quic-kit:connection-state (cl-quic-kit:quic-client-connection client)) :draining) return t do (sleep 0.001))
+                  (eq (cl-quic-kit:connection-state
+                       (cl-quic-kit:quic-client-connection client))
+                      :draining)
+                  (= (cl-quic-kit::quic-connection-closed-error
+                      (cl-quic-kit:quic-client-connection client))
+                     6))))
+       (when client (cl-quic-kit:client-close client))
+       (if server
+           (cl-quic-kit:quic-server-close server)
+         (when socket (cl-quic-kit:udp-close socket)))
+       (server-test-remove-temp-directory directory)))
+   "server reports FINAL_SIZE_ERROR to peer through quic-server-poll for inconsistent stream final size")
 (progn
   (let* ((directory (server-test-make-temp-directory))
          (socket nil)
