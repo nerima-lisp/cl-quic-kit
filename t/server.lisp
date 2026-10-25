@@ -3293,18 +3293,33 @@
               (cl-quic-kit:quic-connection-flush server-connection)
               (cl-quic-kit:quic-server-poll server)
               (cl-quic-kit:client-poll client)
-              (check
-               (not (cl-quic-kit:client-stream-write-pending-p client client-stream))
-               "server read credit releases the queued client write")
+              (progn
+                (check
+                 (cl-quic-kit:client-stream-write-pending-p client client-stream)
+                 "client write remains queued after returning one receive window")
+                (cl-quic-kit:quic-server-poll server)
+                (multiple-value-bind (next-data next-fin)
+                    (cl-quic-kit:quic-connection-read-stream
+                     server-connection server-stream)
+                  (check
+                   (and (equalp next-data (subseq payload 2 4))
+                        (not next-fin))
+                   "server stream read returns the next receive window"))
+                (cl-quic-kit:quic-connection-flush server-connection)
+                (cl-quic-kit:quic-server-poll server)
+                (cl-quic-kit:client-poll client)
+                (check
+                 (not (cl-quic-kit:client-stream-write-pending-p client client-stream))
+                 "second server read credit releases the remaining client write"))
               (cl-quic-kit:quic-server-poll server)
               (progn
                 (multiple-value-bind (remaining-data fin-p)
                     (cl-quic-kit:quic-connection-read-stream
                      server-connection server-stream)
                   (check
-                   (and (equalp remaining-data (subseq payload 2))
+                   (and (equalp remaining-data (subseq payload 4))
                         fin-p)
-                   "server stream read returns remaining octets and FIN"))
+                   "server stream read returns the final octets and FIN"))
                 (let* ((uni-stream
                          (cl-quic-kit:quic-connection-open-stream
                           server-connection :type :unidirectional))
