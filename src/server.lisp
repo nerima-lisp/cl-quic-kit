@@ -978,20 +978,22 @@
                          "Client initial_source_connection_id does not match the Initial source connection ID")))
                     parameters)
                 (quic-encoding-error (condition)
-                                     (let* ((connection
-                                             (server-connection-connection server-connection))
-                                            (engine (server-connection-engine server-connection))
-                                            (frame
-                                             (%connection-prepare-close
-                                              connection :transport-parameter-error
-                                              (quic-error-message condition))))
-                                       (when frame
-                                         (setf (quic-client-closed-p engine) t)
-                                         (%client-queue-frame
-                                          engine frame
-                                          (if (%client-key engine :1-rtt :write) :1-rtt :initial))
-                                         (client-flush engine)))
-                                     (return-from %server-complete-connection server-connection))))
+                  (declare (ignore condition))
+                  (let* ((connection
+                           (server-connection-connection server-connection))
+                         (engine (server-connection-engine server-connection))
+                         (frame
+                           (%connection-prepare-close
+                            connection :transport-parameter-error
+                            "invalid peer transport parameters")))
+                    (when frame
+                      (setf (quic-client-closed-p engine) t)
+                      (%client-queue-frame
+                       engine frame
+                       (if (%client-key engine :1-rtt :write) :1-rtt :initial))
+                      (client-flush engine)))
+                  (return-from %server-complete-connection
+                    server-connection))))
              (connection (server-connection-connection server-connection))
              (local-idle-timeout (quic-connection-idle-timeout connection))
              (peer-idle-timeout (cdr (assoc 1 peer-parameters))))

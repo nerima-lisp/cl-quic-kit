@@ -1192,7 +1192,7 @@
                                      value))
              (integer-parameter (id value)
                (parameter id (cl-quic-kit:encode-varint value)))
-             (run-case (description parameter-bytes)
+             (run-case (description parameter-bytes &optional error-marker)
                (let* ((socket
                        (cl-quic-kit:make-udp-socket :local-host
                                                     "127.0.0.1"
@@ -1211,7 +1211,11 @@
                                                      :tls-server-options
                                                      (append server-tls-options (list :alpn-protocols (list "h3")))))
                       (client nil)
-                      (server-connection nil))
+                      (server-connection nil)
+                      (original-decoder
+                       (symbol-function
+                        (find-symbol "DECODE-TRANSPORT-PARAMETERS"
+                                     "CL-QUIC-KIT"))))
                  (unwind-protect
                      (progn
                        (progn
@@ -1225,7 +1229,18 @@
                                        :alpn (list "h3")
                                        client-tls-options))
                          (setf (cl-quic-kit::quic-client-transport-parameters client)
-                               parameter-bytes))
+                               parameter-bytes)
+                         (when error-marker
+                           (setf (symbol-function
+                                  (find-symbol "DECODE-TRANSPORT-PARAMETERS"
+                                               "CL-QUIC-KIT"))
+                                 (lambda (bytes &rest options)
+                                   (if (equalp bytes parameter-bytes)
+                                       (error
+                                        (find-symbol "QUIC-ENCODING-ERROR"
+                                                     "CL-QUIC-KIT")
+                                        :message error-marker)
+                                       (apply original-decoder bytes options))))))
                        (setf server-connection (loop repeat 2000
                                                      do (cl-quic-kit:client-poll
                                                          client) (cl-quic-kit:quic-server-poll
@@ -1266,7 +1281,23 @@
                         (format nil
                                 "~A produces a server TRANSPORT_PARAMETER_ERROR close"
                                 description))
-                       (cl-quic-kit:client-poll client)
+                       (progn
+                         (cl-quic-kit:client-poll client)
+                         (when error-marker
+                           (let ((reason
+                                   (cl-quic-kit:quic-connection-closed-reason
+                                    (cl-quic-kit:quic-client-connection client))))
+                             (check
+                              (and
+                               (equalp
+                                reason
+                                (cl-quic-kit::%quic-close-reason
+                                 "invalid peer transport parameters"))
+                               (not
+                                (equalp reason
+                                        (cl-quic-kit::%quic-close-reason
+                                         error-marker))))
+                              "server transport-parameter close reason is fixed and excludes the peer marker"))))
                        (check
                         (and
                          (=
@@ -1286,8 +1317,13 @@
                         (format nil
                                 "~A is never accepted by the server"
                                 description)))
-                   (when client
-                     (cl-quic-kit:client-close client))
+                   (unwind-protect
+                       (when client
+                         (cl-quic-kit:client-close client))
+                     (setf (symbol-function
+                            (find-symbol "DECODE-TRANSPORT-PARAMETERS"
+                                         "CL-QUIC-KIT"))
+                           original-decoder))
                    (cl-quic-kit:quic-server-close server)))))
       (dolist
           (case (list
@@ -1350,8 +1386,11 @@
                                       18
                                       19
                                       20
-                                      21)))))
-        (run-case (first case) (second case))))))
+                                      21)))
+                 (list "peer-controlled transport-parameter diagnostic"
+                       #(#xc0)
+                       "PEER_TP_DIAGNOSTIC_7F3A")))
+        (run-case (first case) (second case) (third case))))))
 (progn
   (defun server-test-remove-temp-directory (directory)
     (dolist (name (list "server.crt" "server.key" "server.der"))
