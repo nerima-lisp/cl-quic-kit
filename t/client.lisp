@@ -1083,7 +1083,173 @@
                   (eq (type-error-datum condition) :invalid-octet-vector)
                   (not (search secret-report report)))
              "type errors retain a safe octet classification datum"))))
-(eval-when (:compile-toplevel :load-toplevel :execute) (require :sb-posix))
+(progn
+  (eval-when (:compile-toplevel :load-toplevel :execute)
+    (require :sb-posix))
+  (flet ((octets (&rest values)
+           (make-array (length values) :element-type (quote (unsigned-byte 8))
+                       :initial-contents values)))
+    (labels ((make-client (local destination writes)
+               (cl-quic-kit:make-quic-client
+                :local-connection-id local
+                :destination-connection-id destination
+                :disable-hostname-verification-p t
+                :io-write (lambda (ignored bytes)
+                            (declare (ignore ignored))
+                            (push bytes writes))))
+             (server-packet (local source level number key frames)
+               (let ((server (cl-quic-kit:make-quic-client
+                              :local-connection-id source
+                              :destination-connection-id local
+                              :disable-hostname-verification-p t)))
+                 (cl-quic-kit::%client-set-key server level :write key)
+                 (setf (cl-quic-kit::quic-client-packet-numbers server)
+                       (list (cons level number)))
+                 (cl-quic-kit::%client-build-packet server level frames)))
+             (retry-packet (local retry-cid original token)
+               (let* ((base (cl-quic-kit:make-packet-header
+                             :type :retry :version cl-quic-kit:*quic-version-1*
+                             :destination-connection-id local
+                             :source-connection-id retry-cid
+                             :token token
+                             :retry-integrity-tag (make-array
+                                                   16
+                                                   :element-type
+                                                   (quote (unsigned-byte 8))
+                                                   :initial-element 0)))
+                      (pseudo-wire (cl-quic-kit:encode-packet-header base))
+                      (tag (cl-quic-kit::retry-integrity-tag
+                            (subseq pseudo-wire 0 (- (length pseudo-wire) 16))
+                            :original-destination-connection-id original)))
+                 (cl-quic-kit:encode-packet-header
+                  (cl-quic-kit:make-packet-header
+                   :type :retry :version cl-quic-kit:*quic-version-1*
+                   :destination-connection-id local
+                   :source-connection-id retry-cid
+                   :token token :retry-integrity-tag tag)))))
+      (let* ((local (octets 1 2 3 4 5 6 7 8))
+             (original (octets 9 10 11 12 13 14 15 16))
+             (first-server-cid (octets 21 22 23 24 25 26 27 28))
+             (other-server-cid (octets 31 32 33 34 35 36 37 38))
+             (writes nil)
+             (client (make-client local original writes))
+             (handshake-secret (make-array
+                                32 :element-type (quote (unsigned-byte 8))
+                                :initial-element 77))
+             (handshake-key (cl-quic-kit.protection:make-key-set handshake-secret))
+             (initial-key
+               (getf (cl-quic-kit.protection:derive-initial-secrets original) :server)))
+        (cl-quic-kit::%client-set-key client :handshake :read handshake-key)
+        (let ((handshake-wire
+                (server-packet
+                 local first-server-cid :handshake 0 handshake-key
+                 (list (cl-quic-kit:make-frame :ping)))))
+          (check (cl-quic-kit:client-receive-datagram client handshake-wire)
+                 "client accepts authenticated Handshake before the first Initial")
+          (check (and (not
+                       (cl-quic-kit::quic-client-server-initial-source-connection-id-set-p
+                        client))
+                      (equalp (cl-quic-kit::quic-client-remote-connection-id client)
+                              original))
+                 "Handshake source CID does not select the server CID"))
+        (let ((initial-wire
+                (server-packet
+                 local first-server-cid :initial 0 initial-key
+                 (list (cl-quic-kit:make-frame :ping)))))
+          (check (cl-quic-kit:client-receive-datagram client initial-wire)
+                 "client pins the server CID from the first decryptable Initial")
+          (check (and (cl-quic-kit::quic-client-server-initial-source-connection-id-set-p
+                       client)
+                      (equalp
+                       (cl-quic-kit::quic-client-server-initial-source-connection-id client)
+                       first-server-cid)
+                      (equalp (cl-quic-kit::quic-client-remote-connection-id client)
+                              first-server-cid))
+                 "first Initial source CID becomes the remote server CID"))
+        (let* ((state-before
+                 (cl-quic-kit:connection-state
+                  (cl-quic-kit::quic-client-connection client)))
+               (received-before
+                 (copy-tree (cl-quic-kit::quic-client-received-packets client)))
+               (mismatched-handshake
+                 (server-packet
+                  local other-server-cid :handshake 1 handshake-key
+                  (list (cl-quic-kit:make-frame
+                         :connection-close :error-code 0 :frame-type 0 :reason #())))))
+          (check (null (cl-quic-kit:client-receive-datagram
+                        client mismatched-handshake))
+                 "client drops authenticated Handshake with a changed server CID")
+          (check (and (equalp
+                       (cl-quic-kit::quic-client-server-initial-source-connection-id client)
+                       first-server-cid)
+                      (equalp (cl-quic-kit::quic-client-remote-connection-id client)
+                              first-server-cid)
+                      (equal (cl-quic-kit::quic-client-received-packets client)
+                             received-before)
+                      (eql (cl-quic-kit:connection-state
+                            (cl-quic-kit::quic-client-connection client))
+                           state-before)
+                      (not (cl-quic-kit::quic-client-closed-p client))
+                      (null writes))
+                 "changed Handshake CID leaves CID, packet, connection, and close state unchanged")))
+      (let* ((local (octets 41 42 43 44 45 46 47 48))
+             (original (octets 49 50 51 52 53 54 55 56))
+             (retry-cid (octets 61 62 63 64 65 66 67 68))
+             (first-server-cid (octets 71 72 73 74 75 76 77 78))
+             (other-server-cid (octets 81 82 83 84 85 86 87 88))
+             (token (octets 5 4 3 2))
+             (writes nil)
+             (client (make-client local original writes))
+             (initial-key nil))
+        (check (null (cl-quic-kit:client-receive-datagram
+                      client (retry-packet local retry-cid original token)))
+               "client accepts an authenticated Retry before the first Initial")
+        (check (and (cl-quic-kit::quic-client-retry-received-p client)
+                    (not
+                     (cl-quic-kit::quic-client-server-initial-source-connection-id-set-p
+                      client))
+                    (equalp (cl-quic-kit::quic-client-remote-connection-id client)
+                            retry-cid))
+               "Retry source CID does not pin the server CID")
+        (setf initial-key
+              (getf (cl-quic-kit.protection:derive-initial-secrets retry-cid) :server))
+        (let ((initial-wire
+                (server-packet
+                 local first-server-cid :initial 0 initial-key
+                 (list (cl-quic-kit:make-frame :ping)))))
+          (check (cl-quic-kit:client-receive-datagram client initial-wire)
+                 "client accepts the first authenticated Initial after Retry")
+          (check (and (cl-quic-kit::quic-client-server-initial-source-connection-id-set-p
+                       client)
+                      (equalp
+                       (cl-quic-kit::quic-client-server-initial-source-connection-id client)
+                       first-server-cid)
+                      (equalp (cl-quic-kit::quic-client-remote-connection-id client)
+                              first-server-cid))
+                 "post-Retry Initial source CID selects the server CID"))
+        (let* ((state-before
+                (cl-quic-kit:connection-state
+                 (cl-quic-kit::quic-client-connection client)))
+               (mismatched-initial
+                 (server-packet
+                  local other-server-cid :initial 1 initial-key
+                  (list (cl-quic-kit:make-frame
+                         :connection-close :error-code 0 :frame-type 0 :reason #())))))
+          (check (null (cl-quic-kit:client-receive-datagram
+                        client mismatched-initial))
+                 "client drops a changed CID after the first post-Retry Initial")
+          (check (and (equalp
+                       (cl-quic-kit::quic-client-remote-connection-id client)
+                       first-server-cid)
+                      (equal (cdr (assoc :initial
+                                         (cl-quic-kit::quic-client-received-packets client)))
+                             (list 0))
+                      (eql (cl-quic-kit:connection-state
+                            (cl-quic-kit::quic-client-connection client))
+                           state-before)
+                      (not (cl-quic-kit::quic-client-closed-p client))
+                      (null writes))
+                 "changed post-Retry CID does not process frames or close the client"))))))
 (progn
   (defun client-close-fd-open-p (descriptor)
     (handler-case

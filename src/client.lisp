@@ -9,7 +9,9 @@
   pending-frames pending-stream-writes crypto-send-offsets
   peer-transport-parameters closed-p started-p
   flow-control
-  initial-destination-connection-id remote-connection-id retry-token retry-received-p
+  initial-destination-connection-id remote-connection-id
+  server-initial-source-connection-id server-initial-source-connection-id-set-p
+  retry-token retry-received-p
   packet-numbers received-packets keys recovery sent-packets clock
   pto-probe-budgets pto-probe-frames
   (authentication-failures 0)
@@ -628,7 +630,8 @@
     (when (> failures limit)
       (%client-protocol-close client #xf "QUIC AEAD integrity limit reached"))))
 
-(defun %client-unprotect-packet (client bytes layout)
+(defun %client-unprotect-packet
+    (client bytes layout &key expected-source-connection-id)
   (let* ((type (getf layout :type))
          (level (case type (:initial :initial) (:handshake :handshake)
                  (:0-rtt :0-rtt) (:short :1-rtt)))
@@ -682,17 +685,20 @@
                   (crypto-kit:aead-authentication-failure ()
                     (%client-authentication-failed client selected-key)
                     (return-from %client-unprotect-packet nil)))))
-          (progn
-            (when (plusp
-                   (ldb (byte 2 (if (getf layout :long-p) 2 3)) first))
-              (%client-protocol-close
-               client #xa "non-zero QUIC reserved bits")
-              (return-from %client-unprotect-packet nil))
-            (when next-read-secret
-              (%client-commit-application-read-key-update
-               client next-read-secret next-read-key number)
-              (%client-rotate-application-write-key
-               client :force-p t :update-read-p nil)))
+          (when (and expected-source-connection-id
+                     (not (equalp expected-source-connection-id
+                                   (getf layout :scid))))
+            (return-from %client-unprotect-packet (values nil nil nil)))
+          (when (plusp
+                 (ldb (byte 2 (if (getf layout :long-p) 2 3)) first))
+            (%client-protocol-close
+             client #xa "non-zero QUIC reserved bits")
+            (return-from %client-unprotect-packet nil))
+          (when next-read-secret
+            (%client-commit-application-read-key-update
+             client next-read-secret next-read-key number)
+            (%client-rotate-application-write-key
+             client :force-p t :update-read-p nil))
           (values level number
                   (make-packet-header
                    :type type :version (getf layout :version)
@@ -1417,7 +1423,9 @@
       (return-from %client-handle-retry nil))
     (setf (quic-client-retry-token client) (packet-header-token header)
           (quic-client-remote-connection-id client)
-          (packet-header-source-connection-id header))
+          (packet-header-source-connection-id header)
+          (quic-client-server-initial-source-connection-id client) nil
+          (quic-client-server-initial-source-connection-id-set-p client) nil)
     (let ((initial (cl-quic-kit.protection:derive-initial-secrets
                     (quic-client-remote-connection-id client))))
       (%client-set-key client :initial :write (getf initial :client))
@@ -1454,43 +1462,60 @@
                  :message "QUIC datagram exceeds the maximum UDP payload size"))
         (loop while (< at (length bytes)) do
           (let* ((slice (subseq bytes at))
-       (layout (handler-case
-                   (%client-layout
-                    slice :short-header-dcid-length short-header-dcid-length)
-                 (quic-encoding-error ()
-                   (return-from client-receive-datagram last-header)))))
-  (unless (connection-id-known-p
-           (quic-client-connection client) (getf layout :dcid))
-    (return-from client-receive-datagram last-header))
-  (case (getf layout :type)
-    (:version-negotiation (%client-handle-version-negotiation client slice)
-                          (return))
-    (:retry (%client-handle-retry client slice) (return)))
-  (multiple-value-bind (level number header)
-      (%client-unprotect-packet client slice layout)
-    (when (quic-client-closed-p client)
-      (return-from client-receive-datagram nil))
-    (when header
-      (when (and (member level '(:initial :handshake))
-                 (plusp (length (packet-header-source-connection-id header))))
-        (setf (quic-client-remote-connection-id client)
-              (packet-header-source-connection-id header)))
-      (let ((frames (decode-frames (packet-header-payload header))))
-        (%client-receive-frames client level number frames)
-        (when (quic-client-closed-p client)
-          (return-from client-receive-datagram nil))
-        (setf last-header header)))
-    (setf at (+ at (getf layout :end)))
-    (when (not (getf layout :long-p)) (return)))))
+                 (layout (handler-case
+                             (%client-layout
+                              slice :short-header-dcid-length short-header-dcid-length)
+                           (quic-encoding-error ()
+                             (return-from client-receive-datagram last-header)))))
+            (unless (connection-id-known-p
+                     (quic-client-connection client) (getf layout :dcid))
+              (return-from client-receive-datagram last-header))
+            (case (getf layout :type)
+              (:version-negotiation (%client-handle-version-negotiation client slice)
+                                    (return))
+              (:retry (%client-handle-retry client slice) (return)))
+            (multiple-value-bind (level number header)
+                (%client-unprotect-packet
+                 client slice layout
+                 :expected-source-connection-id
+                 (and (getf layout :long-p)
+                      (quic-client-server-initial-source-connection-id-set-p
+                       client)
+                      (quic-client-server-initial-source-connection-id client)))
+              (when (quic-client-closed-p client)
+                (return-from client-receive-datagram nil))
+              (when header
+                (unless (and (getf layout :long-p)
+                             (quic-client-server-initial-source-connection-id-set-p client)
+                             (not (equalp
+                                   (packet-header-source-connection-id header)
+                                   (quic-client-server-initial-source-connection-id
+                                    client))))
+                  (when (eq level :initial)
+                    (unless (quic-client-server-initial-source-connection-id-set-p
+                             client)
+                      (setf (quic-client-server-initial-source-connection-id client)
+                            (packet-header-source-connection-id header)
+                            (quic-client-server-initial-source-connection-id-set-p
+                             client)
+                            t))
+                    (setf (quic-client-remote-connection-id client)
+                          (quic-client-server-initial-source-connection-id client)))
+                  (let ((frames (decode-frames (packet-header-payload header))))
+                    (%client-receive-frames client level number frames)
+                    (when (quic-client-closed-p client)
+                      (return-from client-receive-datagram nil))
+                    (setf last-header header)))))
+            (setf at (+ at (getf layout :end)))
+            (when (not (getf layout :long-p)) (return))))
         last-header)
     (quic-error (condition)
       (%client-protocol-close
        client (if (typep condition 'quic-frame-space-error) 10 7)
        "invalid packet") nil)
     (error (condition)
-      (%client-protocol-close
-       client (if (typep condition 'final-size-error) 6 7)
-       "invalid packet") nil)))
+      (%client-protocol-close client (if (typep condition 'final-size-error) 6 7)
+                              "invalid packet") nil)))
 
 (defun make-client-tls-boundary (client &key transport-parameters)
   "Attach cl-tls-kit's QUIC CRYPTO boundary."
