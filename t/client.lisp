@@ -221,13 +221,13 @@
        (stream (cl-quic-kit:client-open-stream client nil))
        (flow (cl-quic-kit::quic-client-flow-control client))
        (initial (cl-quic-kit:flow-control-connection-receive-limit flow)))
-  (flet ((reset (final-size)
+  (flet ((receive-reset (final-size)
            (cl-quic-kit:client-receive-frame
             client (cl-quic-kit:make-frame
                     :reset-stream :stream-id (cl-quic-kit:stream-id stream)
                     :application-protocol-error-code 0 :final-size final-size)
             :level :1-rtt)))
-    (reset 8)
+    (receive-reset 8)
     (check (= (cl-quic-kit:flow-control-connection-received flow) 8)
            "RESET_STREAM charges its full final size")
     (check (= (cl-quic-kit:flow-control-connection-receive-limit flow)
@@ -243,7 +243,7 @@
                        (eq (cl-quic-kit:frame-type frame) :max-stream-data))
                      frames)
              "RESET_STREAM does not replenish the reset stream"))
-    (reset 8)
+    (receive-reset 8)
     (check (and (= (cl-quic-kit:flow-control-connection-receive-limit flow)
                    (+ initial 8))
                 (= (count :max-data
