@@ -6,7 +6,8 @@
 (defparameter *quic-server-path-cache-limit* 4096)
 
 (defstruct (quic-server (:constructor %make-quic-server))
-  udp-socket max-connections max-handshakes retry-policy retry-tokens
+  udp-socket (udp-receive-packet-budget 64)
+  max-connections max-handshakes retry-policy retry-tokens
   (retired-retry-cids (make-hash-table :test #'equalp))
   (retired-local-cids (make-hash-table :test #'equalp))
   paths transport-parameters tls-server-options connections accepted-connections
@@ -49,12 +50,19 @@
       (error ()
         (error 'randomness-unavailable :operation operation)))))
 
-(defun make-quic-server (&key (local-address "0.0.0.0") (local-port 443)
+(defun make-quic-server (&key (udp-receive-packet-budget 64)
+                              (local-address "0.0.0.0") (local-port 443)
                               udp-socket max-connections
                               (max-handshakes max-connections)
                               (retry-policy :always)
                               transport-parameters tls-server-options)
-  "Bind a QUIC UDP listener. The server takes ownership of UDP-SOCKET when supplied."
+  "Bind a QUIC UDP listener. The server takes ownership of UDP-SOCKET when supplied.
+
+The default UDP receive packet budget is 64 datagrams. This lets one poll
+handle a multi-packet burst while capping UDP work during sustained input."
+  (cl-quic-kit::%check-type-redacted
+   udp-receive-packet-budget (integer 1 *)
+   :invalid-udp-receive-packet-budget)
   (cl-quic-kit::%check-type-redacted max-connections (integer 1 *) :invalid-max-connections)
   (cl-quic-kit::%check-type-redacted max-handshakes (integer 1 *) :invalid-max-handshakes)
   (unless (<= max-handshakes max-connections)
@@ -72,6 +80,7 @@
                     (make-udp-socket :local-host local-address
                                      :local-port local-port))))
     (%make-quic-server :udp-socket socket
+                       :udp-receive-packet-budget udp-receive-packet-budget
                        :max-connections max-connections
                        :max-handshakes max-handshakes
                        :retry-policy retry-policy
@@ -684,12 +693,13 @@
          server :error-code (quic-server-shutdown-error-code server)
          :reason (quic-server-shutdown-reason server))
         (return-from quic-server-poll t)))
-    (loop
-      (multiple-value-bind (bytes byte-count address)
-          (udp-receive (quic-server-udp-socket server))
-        (unless bytes
-          (return))
-        (%server-handle-datagram server bytes address byte-count now)))
+    (loop repeat (quic-server-udp-receive-packet-budget server)
+          do (multiple-value-bind (bytes byte-count address)
+                 (udp-receive (quic-server-udp-socket server))
+               (unless bytes
+                 (return))
+               (%server-handle-datagram
+                server bytes address byte-count now)))
     (%server-poll-connections server now)
     (let ((shutdown-deadline (quic-server-shutdown-deadline server)))
       (when (and shutdown-deadline
