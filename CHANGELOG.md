@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.2.6
+
+- Replace runtime function-name lookup for required TLS, crypto, and recovery APIs with package-qualified references.
+- Export the recovery packet-number accessor used by the client.
+
 ## 0.2.5
 
 - Use cl-tls-kit v0.5.2 public client-driver APIs for traffic-secret access and transcript synchronization.
