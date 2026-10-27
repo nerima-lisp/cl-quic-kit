@@ -49,19 +49,16 @@
     (write-string "redacted" stream)))
 
 (defun %server-random-octets (length &optional (operation :retry-token))
-  (let ((random (%client-function "CRYPTO-KIT" "RANDOM-OCTETS")))
-    (unless random
-      (error 'randomness-unavailable :operation operation))
-    (handler-case
-        (let ((value (funcall random length)))
-          (unless (and (typep value '(simple-array (unsigned-byte 8) (*)))
-                       (= (length value) length))
-            (error 'randomness-unavailable :operation operation))
-          value)
-      (randomness-unavailable (condition)
-        (error condition))
-      (error ()
-        (error 'randomness-unavailable :operation operation)))))
+  (handler-case
+      (let ((value (crypto-kit:random-octets length)))
+        (unless (and (typep value '(simple-array (unsigned-byte 8) (*)))
+                     (= (length value) length))
+          (error 'randomness-unavailable :operation operation))
+        value)
+    (randomness-unavailable (condition)
+      (error condition))
+    (error ()
+      (error 'randomness-unavailable :operation operation))))
 
 (defun make-quic-server (&key (udp-receive-packet-budget 64)
                               (local-address "0.0.0.0") (local-port 443)
@@ -845,45 +842,41 @@ default absolute handshake timeout is 10 seconds."
           (engine (server-connection-engine server-connection))
           (tls-boundary (server-connection-tls-boundary server-connection))
           (tls-driver (server-connection-tls-driver server-connection))
-          (close-driver (%client-function "CL-TLS-KIT"
-                                          "TLS13-SERVER-DRIVER-CLOSE"))
+          (close-driver #'cl-tls-kit:tls13-server-driver-close)
           (first-error nil))
       (labels ((attempt (thunk)
-                 (handler-case
-                     (funcall thunk)
-                   (error (condition)
-                     (unless first-error
-                       (setf first-error condition)))))
+                        (handler-case
+                            (funcall thunk)
+                          (error (condition)
+                                 (unless first-error
+                                   (setf first-error condition)))))
                (clear-octets (value)
-                 (when (typep value (quote (vector (unsigned-byte 8) *)))
-                   (attempt (lambda () (fill value 0)))))
+                             (when (typep value (quote (vector (unsigned-byte 8) *)))
+                               (attempt (lambda () (fill value 0)))))
                (clear-key (key-set)
-                 (when key-set
-                   (attempt
-                    (lambda ()
-                      (clear-octets
-                       (cl-quic-kit.protection:key-set-key key-set))))
-                   (attempt
-                    (lambda ()
-                      (clear-octets
-                       (cl-quic-kit.protection:key-set-iv key-set))))
-                   (attempt
-                    (lambda ()
-                      (clear-octets
-                       (cl-quic-kit.protection:key-set-hp key-set)))))))
+                          (when key-set
+                            (attempt
+                             (lambda ()
+                               (clear-octets
+                                (cl-quic-kit.protection:key-set-key key-set))))
+                            (attempt
+                             (lambda ()
+                               (clear-octets
+                                (cl-quic-kit.protection:key-set-iv key-set))))
+                            (attempt
+                             (lambda ()
+                               (clear-octets
+                                (cl-quic-kit.protection:key-set-hp key-set)))))))
         (when tls-driver
           (attempt
            (lambda ()
-             (unless close-driver
-               (error "TLS server driver close API is unavailable"))
              (funcall close-driver tls-driver))))
         (let ((transcript-reader
-                (%client-function "CL-TLS-KIT" "QUIC-TLS-BOUNDARY-TRANSCRIPT")))
-          (when (and tls-boundary transcript-reader)
-            (attempt
-             (lambda ()
-               (dolist (wire (funcall transcript-reader tls-boundary))
-                 (clear-octets wire))))))
+               #'cl-tls-kit:quic-tls-boundary-transcript))
+          (when tls-boundary (attempt
+                              (lambda ()
+                                (dolist (wire (funcall transcript-reader tls-boundary))
+                                  (clear-octets wire))))))
         (when engine
           (attempt
            (lambda ()
@@ -1039,18 +1032,11 @@ default absolute handshake timeout is 10 seconds."
         (list (cons 16 (octets-copy retry-cid))))))))
 (defun %server-driver-options (server transport-parameters)
   (let* ((options (%server-copy-plist (quic-server-tls-server-options server)))
-         (constructor (%client-function "CL-TLS-KIT"
-                                        "MAKE-TLS13-SERVER-DRIVER"))
-         (provider-constructor (%client-function "CL-TLS-KIT"
-                                                 "MAKE-CL-CRYPTO-KIT-PROVIDER"))
          (cipher-suites (getf options :cipher-suites
                               #(#x1301 #x1302 #x1303))))
-    (unless constructor
-      (error 'crypto-unavailable :operation :tls13-server-driver))
     (unless (getf options :provider)
-      (unless provider-constructor
-        (error 'crypto-unavailable :operation :tls-provider))
-      (setf (getf options :provider) (funcall provider-constructor)))
+      (setf (getf options :provider)
+            (cl-tls-kit:make-cl-crypto-kit-provider)))
     (unless (member :alpn-protocols options)
       (setf options (append options (list :alpn-protocols '("h3")))))
     (unless (and (typep cipher-suites '(or list vector))
@@ -1074,8 +1060,7 @@ default absolute handshake timeout is 10 seconds."
          (wire-level (%client-space-level tls-level))
          (engine (server-connection-engine server-connection))
          (boundary (server-connection-tls-boundary server-connection))
-         (emit (%client-function "CL-TLS-KIT"
-                                 "QUIC-TLS-BOUNDARY-EMIT-SECRET"))
+         (emit #'cl-tls-kit:quic-tls-boundary-emit-secret)
          (key (cl-quic-kit.protection:make-key-set
                secret
                :cipher (%server-suite-cipher
@@ -1084,9 +1069,8 @@ default absolute handshake timeout is 10 seconds."
     (when (eq wire-level :1-rtt)
       (if (eq direction :read)
           (setf (quic-client-application-read-secret engine) secret)
-          (setf (quic-client-application-write-secret engine) secret)))
-    (when emit
-      (funcall emit boundary tls-level direction secret)))
+        (setf (quic-client-application-write-secret engine) secret)))
+    (funcall emit boundary tls-level direction secret))
   server-connection)
 (defun %server-queue-crypto (server-connection level wire)
   (let* ((engine (server-connection-engine server-connection))
@@ -1199,88 +1183,79 @@ default absolute handshake timeout is 10 seconds."
              (eq (first event) :peer-quic-transport-parameters))
         (setf (server-connection-peer-transport-parameters server-connection)
               (octets-copy (second event)))
-        (case (getf event :type)
-          (:cipher-suite
-           (let* ((suite (getf event :suite))
-                  (engine (server-connection-engine server-connection))
-                  (emit (%client-function
-                         "CL-TLS-KIT"
-                         "QUIC-TLS-BOUNDARY-EMIT-CIPHER-SUITE")))
-             (setf (server-connection-cipher-suite server-connection) suite)
-             (%client-set-authentication-cipher engine (%server-suite-cipher suite))
-             (when (quic-client-closed-p engine)
-               (return-from %server-handle-tls-events server-connection))
-             (when emit
-               (funcall emit (server-connection-tls-boundary server-connection)
-                        suite))))
-          (:send
-           (unless (eq (getf event :content-type) :alert)
-             (%server-queue-crypto server-connection
-                                   (getf event :level)
-                                   (getf event :wire))))
-          (:secret
-           (%server-install-secret server-connection
-                                   (getf event :level)
-                                   (getf event :direction)
-                                   (getf event :secret)))
-          (:alpn
-           (let* ((protocol (getf event :protocol))
-                  (emit (%client-function
-                         "CL-TLS-KIT" "QUIC-TLS-BOUNDARY-EMIT-ALPN")))
-             (when emit
-               (funcall emit
-                        (server-connection-tls-boundary server-connection)
-                        protocol))
-             (setf (quic-connection-alpn (server-connection-connection server-connection))
-                   (and protocol (copy-seq protocol)))))
-          (:ticket-issued nil)
-          (:alert
-           (let* ((alert (getf event :description))
-                  (connection
-                    (server-connection-connection server-connection))
-                  (engine (server-connection-engine server-connection))
-                  (frame (%connection-prepare-close
-                          connection (+ #x0100 alert) "TLS fatal alert")))
-             (setf (quic-client-closed-p engine) t)
-             (when frame
-               (%client-queue-frame
-                engine frame
-                (if (%client-key engine :1-rtt :write) :1-rtt :initial))
-               (client-flush engine))
-             (%server-retire-cid
-              (quic-server-retired-local-cids
-               (server-connection-server server-connection))
-              (server-connection-local-connection-id server-connection)
-              (+ (or (server-connection-now server-connection)
-                     (%quic-real-time))
-                 *quic-server-retry-token-retention*)
-              *quic-server-path-cache-limit*)
-             (%server-retire-cid
-              (quic-server-retired-local-cids
-               (server-connection-server server-connection))
-              (server-connection-original-destination-connection-id
-               server-connection)
-              (+ (or (server-connection-now server-connection)
-                     (%quic-real-time))
-                 *quic-server-retry-token-retention*)
-              *quic-server-path-cache-limit*)
-             (return-from %server-handle-tls-events server-connection)))
-          (:handshake-complete
-           (%server-complete-connection server-connection))
-          (otherwise
-           (error 'quic-error :message "Unknown TLS server driver event")))))
+      (case (getf event :type)
+        (:cipher-suite
+         (let* ((suite (getf event :suite))
+                (engine (server-connection-engine server-connection))
+                (emit #'cl-tls-kit:quic-tls-boundary-emit-cipher-suite))
+           (setf (server-connection-cipher-suite server-connection) suite)
+           (%client-set-authentication-cipher engine (%server-suite-cipher suite))
+           (when (quic-client-closed-p engine)
+             (return-from %server-handle-tls-events server-connection))
+           (funcall emit (server-connection-tls-boundary server-connection)
+                    suite)))
+        (:send
+         (unless (eq (getf event :content-type) :alert)
+           (%server-queue-crypto server-connection
+                                 (getf event :level)
+                                 (getf event :wire))))
+        (:secret
+         (%server-install-secret server-connection
+                                 (getf event :level)
+                                 (getf event :direction)
+                                 (getf event :secret)))
+        (:alpn
+         (let* ((protocol (getf event :protocol))
+                (emit #'cl-tls-kit:quic-tls-boundary-emit-alpn))
+           (funcall emit
+                    (server-connection-tls-boundary server-connection)
+                    protocol)
+           (setf (quic-connection-alpn (server-connection-connection server-connection))
+                 (and protocol (copy-seq protocol)))))
+        (:ticket-issued nil)
+        (:alert
+         (let* ((alert (getf event :description))
+                (connection
+                 (server-connection-connection server-connection))
+                (engine (server-connection-engine server-connection))
+                (frame (%connection-prepare-close
+                        connection (+ #x0100 alert) "TLS fatal alert")))
+           (setf (quic-client-closed-p engine) t)
+           (when frame
+             (%client-queue-frame
+              engine frame
+              (if (%client-key engine :1-rtt :write) :1-rtt :initial))
+             (client-flush engine))
+           (%server-retire-cid
+            (quic-server-retired-local-cids
+             (server-connection-server server-connection))
+            (server-connection-local-connection-id server-connection)
+            (+ (or (server-connection-now server-connection)
+                   (%quic-real-time))
+               *quic-server-retry-token-retention*)
+            *quic-server-path-cache-limit*)
+           (%server-retire-cid
+            (quic-server-retired-local-cids
+             (server-connection-server server-connection))
+            (server-connection-original-destination-connection-id
+             server-connection)
+            (+ (or (server-connection-now server-connection)
+                   (%quic-real-time))
+               *quic-server-retry-token-retention*)
+            *quic-server-path-cache-limit*)
+           (return-from %server-handle-tls-events server-connection)))
+        (:handshake-complete
+         (%server-complete-connection server-connection))
+        (otherwise
+         (error 'quic-error :message "Unknown TLS server driver event")))))
   server-connection)
 (defun %server-feed-crypto (server-connection level offset bytes)
   (let* ((tls-level (%client-level-space level))
          (boundary (server-connection-tls-boundary server-connection))
-         (feed (%client-function "CL-TLS-KIT"
-                                 "QUIC-TLS-BOUNDARY-FEED-CRYPTO"))
-         (step (%client-function "CL-TLS-KIT"
-                                 "TLS13-SERVER-DRIVER-STEP")))
-    (unless (and feed step)
-      (error 'crypto-unavailable :operation :tls13-server-driver))
+         (feed #'cl-tls-kit:quic-tls-boundary-feed-crypto)
+         (step #'cl-tls-kit:tls13-server-driver-step))
     (dolist (message
-              (funcall feed boundary tls-level offset bytes))
+             (funcall feed boundary tls-level offset bytes))
       (multiple-value-bind (driver events)
           (funcall step (server-connection-tls-driver server-connection)
                    (getf message :wire) :level tls-level)
@@ -1289,35 +1264,33 @@ default absolute handshake timeout is 10 seconds."
   server-connection)
 (defun %server-create-connection (server header path address record now)
   (let* ((original-cid
-           (if record
-               (server-retry-token-original-destination-connection-id record)
-               (packet-header-destination-connection-id header)))
+          (if record
+              (server-retry-token-original-destination-connection-id record)
+            (packet-header-destination-connection-id header)))
          (retry-cid
-           (and record
-                (server-retry-token-retry-source-connection-id record)))
+          (and record
+               (server-retry-token-retry-source-connection-id record)))
          (local-cid
-           (or retry-cid
-               (%server-new-connection-id server original-cid)))
+          (or retry-cid
+              (%server-new-connection-id server original-cid)))
          (remote-cid (packet-header-source-connection-id header))
          (transport-parameters
-           (%server-local-transport-parameters
-            server original-cid local-cid retry-cid))
+          (%server-local-transport-parameters
+           server original-cid local-cid retry-cid))
          (boundary-constructor
-           (%client-function "CL-TLS-KIT" "MAKE-QUIC-TLS-BOUNDARY"))
+          #'cl-tls-kit:make-quic-tls-boundary)
          (driver-constructor
-           (%client-function "CL-TLS-KIT" "MAKE-TLS13-SERVER-DRIVER"))
+          #'cl-tls-kit:make-tls13-server-driver)
          (server-connection
-           (%make-server-connection
-            :server server :path path :address (%server-copy-address address)
-            :now now
-            :handshake-deadline (+ (%server-exact-real now) (%server-exact-real (quic-server-handshake-timeout server)))
-            :original-destination-connection-id (octets-copy original-cid)
-            :local-connection-id (octets-copy local-cid)
-            :remote-connection-id (octets-copy remote-cid)
-            :transport-parameters transport-parameters
-            :pending-datagrams nil)))
-    (unless (and boundary-constructor driver-constructor)
-      (error 'crypto-unavailable :operation :tls13-server-driver))
+          (%make-server-connection
+           :server server :path path :address (%server-copy-address address)
+           :now now
+           :handshake-deadline (+ (%server-exact-real now) (%server-exact-real (quic-server-handshake-timeout server)))
+           :original-destination-connection-id (octets-copy original-cid)
+           :local-connection-id (octets-copy local-cid)
+           :remote-connection-id (octets-copy remote-cid)
+           :transport-parameters transport-parameters
+           :pending-datagrams nil)))
     (setf (server-connection-connection server-connection)
           (make-quic-connection
            :role :server :local-connection-id local-cid
@@ -1335,8 +1308,8 @@ default absolute handshake timeout is 10 seconds."
            :disable-hostname-verification-p t
            :transport-parameters transport-parameters))
     (let ((initial
-            (cl-quic-kit.protection:derive-initial-secrets
-             (packet-header-destination-connection-id header))))
+           (cl-quic-kit.protection:derive-initial-secrets
+            (packet-header-destination-connection-id header))))
       (%client-set-key (server-connection-engine server-connection)
                        :initial :read (getf initial :client))
       (%client-set-key (server-connection-engine server-connection)
@@ -1347,9 +1320,7 @@ default absolute handshake timeout is 10 seconds."
                    :transport-parameters transport-parameters
                    :hash-function
                    (lambda (bytes)
-                     (let ((digest (%client-function "CRYPTO-KIT" "DIGEST")))
-                       (unless digest
-                         (error 'crypto-unavailable :operation :digest))
+                     (let ((digest #'crypto-kit:digest))
                        (funcall digest
                                 (if (= (or (server-connection-cipher-suite
                                             server-connection)

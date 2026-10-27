@@ -12,7 +12,7 @@
            #:recovery-state-persistent-congestion-p
            #:recovery-state-cwnd #:recovery-state-bytes-in-flight
            #:recovery-state-pto-count #:packet-number-space-name
-           #:packet-number-space-largest-acked))
+           #:packet-number-space-largest-acked #:sent-packet-number))
 
 (in-package #:cl-quic-kit.recovery)
 
