@@ -3,6 +3,7 @@
 ;;;; QUIC client packet engine and HTTP stream facade.
 
 (defstruct (quic-client (:constructor %make-quic-client))
+  (udp-receive-packet-budget 64)
   connection udp-socket tls-boundary tls-driver
   streams
   (accepted-peer-streams (make-hash-table)) next-bidi-stream next-uni-stream
@@ -1071,7 +1072,8 @@
          (connection-set-state (quic-client-connection client) :established))))
     flush-p))
 
-(defun make-quic-client (&key connection udp-socket tls-boundary tls-driver
+(defun make-quic-client (&key (udp-receive-packet-budget 64)
+                              connection udp-socket tls-boundary tls-driver
                               local-connection-id destination-connection-id
                               server-host server-port hostname
                               disable-hostname-verification-p (alpn '("h3"))
@@ -1079,7 +1081,13 @@
                               tls-trust-anchors tls-verify-signature now-fn
                               tls-signature-algorithms
                               idle-timeout io-write on-close)
-  "Create a protected QUIC client and its HTTP stream facade."
+  "Create a protected QUIC client and its HTTP stream facade.
+
+The default UDP receive packet budget is 64 datagrams. This lets one poll
+handle a multi-packet burst while capping UDP work during sustained input."
+  (cl-quic-kit::%check-type-redacted
+   udp-receive-packet-budget (integer 1 *)
+   :invalid-udp-receive-packet-budget)
   (unless (or hostname disable-hostname-verification-p)
     (error 'hostname-required))
   (let* ((udp (or udp-socket
@@ -1109,7 +1117,9 @@
                 :sender-role (quic-connection-role connection))))
          (role (quic-connection-role connection))
          (client (%make-quic-client
-                  :connection connection :udp-socket udp :tls-boundary tls-boundary
+                  :connection connection :udp-socket udp
+                  :udp-receive-packet-budget udp-receive-packet-budget
+                  :tls-boundary tls-boundary
                   :tls-driver tls-driver :streams (make-hash-table :test #'eql)
                   :next-bidi-stream (if (eq role :server) 1 0)
                   :next-uni-stream (if (eq role :server) 3 2)
@@ -1714,13 +1724,14 @@
 
 (defun %client-poll-udp (client)
   (when (quic-client-udp-socket client)
-    (loop
-      (multiple-value-bind (bytes length address) (udp-receive (quic-client-udp-socket client))
-        (declare (ignore length address))
-        (unless bytes (return))
-        (client-receive-datagram
-         client bytes :short-header-dcid-length
-         (length (quic-client-local-connection-id client)))))))
+    (loop repeat (quic-client-udp-receive-packet-budget client)
+          do (multiple-value-bind (bytes length address)
+                 (udp-receive (quic-client-udp-socket client))
+               (declare (ignore length address))
+               (unless bytes (return))
+               (client-receive-datagram
+                client bytes :short-header-dcid-length
+                (length (quic-client-local-connection-id client)))))))
 
 (defun %client-poll-recovery (client at)
   (%client-discard-expired-read-key client at)

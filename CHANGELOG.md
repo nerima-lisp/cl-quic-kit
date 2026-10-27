@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.2.1
+
+- Bounded client and server UDP receive work to 64 datagrams per poll by default, with a configurable positive integer budget.
+
 ## 0.2.0
 
 - Added a client API to accept peer-initiated streams and read peer `CONNECTION_CLOSE` reasons, a Retry-based QUIC server listener, TLS 1.3 server handshakes, server stream I/O, and graceful server shutdown.

@@ -1159,7 +1159,9 @@
                   (not (cl-quic-kit:quic-client-closed-p mismatched))
                   (null close-wire))
              "client accepts valid Retry with nonzero Unused bits through public API")))))))))
-(load (test-path "t/server.lisp"))
+(progn
+  (load (test-path "t/server.lisp"))
+  (load (test-path "t/udp-poll-budget.lisp")))
 (let* ((original-dcid (%client-test-octets '(90 91 92 93 94 95 96 97)))
        (local-cid (%client-test-octets '(100 101 102 103 104 105 106 107)))
        (mismatched-cid (%client-test-octets '(130 131 132 133 134 135 136 137)))
