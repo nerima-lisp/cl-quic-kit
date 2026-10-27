@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.2.4
+
+- QUIC clients now send configured `:tls-signature-algorithms` in ClientHello and support cl-tls-kit v0.5.1.
+
 ## 0.2.3
 
 - Exported `udp-socket-non-blocking-p` so callers can inspect whether a UDP socket uses nonblocking mode.
