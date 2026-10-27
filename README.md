@@ -139,6 +139,14 @@ The listener defaults to IPv4 address `0.0.0.0` and UDP port `443`. Set `:local-
 address string and `:local-port` to an integer from 0 through 65535; port 0 binds an ephemeral port.
 The `:retry-policy` option accepts `:always` (the default) or `:never`; with `:never`, a tokenless Initial
 proceeds without a Retry packet.
+The `:handshake-timeout` option accepts a positive real duration in seconds and defaults to 10. Its absolute
+deadline starts when the server creates connection state; later traffic does not extend it. At the first
+`cl-quic-kit:quic-server-poll` at or after the deadline, the server silently discards an incomplete handshake,
+releases its routes and admission slots, and never returns it from `cl-quic-kit:quic-server-accept-connection`.
+This timeout is a local policy, not a timeout prescribed by QUIC. RFC 9000 §10.2.3 warns that a
+`CONNECTION_CLOSE` in response to unauthenticated handshake information can expose legitimate connections to
+denial of service and permits discarding packets when an error is detected in an unauthenticated packet
+instead of immediately closing ([RFC 9000 §10.2.3](https://www.rfc-editor.org/rfc/rfc9000#section-10.2.3)).
 `:local-address` applies when the listener creates its socket. When supplying a socket, configure it with
 `:local-host` in `cl-quic-kit:make-udp-socket`. To read the assigned port, create a socket and pass it to the listener:
 

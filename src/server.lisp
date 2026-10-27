@@ -4,10 +4,23 @@
 (defparameter *quic-server-retry-token-retention* 60)
 (defparameter *quic-server-retry-cache-limit* 4096)
 (defparameter *quic-server-path-cache-limit* 4096)
+(defun %server-valid-handshake-timeout-p (value)
+  (and (realp value)
+       (or (not (floatp value))
+           (handler-case
+               (<= (- most-positive-long-float)
+                   value
+                   most-positive-long-float)
+             (arithmetic-error () nil)))
+       (plusp value)))
+(defun %server-exact-real (value)
+  (if (floatp value)
+      (rational value)
+      value))
 
 (defstruct (quic-server (:constructor %make-quic-server))
   udp-socket (udp-receive-packet-budget 64)
-  max-connections max-handshakes retry-policy retry-tokens
+  max-connections max-handshakes handshake-timeout retry-policy retry-tokens
   (retired-retry-cids (make-hash-table :test #'equalp))
   (retired-local-cids (make-hash-table :test #'equalp))
   paths transport-parameters tls-server-options connections accepted-connections
@@ -54,17 +67,23 @@
                               (local-address "0.0.0.0") (local-port 443)
                               udp-socket max-connections
                               (max-handshakes max-connections)
+                              (handshake-timeout 10)
                               (retry-policy :always)
                               transport-parameters tls-server-options)
   "Bind a QUIC UDP listener. The server takes ownership of UDP-SOCKET when supplied.
 
 The default UDP receive packet budget is 64 datagrams. This lets one poll
-handle a multi-packet burst while capping UDP work during sustained input."
+handle a multi-packet burst while capping UDP work during sustained input. The
+default absolute handshake timeout is 10 seconds."
   (cl-quic-kit::%check-type-redacted
    udp-receive-packet-budget (integer 1 *)
    :invalid-udp-receive-packet-budget)
   (cl-quic-kit::%check-type-redacted max-connections (integer 1 *) :invalid-max-connections)
   (cl-quic-kit::%check-type-redacted max-handshakes (integer 1 *) :invalid-max-handshakes)
+  (cl-quic-kit::%check-type-redacted
+   handshake-timeout
+   (satisfies %server-valid-handshake-timeout-p)
+   :invalid-handshake-timeout)
   (unless (<= max-handshakes max-connections)
     (error 'type-error :datum :invalid-handshake-limit
            :expected-type `(integer 1 ,max-connections)))
@@ -83,6 +102,7 @@ handle a multi-packet burst while capping UDP work during sustained input."
                        :udp-receive-packet-budget udp-receive-packet-budget
                        :max-connections max-connections
                        :max-handshakes max-handshakes
+                       :handshake-timeout handshake-timeout
                        :retry-policy retry-policy
                        :retry-tokens (make-hash-table :test #'equalp)
                        :retired-retry-cids (make-hash-table :test #'equalp)
@@ -677,14 +697,21 @@ handle a multi-packet burst while capping UDP work during sustained input."
     (%server-prune-expired-state server now)
     (dolist (server-connection (%server-routed-connections server))
       (let* ((connection (server-connection-connection server-connection))
-             (deadline (connection-draining-deadline connection)))
-        (when (and deadline
-                   (member (connection-state connection) '(:closing :draining))
-                   (>= now deadline))
-          (connection-poll connection now)
-          (when (eq (connection-state connection) :closed)
-            (setf (server-connection-pending-datagrams server-connection) nil)
-            (%server-remove-connection-routes server-connection)))))
+             (handshake-deadline
+               (server-connection-handshake-deadline server-connection))
+             (draining-deadline (connection-draining-deadline connection)))
+        (cond
+          ((and (not (server-connection-handshake-complete-p server-connection))
+                handshake-deadline
+                (>= (%server-exact-real now)
+                    (%server-exact-real handshake-deadline)))
+           (%server-release-connection-state server-connection))
+          ((and draining-deadline
+                (member (connection-state connection) '(:closing :draining))
+                (>= now draining-deadline))
+           (connection-poll connection now)
+           (when (eq (connection-state connection) :closed)
+             (%server-release-connection-state server-connection))))))
     (let ((shutdown-deadline (quic-server-shutdown-deadline server)))
       (when (and shutdown-deadline
                  (or (>= now shutdown-deadline)
@@ -740,13 +767,10 @@ handle a multi-packet burst while capping UDP work during sustained input."
                      (error (condition)
                        (remember-error condition)))))
             (dolist (server-connection connections)
-              (let ((connection
-                      (server-connection-connection server-connection)))
-                (setf (server-connection-pending-datagrams server-connection) nil)
-                (handler-case
-                    (connection-set-state connection :closed)
-                  (error (condition)
-                    (remember-error condition)))))
+              (handler-case
+                  (%server-release-connection-state server-connection)
+                (error (condition)
+                  (remember-error condition))))
             (clrhash (quic-server-connections server))
             (setf (quic-server-accepted-connections server) nil)
             (clrhash (quic-server-retry-tokens server))
@@ -768,7 +792,7 @@ handle a multi-packet burst while capping UDP work during sustained input."
 (progn
   (defstruct (server-connection
               (:constructor %make-server-connection))
-    server connection engine tls-boundary tls-driver path address now
+    server connection engine tls-boundary tls-driver path address now handshake-deadline
     original-destination-connection-id local-connection-id
     remote-connection-id cipher-suite transport-parameters
     peer-transport-parameters pending-datagrams
@@ -815,7 +839,127 @@ handle a multi-packet burst while capping UDP work during sustained input."
             (delete (server-connection-connection server-connection)
                     (quic-server-accepted-connections server)
                     :test #'eq))
-      server-connection)))
+      server-connection))
+  (defun %server-release-connection-state (server-connection)
+    (let ((connection (server-connection-connection server-connection))
+          (engine (server-connection-engine server-connection))
+          (tls-boundary (server-connection-tls-boundary server-connection))
+          (tls-driver (server-connection-tls-driver server-connection))
+          (close-driver (%client-function "CL-TLS-KIT"
+                                          "TLS13-SERVER-DRIVER-CLOSE"))
+          (first-error nil))
+      (labels ((attempt (thunk)
+                 (handler-case
+                     (funcall thunk)
+                   (error (condition)
+                     (unless first-error
+                       (setf first-error condition)))))
+               (clear-octets (value)
+                 (when (typep value (quote (vector (unsigned-byte 8) *)))
+                   (attempt (lambda () (fill value 0)))))
+               (clear-key (key-set)
+                 (when key-set
+                   (attempt
+                    (lambda ()
+                      (clear-octets
+                       (cl-quic-kit.protection:key-set-key key-set))))
+                   (attempt
+                    (lambda ()
+                      (clear-octets
+                       (cl-quic-kit.protection:key-set-iv key-set))))
+                   (attempt
+                    (lambda ()
+                      (clear-octets
+                       (cl-quic-kit.protection:key-set-hp key-set)))))))
+        (when tls-driver
+          (attempt
+           (lambda ()
+             (unless close-driver
+               (error "TLS server driver close API is unavailable"))
+             (funcall close-driver tls-driver))))
+        (let ((transcript-reader
+                (%client-function "CL-TLS-KIT" "QUIC-TLS-BOUNDARY-TRANSCRIPT")))
+          (when (and tls-boundary transcript-reader)
+            (attempt
+             (lambda ()
+               (dolist (wire (funcall transcript-reader tls-boundary))
+                 (clear-octets wire))))))
+        (when engine
+          (attempt
+           (lambda ()
+             (dolist (level-keys (quic-client-keys engine))
+               (dolist (direction (list :read :write))
+                 (clear-key (getf (cdr level-keys) direction))))))
+          (attempt
+           (lambda ()
+             (dolist (key-set
+                      (list (quic-client-application-read-old-key engine)
+                            (quic-client-application-read-next-key engine)))
+               (clear-key key-set))))
+          (attempt
+           (lambda ()
+             (dolist (secret
+                      (list (quic-client-application-read-next-secret engine)
+                            (quic-client-application-read-secret engine)
+                            (quic-client-application-write-secret engine)))
+               (clear-octets secret))))
+          (attempt
+           (lambda ()
+             (clear-octets (quic-client-client-hello-wire engine))))
+          (attempt
+           (lambda ()
+             (setf (quic-client-keys engine) nil
+                   (quic-client-application-read-old-key engine) nil
+                   (quic-client-application-read-next-key engine) nil
+                   (quic-client-application-read-next-secret engine) nil
+                   (quic-client-application-read-secret engine) nil
+                   (quic-client-application-write-secret engine) nil
+                   (quic-client-client-hello-wire engine) nil
+                   (quic-client-tls-boundary engine) nil
+                   (quic-client-tls-driver engine) nil
+                   (quic-client-tls-key-exchange engine) nil
+                   (quic-client-tls-provider engine) nil
+                   (quic-client-tls-trust-anchors engine) nil
+                   (quic-client-tls-verify-signature engine) nil
+                   (quic-client-tls-signature-algorithms engine) nil
+                   (quic-client-streams engine) nil
+                   (quic-client-accepted-peer-streams engine) nil
+                   (quic-client-pending-frames engine) nil
+                   (quic-client-pending-stream-writes engine) nil
+                   (quic-client-crypto-send-offsets engine) nil
+                   (quic-client-packet-numbers engine) nil
+                   (quic-client-received-packets engine) nil
+                   (quic-client-recovery engine) nil
+                   (quic-client-sent-packets engine) nil
+                   (quic-client-pto-probe-budgets engine) nil
+                   (quic-client-pto-probe-frames engine) nil
+                   (quic-client-closed-p engine) t
+                   (quic-client-connection engine) nil
+                   (quic-client-clock engine) nil))))
+        (attempt
+         (lambda ()
+           (setf (server-connection-pending-datagrams server-connection) nil
+                 (server-connection-peer-transport-parameters server-connection) nil
+                 (server-connection-engine server-connection) nil
+                 (server-connection-tls-boundary server-connection) nil
+                 (server-connection-tls-driver server-connection) nil
+                 (server-connection-accepted-p server-connection) nil)))
+        (when connection
+          (attempt (lambda () (connection-set-state connection :closed)))
+          (attempt
+           (lambda ()
+             (setf (quic-connection-stream-engine connection) nil
+                   (quic-connection-tls-input connection) nil
+                   (quic-connection-tls-output connection) nil
+                   (quic-connection-io-read connection) nil
+                   (quic-connection-io-write connection) nil
+                   (quic-connection-on-close connection) nil
+                   (quic-connection-now-fn connection)
+                   (function %quic-real-time)))))
+        (attempt (lambda () (%server-remove-connection-routes server-connection)))
+        (when first-error
+          (error first-error))
+        server-connection))))
 (defun %server-new-connection-id (server forbidden-cid)
   (loop repeat 4
         for candidate = (%server-random-octets 8 :connection-id)
@@ -1166,6 +1310,7 @@ handle a multi-packet burst while capping UDP work during sustained input."
            (%make-server-connection
             :server server :path path :address (%server-copy-address address)
             :now now
+            :handshake-deadline (+ (%server-exact-real now) (%server-exact-real (quic-server-handshake-timeout server)))
             :original-destination-connection-id (octets-copy original-cid)
             :local-connection-id (octets-copy local-cid)
             :remote-connection-id (octets-copy remote-cid)
@@ -1415,8 +1560,7 @@ handle a multi-packet burst while capping UDP work during sustained input."
       (connection-poll connection now)
       (case (connection-state connection)
         (:closed
-         (setf (server-connection-pending-datagrams server-connection) nil)
-         (%server-remove-connection-routes server-connection))
+         (%server-release-connection-state server-connection))
         (:draining
          (setf (server-connection-pending-datagrams server-connection) nil))
         (:closing
@@ -1428,7 +1572,7 @@ handle a multi-packet burst while capping UDP work during sustained input."
            ((:closed :draining)
             (setf (server-connection-pending-datagrams server-connection) nil)
             (when (eq (connection-state connection) :closed)
-              (%server-remove-connection-routes server-connection)))
+              (%server-release-connection-state server-connection)))
            (otherwise
             (%server-flush-pending-datagrams server-connection)))))))
   server)

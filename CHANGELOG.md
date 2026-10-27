@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.2.2
+
+- Added an absolute server handshake timeout, defaulting to 10 seconds, that silently discards expired incomplete handshakes and releases their admission capacity.
+
 ## 0.2.1
 
 - Bounded client and server UDP receive work to 64 datagrams per poll by default, with a configurable positive integer budget.
