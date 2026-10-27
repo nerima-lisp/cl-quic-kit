@@ -408,54 +408,54 @@
                    (zerop (cl-quic-kit::%server-handshaking-count server)))
               "a TLS close failure still releases routes, accept state, and handshake capacity"))
      (let* ((normal-server
-               (server-handshake-timeout-test-server
-                :max-connections 1 :max-handshakes 1))
-              (normal-server-connection
-               (server-handshake-timeout-test-connection
-                normal-server
-                (server-handshake-timeout-test-cid 31)
-                (server-handshake-timeout-test-cid 32)
-                (server-handshake-timeout-test-cid 33)
-                0))
-              (normal-connection
-               (cl-quic-kit::server-connection-connection
-                normal-server-connection))
-              (normal-driver (list :normal-tls-driver))
-              (normal-close-count 0))
-         (setf (cl-quic-kit::server-connection-tls-driver
-                normal-server-connection)
-               normal-driver
-               (cl-quic-kit::server-connection-pending-datagrams
-                normal-server-connection)
-               nil
-               (cl-quic-kit::server-connection-accepted-p
-                normal-server-connection)
-               t
-               (cl-quic-kit::quic-server-accepted-connections normal-server)
-               (list normal-connection))
-         (cl-quic-kit:connection-set-state normal-connection :closed)
-         (server-handshake-timeout-test-with-poll
-          normal-server
-          (lambda (normal-enqueue)
-            (declare (ignore normal-enqueue))
-            (cl-quic-kit::%server-poll-connections normal-server 0)
-            (check (and (= normal-close-count 1)
-                        (eq (cl-quic-kit:connection-state normal-connection) :closed)
-                        (null (cl-quic-kit::server-connection-tls-driver
-                               normal-server-connection))
-                        (null (cl-quic-kit::quic-server-accepted-connections
-                               normal-server))
-                        (zerop (cl-quic-kit::%server-connection-count normal-server)))
-                   "the normal closed-connection path uses the public TLS driver close"))
-          (lambda (candidate-driver)
-            (unless (eq candidate-driver normal-driver)
-              (error "unexpected normal TLS driver"))
-            (incf normal-close-count)
-            candidate-driver)))
+             (server-handshake-timeout-test-server
+              :max-connections 1 :max-handshakes 1))
+            (normal-server-connection
+             (server-handshake-timeout-test-connection
+              normal-server
+              (server-handshake-timeout-test-cid 31)
+              (server-handshake-timeout-test-cid 32)
+              (server-handshake-timeout-test-cid 33)
+              0))
+            (normal-connection
+             (cl-quic-kit::server-connection-connection
+              normal-server-connection))
+            (normal-driver (list :normal-tls-driver))
+            (normal-close-count 0))
+       (setf (cl-quic-kit::server-connection-tls-driver
+              normal-server-connection)
+             normal-driver
+             (cl-quic-kit::server-connection-pending-datagrams
+              normal-server-connection)
+             nil
+             (cl-quic-kit::server-connection-accepted-p
+              normal-server-connection)
+             t
+             (cl-quic-kit::quic-server-accepted-connections normal-server)
+             (list normal-connection))
+       (cl-quic-kit:connection-set-state normal-connection :closed)
+       (server-handshake-timeout-test-with-poll
+        normal-server
+        (lambda (normal-enqueue)
+          (declare (ignore normal-enqueue))
+          (cl-quic-kit::%server-poll-connections normal-server 0)
+          (check (and (= normal-close-count 1)
+                      (eq (cl-quic-kit:connection-state normal-connection) :closed)
+                      (null (cl-quic-kit::server-connection-tls-driver
+                             normal-server-connection))
+                      (null (cl-quic-kit::quic-server-accepted-connections
+                             normal-server))
+                      (zerop (cl-quic-kit::%server-connection-count normal-server)))
+                 "the normal closed-connection path uses the public TLS driver close"))
+        (lambda (candidate-driver)
+          (unless (eq candidate-driver normal-driver)
+            (error "unexpected normal TLS driver"))
+          (incf normal-close-count)
+          candidate-driver))
        (check (server-handshake-timeout-test-admit-client normal-server 0)
-              "normal close releases the max-handshakes slot")
-       (check (server-handshake-timeout-test-admit-client server 10)
-              "a new client can reuse max-handshakes after TLS close failure")
+              "normal close releases the max-handshakes slot"))
+     (check (server-handshake-timeout-test-admit-client server 10)
+            "a new client can reuse max-handshakes after TLS close failure")
      (let* ((large-server
              (server-handshake-timeout-test-server
               :max-connections 1 :max-handshakes 1
