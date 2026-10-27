@@ -73,6 +73,7 @@
    #:connection-receive-frame #:connection-receive-packet
    #:connection-read #:connection-write #:connection-poll
    #:udp-socket #:make-udp-socket #:udp-socket-local-port
+   #:udp-socket-non-blocking-p
    #:udp-send #:udp-receive #:udp-close
    #:quic-client #:make-quic-client #:client-open-stream
    #:client-write-stream #:client-stream-write-pending-p
