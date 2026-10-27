@@ -123,53 +123,60 @@
            :payload #()))
          (create-symbol (find-symbol "%SERVER-CREATE-CONNECTION" "CL-QUIC-KIT"))
          (original-create (symbol-function create-symbol))
+         (process-symbol (find-symbol "%SERVER-PROCESS-PROTECTED-DATAGRAM" "CL-QUIC-KIT"))
+         (original-process (symbol-function process-symbol))
          (created nil))
     (unwind-protect
-        (progn
-          (setf (symbol-function create-symbol)
-                (lambda (candidate-server candidate-header path address record now)
-                  (declare (ignore candidate-header record))
-                  (let* ((connection
-                          (cl-quic-kit:make-quic-connection
-                           :role :server
-                           :local-connection-id local-cid
-                           :idle-timeout 100
-                           :now-fn (lambda () now)))
-                         (server-connection
-                          (cl-quic-kit::%make-server-connection
-                           :server candidate-server
-                           :connection connection
-                           :path path
-                           :address address
-                           :now now
-                           :handshake-deadline
-                           (+ (cl-quic-kit::%server-exact-real now)
-                              (cl-quic-kit::%server-exact-real
-                               (cl-quic-kit::quic-server-handshake-timeout candidate-server)))
-                           :original-destination-connection-id original-cid
-                           :local-connection-id local-cid
-                           :remote-connection-id remote-cid
-                           :pending-datagrams nil)))
-                    (cl-quic-kit:connection-set-state connection :handshaking)
-                    (setf (gethash local-cid
-                                   (cl-quic-kit::quic-server-connections
-                                    candidate-server))
-                          server-connection
-                          created server-connection)
-                    server-connection)))
-          (cl-quic-kit::%server-start-or-feed-initial
-           server header nil :new-peer nil #(1) at)
-          (and created
-               (eq created
-                   (gethash local-cid
-                            (cl-quic-kit::quic-server-connections server)))
-               (= (cl-quic-kit::%server-connection-count server) 1)
-               (= (cl-quic-kit::%server-handshaking-count server) 1)
-               (= (cl-quic-kit::server-connection-handshake-deadline created)
-                  (+ (cl-quic-kit::%server-exact-real at)
-                     (cl-quic-kit::%server-exact-real
-                      (cl-quic-kit::quic-server-handshake-timeout server))))))
-      (setf (symbol-function create-symbol) original-create))))
+         (progn
+           (setf (symbol-function create-symbol)
+                 (lambda (candidate-server candidate-header path address record now)
+                   (declare (ignore candidate-header record))
+                   (let* ((connection
+                           (cl-quic-kit:make-quic-connection
+                            :role :server
+                            :local-connection-id local-cid
+                            :idle-timeout 100
+                            :now-fn (lambda () now)))
+                          (server-connection
+                           (cl-quic-kit::%make-server-connection
+                            :server candidate-server
+                            :connection connection
+                            :path path
+                            :address address
+                            :now now
+                            :handshake-deadline
+                            (+ (cl-quic-kit::%server-exact-real now)
+                               (cl-quic-kit::%server-exact-real
+                                (cl-quic-kit::quic-server-handshake-timeout candidate-server)))
+                            :original-destination-connection-id original-cid
+                            :local-connection-id local-cid
+                            :remote-connection-id remote-cid
+                            :pending-datagrams nil)))
+                     (cl-quic-kit:connection-set-state connection :handshaking)
+                     (setf (gethash local-cid
+                                    (cl-quic-kit::quic-server-connections
+                                     candidate-server))
+                           server-connection
+                           created server-connection)
+                     server-connection))
+                 (symbol-function process-symbol)
+                 (lambda (&rest arguments)
+                   (declare (ignore arguments))
+                   nil))
+           (cl-quic-kit::%server-start-or-feed-initial
+            server header nil :new-peer nil #(1) at)
+           (and created
+                (eq created
+                    (gethash local-cid
+                             (cl-quic-kit::quic-server-connections server)))
+                (= (cl-quic-kit::%server-connection-count server) 1)
+                (= (cl-quic-kit::%server-handshaking-count server) 1)
+                (= (cl-quic-kit::server-connection-handshake-deadline created)
+                   (+ (cl-quic-kit::%server-exact-real at)
+                      (cl-quic-kit::%server-exact-real
+                       (cl-quic-kit::quic-server-handshake-timeout server))))))
+      (setf (symbol-function create-symbol) original-create
+            (symbol-function process-symbol) original-process))))
 
 (progn
   (let ((server
