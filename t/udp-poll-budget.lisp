@@ -131,3 +131,15 @@
                       (zerop (funcall remaining)))
                  "the next server poll handles the remaining datagram")))
     (cl-quic-kit:quic-server-close server)))
+(let* ((default-socket (cl-quic-kit:make-udp-socket :local-host "127.0.0.1"
+                                                    :local-port 0))
+       (blocking-socket (cl-quic-kit:make-udp-socket :local-host "127.0.0.1"
+                                                     :local-port 0
+                                                     :non-blocking-p nil)))
+  (unwind-protect
+       (check (and (eq t (cl-quic-kit:udp-socket-non-blocking-p default-socket))
+                   (null (cl-quic-kit:udp-socket-non-blocking-p blocking-socket)))
+              "public UDP socket predicate reports nonblocking mode")
+    (unwind-protect
+         (cl-quic-kit:udp-close default-socket)
+      (cl-quic-kit:udp-close blocking-socket))))

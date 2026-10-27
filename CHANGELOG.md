@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.2.3
+
+- Exported `udp-socket-non-blocking-p` so callers can inspect whether a UDP socket uses nonblocking mode.
+
 ## 0.2.2
 
 - Added an absolute server handshake timeout, defaulting to 10 seconds, that silently discards expired incomplete handshakes and releases their admission capacity.

@@ -162,7 +162,8 @@ instead of immediately closing ([RFC 9000 §10.2.3](https://www.rfc-editor.org/r
   (values server (cl-quic-kit:udp-socket-local-port socket)))
 ```
 
-The server takes ownership of the supplied socket. Give clients a reachable server address and the returned
+The server takes ownership of the supplied socket. The `cl-quic-kit:udp-socket-non-blocking-p` accessor
+returns true when a socket uses nonblocking mode. Give clients a reachable server address and the returned
 port.
 
 The server passes `:tls-server-options` to cl-tls-kit's public
