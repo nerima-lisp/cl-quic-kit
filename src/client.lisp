@@ -350,17 +350,19 @@
    (quic-client-streams client))
   parameters)
 
-(defun %client-driver-suite-cipher (driver)
-  (case (and driver (%client-driver-slot driver "TLS13-CLIENT-DRIVER-SUITE"))
-    (#x1302 :aes-256-gcm)
-    (#x1303 :chacha20-poly1305)
-    (otherwise :aes-128-gcm)))
+(defun %client-driver-suite-cipher (client)
+  (let* ((boundary (quic-client-tls-boundary client))
+         (suite (and boundary
+                     (cl-tls-kit:quic-tls-boundary-cipher-suite boundary))))
+    (case suite
+      (#x1302 :aes-256-gcm)
+      (#x1303 :chacha20-poly1305)
+      (otherwise :aes-128-gcm))))
 
 (defun %client-install-secret (client level direction secret &key replace-p preserve-hp)
   (let ((wire-level (%client-space-level level)))
     (when (or replace-p (not (%client-key client wire-level direction)))
-      (let* ((cipher (%client-driver-suite-cipher
-                      (quic-client-tls-driver client)))
+      (let* ((cipher (%client-driver-suite-cipher client))
              (old-key (%client-key client wire-level direction))
              (new-key (cl-quic-kit.protection:make-key-set
                        secret :cipher cipher)))
@@ -385,15 +387,15 @@
            (%client-level-space level) (lambda (tls-level)
                    (funcall emit boundary tls-level direction secret))))))))
 
-(defun %client-driver-suite-hash (driver)
-  (if (and driver (= (%client-driver-slot driver "TLS13-CLIENT-DRIVER-SUITE") #x1302))
-      :sha384
-      :sha256))
+(defun %client-driver-suite-hash (client)
+  (let* ((boundary (quic-client-tls-boundary client))
+         (suite (and boundary
+                     (cl-tls-kit:quic-tls-boundary-cipher-suite boundary))))
+    (if (eql suite #x1302) :sha384 :sha256)))
 
 (defun %client-rotate-application-read-key (client)
-  (let* ((driver (quic-client-tls-driver client))
-         (secret (quic-client-application-read-secret client))
-         (hash (%client-driver-suite-hash driver))
+  (let* ((secret (quic-client-application-read-secret client))
+         (hash (%client-driver-suite-hash client))
          (length (if (eq hash :sha384) 48 32)))
     (when secret
       (setf (quic-client-application-read-old-key client)
@@ -409,21 +411,20 @@
       t)))
 
 (defun %client-next-application-key (client direction)
-  (let* ((driver (quic-client-tls-driver client))
-         (secret (if (eq direction :read)
+  (let* ((secret (if (eq direction :read)
                      (quic-client-application-read-secret client)
-                     (quic-client-application-write-secret client)))
-         (hash (%client-driver-suite-hash driver))
+                   (quic-client-application-write-secret client)))
+         (hash (%client-driver-suite-hash client))
          (length (if (eq hash :sha384) 48 32)))
     (when secret
       (let ((next-secret
-              (cl-quic-kit.protection::%expand-label
-               hash secret "quic ku"
-               (make-array 0 :element-type '(unsigned-byte 8)) length)))
+             (cl-quic-kit.protection::%expand-label
+              hash secret "quic ku"
+              (make-array 0 :element-type '(unsigned-byte 8)) length)))
         (values next-secret
                 (let ((next-key (cl-quic-kit.protection:make-key-set
                                  next-secret
-                                 :cipher (%client-driver-suite-cipher driver))))
+                                 :cipher (%client-driver-suite-cipher client))))
                   (setf (cl-quic-kit.protection:key-set-hp next-key)
                         (cl-quic-kit.protection:key-set-hp
                          (%client-key client :1-rtt direction)))
@@ -457,9 +458,8 @@
   (%client-prepare-next-application-read-key client))
 
 (defun %client-rotate-application-write-key (client &key force-p (update-read-p nil))
-  (let* ((driver (quic-client-tls-driver client))
-         (secret (quic-client-application-write-secret client))
-         (hash (%client-driver-suite-hash driver))
+  (let* ((secret (quic-client-application-write-secret client))
+         (hash (%client-driver-suite-hash client))
          (length (if (eq hash :sha384) 48 32)))
     (when (and secret
                (or force-p
@@ -1524,8 +1524,9 @@ handle a multi-packet burst while capping UDP work during sustained input."
        client (if (typep condition 'quic-frame-space-error) 10 7)
        "invalid packet") nil)
     (error (condition)
-      (%client-protocol-close client (if (typep condition 'final-size-error) 6 7)
-                              "invalid packet") nil)))
+      (%client-protocol-close
+       client (if (typep condition 'final-size-error) 6 7)
+       "invalid packet") nil)))
 
 (defun make-client-tls-boundary (client &key transport-parameters)
   "Attach cl-tls-kit's QUIC CRYPTO boundary."
@@ -1600,6 +1601,7 @@ handle a multi-packet burst while capping UDP work during sustained input."
            (driver nil))
       (setf driver
             (funcall constructor
+                     :signature-algorithms (quic-client-tls-signature-algorithms client)
                      :provider provider
                      :key-exchange (%client-driver-key-exchange client)
                      :hostname (quic-client-hostname client)
@@ -1610,7 +1612,7 @@ handle a multi-packet burst while capping UDP work during sustained input."
                      (lambda (driver wire)
                        (let* ((type (aref wire 0))
                               (level (if (= type 1) :initial
-                                         (if (= type 20) :handshake :application)))
+                                       (if (= type 20) :handshake :application)))
                               (boundary (quic-client-tls-boundary client))
                               (before (length (quic-client-pending-frames client))))
                          (unless boundary
@@ -1620,46 +1622,33 @@ handle a multi-packet burst while capping UDP work during sustained input."
                           level
                           (lambda (tls-level)
                             (let* ((client-hello
-                                      (%client-driver-slot
-                                       driver
-                                       "TLS13-CLIENT-DRIVER-CLIENT-HELLO"))
+                                    (and (= type 1) (cl-tls-kit:decode-client-hello (subseq wire 4))))
                                    (client-hello-extensions
-                                     (and client-hello
-                                          (cl-tls-kit:tls13-client-hello-extensions
-                                           client-hello)))
+                                    (and client-hello
+                                         (cl-tls-kit:tls13-client-hello-extensions
+                                          client-hello)))
                                    (transport-parameters-offered-p
-                                     (and client-hello-extensions
-                                          (find #x0039 client-hello-extensions
-                                                :key (function
-                                                      cl-tls-kit:tls-extension-type))))
+                                    (and client-hello-extensions
+                                         (find #x0039 client-hello-extensions
+                                               :key (function
+                                                     cl-tls-kit:tls-extension-type))))
                                    (send-with-transport-parameters
-                                     (and (= type 1)
-                                          client-hello
-                                          (not transport-parameters-offered-p)
-                                          (%client-function
-                                           "CL-TLS-KIT"
-                                           "QUIC-TLS-BOUNDARY-SEND-WITH-TRANSPORT-PARAMETERS"))))
-                                (if send-with-transport-parameters
-                                    (progn
-                                      (funcall send-with-transport-parameters
-                                               boundary tls-level type
-                                               (subseq wire 4)
-                                               (quic-client-transport-parameters
-                                                client))
-                                      (setf
-                                       (cl-tls-kit:tls13-client-hello-extensions
-                                        client-hello)
-                                       (append
-                                        client-hello-extensions
-                                        (list
-                                         (cl-tls-kit:make-tls-extension
-                                          #x0039
-                                          (quic-client-transport-parameters
-                                           client))))))
-                                  (funcall (%client-function
-                                            "CL-TLS-KIT"
-                                            "QUIC-TLS-BOUNDARY-SEND")
-                                           boundary tls-level type (subseq wire 4))))))
+                                    (and (= type 1)
+                                         client-hello
+                                         (not transport-parameters-offered-p)
+                                         (%client-function
+                                          "CL-TLS-KIT"
+                                          "QUIC-TLS-BOUNDARY-SEND-WITH-TRANSPORT-PARAMETERS"))))
+                              (if send-with-transport-parameters
+                                  (funcall send-with-transport-parameters
+                                             boundary tls-level type
+                                             (subseq wire 4)
+                                             (quic-client-transport-parameters
+                                              client))
+                                (funcall (%client-function
+                                          "CL-TLS-KIT"
+                                          "QUIC-TLS-BOUNDARY-SEND")
+                                         boundary tls-level type (subseq wire 4))))))
                          (when (and (= type 1)
                                     (> (length (quic-client-pending-frames client)) before))
                            (setf (quic-client-client-hello-wire client)
@@ -1677,28 +1666,89 @@ handle a multi-packet burst while capping UDP work during sustained input."
                                                (subseq transcript 0
                                                        (- (length transcript)
                                                           (length wire)))
-                                     sent))))))))))
-      (when (quic-client-tls-signature-algorithms client)
-        (%client-driver-set-slot
-         driver "TLS13-CLIENT-DRIVER-SIGNATURE-ALGORITHMS"
-         (quic-client-tls-signature-algorithms client)))
+                                               sent))))))))))
       (setf (quic-client-tls-driver client) driver)
       driver)))
 
 (defun client-tls-feed (client level offset bytes)
   "Feed one protected CRYPTO frame through the TLS boundary and driver."
-  (let ((feed (%client-function "CL-TLS-KIT" "QUIC-TLS-BOUNDARY-FEED-CRYPTO"))
-        (step (%client-function "CL-TLS-KIT" "TLS13-CLIENT-DRIVER-STEP")))
-    (when (and feed step (quic-client-tls-boundary client)
-               (quic-client-tls-driver client))
-      (dolist (message
-                (%client-tls-level-call
-                 (%client-level-space level)
-                 (lambda (tls-level)
-                   (funcall feed (quic-client-tls-boundary client)
-                            tls-level offset bytes))))
-        (funcall step (quic-client-tls-driver client) (getf message :wire))
-        (%client-sync-tls-secrets client)))))
+  (labels ((driver-wire (wire)
+                        (let* ((client-hello-wire (quic-client-client-hello-wire client))
+                               (offered-transport-parameters-p
+                                (and client-hello-wire
+                                     (>= (length client-hello-wire) 4)
+                                     (= (aref client-hello-wire 0) 1)
+                                     (find #x0039
+                                           (cl-tls-kit:tls13-client-hello-extensions
+                                            (cl-tls-kit:decode-client-hello
+                                             (subseq client-hello-wire 4)))
+                                           :key (function cl-tls-kit:tls-extension-type)))))
+                          (if (and offered-transport-parameters-p
+                                   (>= (length wire) 4)
+                                   (= (aref wire 0) 8))
+                              (progn
+                                (cl-tls-kit:decode-handshake wire)
+                                (let* ((body (subseq wire 4))
+                                       (extension-end
+                                        (+ 2 (ash (aref body 0) 8) (aref body 1)))
+                                       (cursor 2)
+                                       (extensions nil)
+                                       (transport-parameters-p nil))
+                                  (loop while (< cursor extension-end) do
+                                        (let* ((type (+ (ash (aref body cursor) 8)
+                                                        (aref body (1+ cursor))))
+                                               (length (+ (ash (aref body (+ cursor 2)) 8)
+                                                          (aref body (+ cursor 3))))
+                                               (data-start (+ cursor 4))
+                                               (next (+ data-start length)))
+                                          (if (= type #x0039)
+                                              (setf transport-parameters-p t)
+                                            (push (cl-tls-kit:make-tls-extension
+                                                   type (subseq body data-start next))
+                                                  extensions))
+                                          (setf cursor next)))
+                                  (if transport-parameters-p
+                                      (cl-tls-kit:encode-handshake
+                                       8
+                                       (cl-tls-kit:make-tls13-encrypted-extensions
+                                        (nreverse extensions)))
+                                    wire)))
+                            wire))))
+    (let ((feed (%client-function "CL-TLS-KIT" "QUIC-TLS-BOUNDARY-FEED-CRYPTO"))
+          (step (%client-function "CL-TLS-KIT" "TLS13-CLIENT-DRIVER-STEP")))
+      (when (and feed step (quic-client-tls-boundary client)
+                 (quic-client-tls-driver client))
+        (dolist (message
+                 (%client-tls-level-call
+                  (%client-level-space level)
+                  (lambda (tls-level)
+                    (funcall feed (quic-client-tls-boundary client)
+                             tls-level offset bytes))))
+          (let* ((wire (getf message :wire))
+                 (driver (quic-client-tls-driver client))
+                 (step-wire (driver-wire wire))
+                 (sync-transcript-p (not (equalp wire step-wire)))
+                 (transcript-before
+                  (and sync-transcript-p
+                       (%client-driver-slot
+                        driver "TLS13-CLIENT-DRIVER-TRANSCRIPT"))))
+            (when (and sync-transcript-p (null transcript-before))
+              (error 'quic-error :message "TLS driver transcript is unavailable"))
+            ;; The QUIC boundary validates transport parameters; retain their
+            ;; original bytes in the TLS transcript used by the driver.
+            (funcall step driver step-wire)
+            (when sync-transcript-p
+              (unless (%client-driver-set-slot
+                       driver "TLS13-CLIENT-DRIVER-TRANSCRIPT"
+                       (%octets transcript-before wire))
+                (error 'quic-error :message "TLS driver transcript cannot be synchronized")))
+            (when (= (aref wire 0) 2)
+              (let ((hello (cl-tls-kit:decode-handshake wire)))
+                (when (typep hello 'cl-tls-kit:tls13-server-hello)
+                  (cl-tls-kit:quic-tls-boundary-emit-cipher-suite
+                   (quic-client-tls-boundary client)
+                   (cl-tls-kit:tls13-server-hello-cipher-suite hello)))))
+            (%client-sync-tls-secrets client)))))))
 
 (defun client-start (client)
   "Start TLS and send ClientHello in a protected Initial packet."
