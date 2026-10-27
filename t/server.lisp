@@ -2439,7 +2439,24 @@
                  (apply (function cl-quic-kit:make-quic-client) :server-host "127.0.0.1" :server-port (cl-quic-kit:udp-socket-local-port socket) :hostname "localhost" :idle-timeout 60 :alpn (list "h3") :io-write (lambda (connection bytes)
                     (declare (ignore connection))
                     (push bytes writes)) client-tls-options))
-           (cl-quic-kit:client-poll client)
+           (let* ((constructor-symbol
+                    'cl-tls-kit:make-tls13-client-driver)
+                   (original-constructor
+                    (and constructor-symbol (symbol-function constructor-symbol)))
+                   (constructor-arguments nil))
+             (unless original-constructor
+               (error "TLS client-driver constructor is unavailable"))
+             (unwind-protect
+                  (progn
+                    (setf (symbol-function constructor-symbol)
+                          (lambda (&rest arguments)
+                            (setf constructor-arguments (copy-list arguments))
+                            (apply original-constructor arguments)))
+                    (cl-quic-kit:client-poll client))
+               (setf (symbol-function constructor-symbol) original-constructor))
+             (check
+              (equalp (getf constructor-arguments :signature-algorithms) #(#x0403))
+              "client passes configured signature algorithms through the public constructor"))
            (let* ((hello-wire
                     (cl-quic-kit::quic-client-client-hello-wire client))
                   (hello
