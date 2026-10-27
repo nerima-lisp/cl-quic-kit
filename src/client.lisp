@@ -206,8 +206,7 @@
     (and symbol (fboundp symbol) (symbol-function symbol))))
 
 (defun %client-tls-boundary-error-p (condition)
-  (let ((type (find-symbol "QUIC-TLS-BOUNDARY-ERROR" "CL-TLS-KIT")))
-    (and type (typep condition type))))
+  (typep condition 'cl-tls-kit:quic-tls-boundary-error))
 
 (defun %client-tls-level-call (level function)
   (handler-case
@@ -217,16 +216,6 @@
                (%client-tls-boundary-error-p condition))
           (funcall function :1-rtt)
           (error condition)))))
-
-(defun %client-driver-slot (driver name)
-  (let ((reader (%client-function "CL-TLS-KIT" name)))
-    (and reader (funcall reader driver))))
-
-(defun %client-driver-set-slot (driver name value)
-  (let* ((package (find-package "CL-TLS-KIT"))
-         (symbol (and package (find-symbol name package)))
-         (setter (and symbol (fdefinition (list 'setf symbol)))))
-    (when setter (funcall setter value driver))))
 
 (defun %client-random-octets (length)
   (let ((random (%client-function "CRYPTO-KIT" "RANDOM-OCTETS")))
@@ -500,19 +489,18 @@
     (min 4 (max 1 (ceiling bits 8)))))
 
 (defun %client-sync-tls-secrets (client)
-  (let ((driver (quic-client-tls-driver client))
-        (secret-reader (%client-function "CL-TLS-KIT"
-                                         "TLS13-TRAFFIC-STATE-SECRET")))
-    (when (and driver secret-reader)
-      (dolist (spec '(("TLS13-CLIENT-DRIVER-HANDSHAKE-READ-STATE" :handshake :read)
-                      ("TLS13-CLIENT-DRIVER-HANDSHAKE-WRITE-STATE" :handshake :write)
-                      ("TLS13-CLIENT-DRIVER-APPLICATION-READ-STATE" :1-rtt :read)
-                      ("TLS13-CLIENT-DRIVER-APPLICATION-WRITE-STATE" :1-rtt :write)))
-        (destructuring-bind (slot level direction) spec
-          (let ((state (%client-driver-slot driver slot)))
-            (when state
-              (%client-install-secret client level direction
-                                       (funcall secret-reader state)))))))))
+  (let ((driver (quic-client-tls-driver client)))
+    (when driver
+      (dolist (spec '((:handshake :handshake :read)
+                      (:handshake :handshake :write)
+                      (:application :1-rtt :read)
+                      (:application :1-rtt :write)))
+        (destructuring-bind (phase level direction) spec
+          (let ((secret
+                  (cl-tls-kit:tls13-client-driver-traffic-secret
+                   driver phase direction)))
+            (when secret
+              (%client-install-secret client level direction secret))))))))
 
 (defun %client-transport-parameters (local-connection-id idle-timeout)
   (encode-transport-parameters
@@ -1656,17 +1644,9 @@ handle a multi-packet burst while capping UDP work during sustained input."
                                   (cdar (quic-client-pending-frames client)) :data))
                            ;; The boundary-added transport-parameters extension is
                            ;; part of the TLS transcript seen by the peer.
-                           (let ((transcript (%client-driver-slot
-                                              driver "TLS13-CLIENT-DRIVER-TRANSCRIPT")))
-                             (when transcript
-                               (let ((sent (quic-client-client-hello-wire client)))
-                                 (%client-driver-set-slot
-                                  driver "TLS13-CLIENT-DRIVER-TRANSCRIPT"
-                                  (concatenate '(vector (unsigned-byte 8))
-                                               (subseq transcript 0
-                                                       (- (length transcript)
-                                                          (length wire)))
-                                               sent))))))))))
+                           (cl-tls-kit:tls13-client-driver-replace-last-transcript-message
+                            driver wire
+                            (quic-client-client-hello-wire client)))))))
       (setf (quic-client-tls-driver client) driver)
       driver)))
 
@@ -1727,21 +1707,13 @@ handle a multi-packet burst while capping UDP work during sustained input."
           (let* ((wire (getf message :wire))
                  (driver (quic-client-tls-driver client))
                  (step-wire (driver-wire wire))
-                 (sync-transcript-p (not (equalp wire step-wire)))
-                 (transcript-before
-                  (and sync-transcript-p
-                       (%client-driver-slot
-                        driver "TLS13-CLIENT-DRIVER-TRANSCRIPT"))))
-            (when (and sync-transcript-p (null transcript-before))
-              (error 'quic-error :message "TLS driver transcript is unavailable"))
+                 (sync-transcript-p (not (equalp wire step-wire))))
             ;; The QUIC boundary validates transport parameters; retain their
             ;; original bytes in the TLS transcript used by the driver.
             (funcall step driver step-wire)
             (when sync-transcript-p
-              (unless (%client-driver-set-slot
-                       driver "TLS13-CLIENT-DRIVER-TRANSCRIPT"
-                       (%octets transcript-before wire))
-                (error 'quic-error :message "TLS driver transcript cannot be synchronized")))
+              (cl-tls-kit:tls13-client-driver-replace-last-transcript-message
+               driver step-wire wire))
             (when (= (aref wire 0) 2)
               (let ((hello (cl-tls-kit:decode-handshake wire)))
                 (when (typep hello 'cl-tls-kit:tls13-server-hello)

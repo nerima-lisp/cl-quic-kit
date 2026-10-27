@@ -1,9 +1,9 @@
 (asdf:defsystem "cl-quic-kit"
   :description "A Common Lisp QUIC toolkit based on RFC 9000, RFC 9001, and RFC 9002."
-  :version "0.2.4"
+  :version "0.2.5"
   :author "nerima-lisp"
   :license "MIT"
-  :depends-on ("cl-crypto-kit" (:version "cl-tls-kit" "0.5.1"))
+  :depends-on ("cl-crypto-kit" (:version "cl-tls-kit" "0.5.2"))
   :serial t
   :components ((:file "package")
                (:module "src" :serial t

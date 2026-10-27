@@ -3,7 +3,7 @@
 
   inputs.nixpkgs.url = "github:NixOS/nixpkgs/nixpkgs-unstable";
   inputs.cl-crypto-kit.url = "github:nerima-lisp/cl-crypto-kit/41ed7e90f736591aa1961bc6deb0741c73392a60";
-  inputs.cl-tls-kit.url = "github:nerima-lisp/cl-tls-kit/91fab685804374c7ef7cab3d540c662abae647a4";
+  inputs.cl-tls-kit.url = "github:nerima-lisp/cl-tls-kit/v0.5.2";
   inputs.cl-tls-kit.inputs.cl-crypto-kit.follows = "cl-crypto-kit";
 
   outputs = { self, nixpkgs, cl-crypto-kit, cl-tls-kit }:

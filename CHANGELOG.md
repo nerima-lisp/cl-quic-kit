@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.2.5
+
+- Use cl-tls-kit v0.5.2 public client-driver APIs for traffic-secret access and transcript synchronization.
+- Reference the exported QUIC TLS boundary error condition directly.
+
 ## 0.2.4
 
 - QUIC clients now send configured `:tls-signature-algorithms` in ClientHello and support cl-tls-kit v0.5.1.
