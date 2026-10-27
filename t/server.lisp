@@ -2444,10 +2444,14 @@
                     (cl-quic-kit::quic-client-client-hello-wire client))
                   (hello
                     (cl-tls-kit:decode-handshake hello-wire)))
-             (setf (cl-tls-kit:tls13-client-hello-extensions hello)
-                   (append
-                    (cl-tls-kit:tls13-client-hello-extensions hello)
-                    (list (cl-tls-kit:make-tls-extension 42 #()))))
+             (progn
+               (check (equal '(#x0403)
+                             (cl-tls-kit:tls13-client-hello-signature-algorithms hello))
+                      "ClientHello carries configured TLS signature algorithms")
+               (setf (cl-tls-kit:tls13-client-hello-extensions hello)
+                     (append
+                      (cl-tls-kit:tls13-client-hello-extensions hello)
+                      (list (cl-tls-kit:make-tls-extension 42 #())))))
              (let* ((crafted-wire (cl-tls-kit:encode-handshake 1 hello))
                     (packet
                       (cl-quic-kit::%client-build-packet
