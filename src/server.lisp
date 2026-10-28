@@ -1605,9 +1605,9 @@ default absolute handshake timeout is 10 seconds."
     (client-flush (%quic-connection-stream-engine connection)))
 
   (defun quic-connection-close-stream (connection stream)
-  "Remove STREAM from CONNECTION and discard its pending writes.
+    "Remove STREAM from CONNECTION and discard its pending writes.
 Does not enqueue FIN or RESET_STREAM. Already queued frames may still be sent."
-  (client-close-stream (%quic-connection-stream-engine connection) stream)))
+    (client-close-stream (%quic-connection-stream-engine connection) stream)))
 (progn
   (defun %quic-close-error-code (error-code)
     (let ((wire-code (%connection-error-code error-code)))
