@@ -235,6 +235,10 @@ stream data with available credit, then sends pending datagrams. For client conn
 immediately. Congestion control can leave frames queued, and a server's amplification limit can defer
 datagrams. Polling retries packetization and
 sending. Call flush between polls when an immediate send attempt is needed.
+
+Use `cl-quic-kit:quic-connection-close-stream` to remove a stream from a connection and
+discard its pending writes. It does not enqueue FIN or RESET_STREAM. Frames already
+queued for packetization may still be sent.
 A locally opened unidirectional stream is
 send-only, while a peer-initiated unidirectional stream is receive-only. Reading from a send-only stream or
 writing to a receive-only stream signals `cl-quic-kit:stream-id-error`.

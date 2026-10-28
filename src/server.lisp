@@ -1161,22 +1161,39 @@ default absolute handshake timeout is 10 seconds."
        (make-frame :handshake-done) :application)
       (client-flush (server-connection-engine server-connection))))
   server-connection)
-(defun %server-close-on-frame-error (server-connection error-code)
-  (let* ((connection (server-connection-connection server-connection))
-         (engine (server-connection-engine server-connection))
-         (frame (%connection-prepare-close
-                 connection error-code "peer sent an invalid frame"))
-         (level (or (and (%client-key engine :1-rtt :write) :1-rtt)
-                    (and (%client-key engine :handshake :write) :handshake)
-                    (and (%client-key engine :initial :write) :initial))))
-    (when frame
-      (setf (quic-client-closed-p engine) t
-            (quic-client-pending-frames engine) nil
-            (quic-client-pending-stream-writes engine) nil)
-      (when level
-        (%client-queue-frame engine frame level)
-        (client-flush engine))))
-  server-connection)
+(progn
+  (defun %server-close-on-frame-error (server-connection error-code)
+    (let* ((connection (server-connection-connection server-connection))
+           (engine (server-connection-engine server-connection))
+           (frame (%connection-prepare-close
+                   connection error-code "peer sent an invalid frame"))
+           (level (or (and (%client-key engine :1-rtt :write) :1-rtt)
+                      (and (%client-key engine :handshake :write) :handshake)
+                      (and (%client-key engine :initial :write) :initial))))
+      (when frame
+        (setf (quic-client-closed-p engine) t
+              (quic-client-pending-frames engine) nil
+              (quic-client-pending-stream-writes engine) nil)
+        (when level
+          (%client-queue-frame engine frame level)
+          (client-flush engine))))
+    server-connection)
+
+  (defun %server-frame-error-code (condition)
+    (typecase condition
+      (stream-limit-error 4)
+      (flow-control-error
+       (if (typep condition 'final-size-error) 6 3))
+      (stream-id-error 5)
+      (quic-encoding-error 7)
+      (cl-tls-kit:quic-tls-boundary-error 10)
+      (quic-error 10)))
+
+  (defun %server-handle-frame-error (server-connection condition)
+    (let ((error-code (%server-frame-error-code condition)))
+      (if error-code
+          (%server-close-on-frame-error server-connection error-code)
+          (error condition)))))
 (defun %server-handle-tls-events (server-connection events)
   (dolist (event events)
     (if (and (consp event)
@@ -1485,28 +1502,18 @@ default absolute handshake timeout is 10 seconds."
                                        nil)
                                      :touch-p nil)
                                 (setf flush-p t))
-                            (stream-limit-error (condition)
-                                                (declare (ignore condition))
-                                                (%server-close-on-frame-error server-connection 4))
-                            (flow-control-error (condition)
-                                                (%server-close-on-frame-error
-                                                 server-connection
-                                                 (if (typep condition 'final-size-error)
-                                                     6 3)))
-                            (stream-id-error (condition)
-                                             (declare (ignore condition))
-                                             (%server-close-on-frame-error server-connection 5))
-                            (quic-encoding-error (condition)
-                                                 (declare (ignore condition))
-                                                 (%server-close-on-frame-error server-connection 7))
-                            (quic-error (condition)
-                                        (declare (ignore condition))
-                                        (%server-close-on-frame-error server-connection 10)))
+                            (error (condition)
+                              (%server-handle-frame-error
+                               server-connection condition)))
                           (when (member (connection-state connection)
                                         '(:closing :draining :closed))
                             (return-from %server-process-protected-datagram server-connection)))
                         (when flush-p
-                          (client-flush engine)))
+                          (handler-case
+                              (client-flush engine)
+                            (error (condition)
+                              (%server-handle-frame-error
+                               server-connection condition)))))
                       (connection-touch connection now)))))
               (setf at (+ at (getf layout :end)))
               (when (not (getf layout :long-p))
@@ -1538,7 +1545,10 @@ default absolute handshake timeout is 10 seconds."
          (%server-flush-pending-datagrams server-connection))
         (otherwise
          (%server-flush-pending-datagrams server-connection)
-         (client-poll (server-connection-engine server-connection) now)
+         (handler-case
+             (client-poll (server-connection-engine server-connection) now)
+           (error (condition)
+             (%server-handle-frame-error server-connection condition)))
          (case (connection-state connection)
            ((:closed :draining)
             (setf (server-connection-pending-datagrams server-connection) nil)
@@ -1590,8 +1600,14 @@ default absolute handshake timeout is 10 seconds."
              :error-code (or (quic-connection-closed-error connection) 0)
              :reason (or (quic-connection-closed-reason connection) #())))
     (client-write-stream engine stream octets :fin-p fin-p)))
-(defun quic-connection-flush (connection)
-  (client-flush (%quic-connection-stream-engine connection)))
+(progn
+  (defun quic-connection-flush (connection)
+    (client-flush (%quic-connection-stream-engine connection)))
+
+  (defun quic-connection-close-stream (connection stream)
+  "Remove STREAM from CONNECTION and discard its pending writes.
+Does not enqueue FIN or RESET_STREAM. Already queued frames may still be sent."
+  (client-close-stream (%quic-connection-stream-engine connection) stream)))
 (progn
   (defun %quic-close-error-code (error-code)
     (let ((wire-code (%connection-error-code error-code)))

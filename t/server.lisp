@@ -4391,105 +4391,169 @@
 
 (progn
   (defun server-test-stop-sending-pending-write-does-not-escape-poll ()
-    (let* ((server
-            (cl-quic-kit:make-quic-server
-             :local-address "127.0.0.1" :local-port 0
-             :max-connections 1 :retry-policy :never))
-           (socket (cl-quic-kit::quic-server-udp-socket server))
-           (local-cid (make-array 8 :element-type '(unsigned-byte 8) :initial-contents '(11 12 13 14 15 16 17 18)))
-           (remote-cid (make-array 8 :element-type '(unsigned-byte 8) :initial-contents '(21 22 23 24 25 26 27 28)))
-           (address :stop-sending-peer)
-           (path (cl-quic-kit::%server-path server address local-cid 0 t))
-           (writes nil)
-           (connection
-            (cl-quic-kit:make-quic-connection
-             :role :server :local-connection-id local-cid
-             :now-fn (lambda () 0)
-             :io-write
-             (lambda (ignored bytes)
-               (declare (ignore ignored))
-               (push bytes writes))))
-           (engine
-            (cl-quic-kit:make-quic-client
-             :connection connection :local-connection-id local-cid
-             :destination-connection-id remote-cid
-             :disable-hostname-verification-p t
-             :now-fn (lambda () 0)))
-           (server-connection
-            (cl-quic-kit::%make-server-connection
-             :server server :connection connection :engine engine :path path
-             :address address :now 0 :handshake-complete-p t
-             :original-destination-connection-id local-cid
-             :local-connection-id local-cid :remote-connection-id remote-cid
-             :pending-datagrams nil))
-           (peer
-            (cl-quic-kit:make-quic-client
-             :local-connection-id remote-cid
-             :destination-connection-id local-cid
-             :disable-hostname-verification-p t
-             :now-fn (lambda () 0)))
-           (flow (cl-quic-kit::quic-client-flow-control engine))
-           (stream (cl-quic-kit:client-open-stream engine nil))
-           (payload (make-array 4 :element-type '(unsigned-byte 8)
-                                :initial-contents '(1 2 3 4)))
-           (receive-symbol (find-symbol "UDP-RECEIVE" "CL-QUIC-KIT"))
-           (original-receive (symbol-function receive-symbol))
-           (datagram-pending-p t)
-           (wire nil)
-           (escaped-condition nil))
-      (unwind-protect
-           (progn
-             (cl-quic-kit:connection-set-state connection :established)
-             (setf (gethash local-cid
-                            (cl-quic-kit::quic-server-connections server))
-                   server-connection
-                   (cl-quic-kit::flow-control-state-connection-max-data flow) 0)
-             (cl-quic-kit:client-write-stream engine stream payload)
-             (cl-quic-kit:flow-control-update-max-data flow (length payload))
-             (check
-              (and (cl-quic-kit:client-stream-write-pending-p engine stream)
-                   (plusp (cl-quic-kit::%client-stream-send-credit engine stream)))
-              "STOP_SENDING regression fixture retains a pending response write and send credit")
-             (let ((secret
-                     (make-array 32 :element-type '(unsigned-byte 8)
-                                 :initial-element 7)))
-               (cl-quic-kit::%client-set-key
-                peer :1-rtt :write
-                (cl-quic-kit.protection:make-key-set secret))
-               (cl-quic-kit::%client-set-key
-                engine :1-rtt :read
-                (cl-quic-kit.protection:make-key-set secret))
-               (cl-quic-kit::%client-set-key
-                engine :1-rtt :write
-                (cl-quic-kit.protection:make-key-set secret)))
-             (setf wire
-                   (cl-quic-kit::%client-build-packet
-                    peer :1-rtt
-                    (list
-                     (cl-quic-kit:make-frame
-                      :stop-sending :stream-id (cl-quic-kit:stream-id stream)
-                      :application-protocol-error-code 7)))
-                   (symbol-function receive-symbol)
-                   (lambda (candidate-socket &rest arguments)
-                     (if (and (eq candidate-socket socket) datagram-pending-p)
-                         (progn
-                           (setf datagram-pending-p nil)
-                           (values wire (length wire) address))
+  (let* ((server
+          (cl-quic-kit:make-quic-server
+           :local-address "127.0.0.1" :local-port 0
+           :max-connections 1 :retry-policy :never))
+         (socket (cl-quic-kit::quic-server-udp-socket server))
+         (local-cid
+          (make-array 8 :element-type '(unsigned-byte 8)
+                      :initial-contents '(11 12 13 14 15 16 17 18)))
+         (remote-cid
+          (make-array 8 :element-type '(unsigned-byte 8)
+                      :initial-contents '(21 22 23 24 25 26 27 28)))
+         (address :stop-sending-peer)
+         (path (cl-quic-kit::%server-path server address local-cid 0 t))
+         (writes nil)
+         (connection
+          (cl-quic-kit:make-quic-connection
+           :role :server :local-connection-id local-cid
+           :now-fn (lambda () 0)
+           :io-write
+           (lambda (ignored bytes)
+             (declare (ignore ignored))
+             (push bytes writes))))
+         (engine
+          (cl-quic-kit:make-quic-client
+           :connection connection :local-connection-id local-cid
+           :destination-connection-id remote-cid
+           :disable-hostname-verification-p t
+           :now-fn (lambda () 0)))
+         (boundary (cl-tls-kit:make-quic-tls-boundary :role :server))
+         (server-connection
+          (cl-quic-kit::%make-server-connection
+           :server server :connection connection :engine engine :path path
+           :address address :now 0 :handshake-complete-p t
+           :original-destination-connection-id local-cid
+           :local-connection-id local-cid :remote-connection-id remote-cid
+           :tls-boundary boundary :pending-datagrams nil))
+         (peer
+          (cl-quic-kit:make-quic-client
+           :local-connection-id remote-cid
+           :destination-connection-id local-cid
+           :disable-hostname-verification-p t
+           :now-fn (lambda () 0)))
+         (flow (cl-quic-kit::quic-client-flow-control engine))
+         (stream (cl-quic-kit:client-open-stream engine nil))
+         (api-stream (cl-quic-kit:client-open-stream engine nil))
+         (payload (make-array 4 :element-type '(unsigned-byte 8)
+                              :initial-contents '(1 2 3 4)))
+         (receive-symbol (find-symbol "UDP-RECEIVE" "CL-QUIC-KIT"))
+         (original-receive (symbol-function receive-symbol))
+         (datagram-pending-p t)
+         (wire nil)
+         (escaped-condition nil))
+    (unwind-protect
+         (progn
+           (cl-quic-kit:connection-set-state connection :established)
+           (setf (gethash local-cid
+                          (cl-quic-kit::quic-server-connections server))
+                 server-connection
+                 (cl-quic-kit::flow-control-state-connection-max-data flow) 2)
+           (cl-quic-kit:client-write-stream engine stream payload)
+           (cl-quic-kit:client-write-stream engine api-stream payload)
+           (check
+            (and (cl-quic-kit:client-stream-write-pending-p engine stream)
+                 (cl-quic-kit:client-stream-write-pending-p engine api-stream))
+            "STOP_SENDING regression fixture queues stream frames and pending writes")
+           (cl-quic-kit:quic-connection-close-stream connection api-stream)
+           (check
+            (and (null (gethash (cl-quic-kit:stream-id api-stream)
+                                (cl-quic-kit::quic-client-streams engine)))
+                 (not (cl-quic-kit:client-stream-write-pending-p
+                       engine api-stream))
+                 (cl-quic-kit:client-stream-write-pending-p engine stream))
+            "connection stream cleanup removes its map entry and pending write")
+           (cl-quic-kit:flow-control-update-max-data flow (length payload))
+           (check
+            (and (cl-quic-kit:client-stream-write-pending-p engine stream)
+                 (plusp
+                  (cl-quic-kit::%client-stream-send-credit engine stream)))
+            "STOP_SENDING regression fixture retains a pending write and send credit")
+           (let ((secret
+                   (make-array 32 :element-type '(unsigned-byte 8)
+                               :initial-element 7)))
+             (cl-quic-kit::%client-set-key
+              peer :1-rtt :write
+              (cl-quic-kit.protection:make-key-set secret))
+             (cl-quic-kit::%client-set-key
+              engine :1-rtt :read
+              (cl-quic-kit.protection:make-key-set secret))
+             (cl-quic-kit::%client-set-key
+              engine :1-rtt :write
+              (cl-quic-kit.protection:make-key-set secret)))
+           (setf wire
+                 (cl-quic-kit::%client-build-packet
+                  peer :1-rtt
+                  (list
+                   (cl-quic-kit:make-frame
+                    :stop-sending :stream-id (cl-quic-kit:stream-id stream)
+                    :application-protocol-error-code 7)))
+                 (symbol-function receive-symbol)
+                 (lambda (candidate-socket &rest arguments)
+                   (if (and (eq candidate-socket socket) datagram-pending-p)
+                       (progn
+                         (setf datagram-pending-p nil)
+                         (values wire (length wire) address))
                        (apply original-receive candidate-socket arguments))))
-             (handler-case
-                 (cl-quic-kit:quic-server-poll server 0)
-               (error (condition)
-                 (setf escaped-condition condition)))
-             (check
-              (null escaped-condition)
-              (format nil
-                      "server-test-stop-sending-pending-write-does-not-escape-poll: ~A"
-                      escaped-condition))
+           (handler-case
+               (cl-quic-kit:quic-server-poll server 0)
+             (error (condition)
+               (setf escaped-condition condition)))
+           (check
+            (null escaped-condition)
+            (format nil
+                    "server-test-stop-sending-pending-write-does-not-escape-poll: ~A"
+                    escaped-condition))
+           (let ((sent-frames
+                   (loop for record in
+                         (cl-quic-kit::quic-client-sent-packets engine)
+                         append (getf record :frames))))
              (check
               (and (eq (cl-quic-kit:connection-state connection) :established)
-                   (not (cl-quic-kit:client-stream-write-pending-p engine stream))
+                   (not (cl-quic-kit:client-stream-write-pending-p
+                         engine stream))
+                   (cl-quic-kit::stream-send-reset-p stream)
+                   (= (cl-quic-kit::stream-reset-error-code stream) 7)
+                   (= (cl-quic-kit::stream-send-final-size stream) 2)
+                   (some (lambda (frame)
+                           (eq (cl-quic-kit:frame-type frame) :reset-stream))
+                         sent-frames)
+                   (notany (lambda (frame)
+                             (eq (cl-quic-kit:frame-type frame) :stream))
+                           sent-frames)
                    writes)
-              "STOP_SENDING discards the pending response write and leaves the server connection usable"))
-        (setf (symbol-function receive-symbol) original-receive)
-        (cl-quic-kit:quic-server-close server))))
+              "STOP_SENDING discards unsent data and emits RESET_STREAM with its final size"))
+           (cl-tls-kit:quic-tls-boundary-feed-crypto
+            boundary :application 0
+            (make-array 1 :element-type '(unsigned-byte 8) :initial-element 1))
+           (setf wire
+                 (cl-quic-kit::%client-build-packet
+                  peer :1-rtt
+                  (list
+                   (cl-quic-kit:make-frame
+                    :crypto :offset 0
+                    :data
+                    (make-array 1 :element-type '(unsigned-byte 8)
+                                :initial-element 2))))
+                 datagram-pending-p t
+                 escaped-condition nil)
+           (handler-case
+               (cl-quic-kit:quic-server-poll server 0)
+             (error (condition)
+               (setf escaped-condition condition)))
+           (check
+            (null escaped-condition)
+            (format nil
+                    "server-test-peer-crypto-decode-error-does-not-escape-poll: ~A"
+                    escaped-condition))
+           (check
+            (and (eq (cl-quic-kit:connection-state connection) :closing)
+                 (= (cl-quic-kit::quic-connection-closed-error connection)
+                    10)
+                 (not (cl-quic-kit::quic-server-closed-p server))
+                 writes)
+            "malformed peer CRYPTO closes only its QUIC connection"))
+      (setf (symbol-function receive-symbol) original-receive)
+      (cl-quic-kit:quic-server-close server))))
   (server-test-stop-sending-pending-write-does-not-escape-poll))
