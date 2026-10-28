@@ -4396,8 +4396,8 @@
              :local-address "127.0.0.1" :local-port 0
              :max-connections 1 :retry-policy :never))
            (socket (cl-quic-kit::quic-server-udp-socket server))
-           (local-cid #(11 12 13 14 15 16 17 18))
-           (remote-cid #(21 22 23 24 25 26 27 28))
+           (local-cid (make-array 8 :element-type '(unsigned-byte 8) :initial-contents '(11 12 13 14 15 16 17 18)))
+           (remote-cid (make-array 8 :element-type '(unsigned-byte 8) :initial-contents '(21 22 23 24 25 26 27 28)))
            (address :stop-sending-peer)
            (path (cl-quic-kit::%server-path server address local-cid 0 t))
            (writes nil)
