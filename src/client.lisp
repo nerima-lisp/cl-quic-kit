@@ -1016,6 +1016,17 @@
            (error 'stream-id-error :stream-id id))
          (stream-stop-sending-receive
           stream (frame-field frame :application-protocol-error-code 0))
+         (setf (quic-client-pending-stream-writes client)
+               (delete stream (quic-client-pending-stream-writes client)
+                       :key #'first :test #'eq)
+               (quic-client-pending-frames client)
+               (delete-if
+                (lambda (entry)
+                  (let ((pending-frame (cdr entry)))
+                    (and (member (frame-type pending-frame)
+                                 '(:stream :stream-data-blocked))
+                         (= id (frame-field pending-frame :stream-id)))))
+                (quic-client-pending-frames client)))
          (loop for event = (stream-next-event stream)
                while event
                when (eq (getf event :type) :reset-stream)

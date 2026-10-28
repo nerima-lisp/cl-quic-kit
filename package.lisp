@@ -91,6 +91,7 @@
    #:quic-connection-write-stream
    #:quic-connection-flush
    #:quic-connection-close
+   #:quic-connection-close-stream
    #:quic-server-shutdown #:client-receive-frames))
 
 (in-package #:cl-quic-kit)

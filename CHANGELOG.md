@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.2.7
+
+- Discard unsent stream data and pending writes after peer STOP_SENDING while retaining RESET_STREAM with the peer error code and final size.
+- Contain peer TLS CRYPTO decode errors to the affected connection and export `quic-connection-close-stream` for stream and pending-write cleanup.
+
 ## 0.2.6
 
 - Replace runtime function-name lookup for required TLS, crypto, and recovery APIs with package-qualified references.
